@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: rustyant — WebSocket transport (API Gateway WS → Lambda → S3)
+
+# Deploys:
+#   * S3 bucket for KV storage
+#   * rustyant-ws Lambda (Rust, arm64) built by sam+cargo-lambda
+#   * API Gateway WebSocket API with $connect / $disconnect / $default routes
+#   * IAM policy granting the Lambda execute-api:ManageConnections (so it can
+#     reply via @connections) plus S3 CRUD on the bucket
+#
+# The HTTP variant (Lambda URL) is not provisioned here — deploy it via
+# `just lambda-deploy` against the existing `rustyant` binary.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: S3 bucket holding the KV objects. Will be created by this stack.
+    AllowedPattern: ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$
+
+  KeyPrefix:
+    Type: String
+    Description: Prefix prepended to every Redis key in S3.
+    Default: rustyant/
+
+  StageName:
+    Type: String
+    Description: API Gateway WebSocket stage name.
+    Default: prod
+
+  LogLevel:
+    Type: String
+    Description: tracing env-filter for the Lambda.
+    Default: info
+    AllowedValues: [trace, debug, info, warn, error]
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 10
+    Environment:
+      Variables:
+        BUCKET: !Ref BucketName
+        KEY_PREFIX: !Ref KeyPrefix
+        LOG_LEVEL: !Ref LogLevel
+        RUST_LOG: !Ref LogLevel
+
+Resources:
+  # --- Storage ------------------------------------------------------------
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # --- WebSocket API ------------------------------------------------------
+  # $request.body.action is API Gateway's conventional selection expression.
+  # RESP frames are binary and contain no JSON `action` field, so the
+  # expression never resolves to a defined route key and traffic falls
+  # through to $default — which is exactly what we want.
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-ws'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+
+  # --- Lambda -------------------------------------------------------------
+  WsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+      BuildProperties:
+        Binary: rustyant-ws
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ws'
+      CodeUri: ../
+      Handler: bootstrap
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref BucketName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource:
+                - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${StageName}/POST/@connections/*'
+
+  WsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # --- Routes + Integration ----------------------------------------------
+  WsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsFunction.Arn}/invocations'
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsIntegration}'
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsIntegration}'
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsIntegration}'
+
+  # --- Deployment + Stage ------------------------------------------------
+  WsDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  WsStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref StageName
+      DeploymentId: !Ref WsDeployment
+      DefaultRouteSettings:
+        DataTraceEnabled: false
+        DetailedMetricsEnabled: true
+        LoggingLevel: INFO
+
+Outputs:
+  WebSocketUrl:
+    Description: WebSocket URL to pass to the rustyant Python client.
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ws-url'
+
+  WsFunctionArn:
+    Description: ARN of the rustyant-ws Lambda.
+    Value: !GetAtt WsFunction.Arn
+
+  BucketName:
+    Description: S3 bucket backing KV storage.
+    Value: !Ref Bucket

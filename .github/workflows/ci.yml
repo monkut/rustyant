@@ -20,7 +20,7 @@ jobs:
     name: fmt + clippy + typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -58,7 +58,7 @@ jobs:
       RUSTYANT_FLOCI_URL: http://localhost:4566
       RUSTYANT_FLOCI_BUCKET: rustyant-ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -74,7 +74,7 @@ jobs:
         run: cargo test --doc --all-features
       - name: upload junit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: junit
           path: target/nextest/ci/junit.xml
@@ -84,7 +84,7 @@ jobs:
     name: cargo-audit + cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -99,7 +99,7 @@ jobs:
     name: MSRV build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Extract MSRV from Cargo.toml
         id: msrv
         run: |
