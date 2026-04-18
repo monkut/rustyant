@@ -754,7 +754,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
- "serde_core",
 ]
 
 [[package]]
@@ -2051,7 +2050,6 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "rustyant"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -2063,7 +2061,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2398,7 +2395,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd"
 dependencies = [
  "deranged",
- "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
