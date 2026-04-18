@@ -110,3 +110,31 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.msrv }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-features --all-targets
+
+  sam-validate:
+    name: SAM template validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - run: sam validate --template-file infra/template.yaml --lint
+
+  python-client:
+    name: Python client tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/python
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install python 3.12
+        run: uv python install 3.12
+      - name: Install package + dev deps
+        run: uv pip install --system -e '.[dev]'
+      - name: Run pytest
+        run: pytest tests/ -q
