@@ -107,3 +107,28 @@ lambda-watch:
 
 lambda-deploy FUNCTION="rant-rustyant":
     cargo lambda deploy {{FUNCTION}}
+
+# ---- SAM / CloudFormation (WebSocket transport) ----
+# Requires the `sam` CLI (https://docs.aws.amazon.com/serverless-application-model/).
+# Uses the rust-cargolambda BuildMethod, which needs `--beta-features`.
+
+# Validate the template — catches syntax + IAM/reference errors without deploying.
+ws-template-validate:
+    sam validate --template-file infra/template.yaml --lint
+
+# Build the rustyant-ws Lambda artifact (runs cargo-lambda under the hood).
+ws-template-build:
+    sam build --template-file infra/template.yaml --beta-features
+
+# Deploy the WebSocket stack. Pass BUCKET=<globally-unique-name> on first use.
+# STACK defaults match the dev account convention (`rant-*`).
+ws-template-deploy STACK="rant-rustyant-ws" BUCKET="":
+    sam deploy --template-file .aws-sam/build/template.yaml \
+        --stack-name {{STACK}} \
+        --capabilities CAPABILITY_IAM \
+        --resolve-s3 \
+        --parameter-overrides BucketName={{BUCKET}}
+
+# Remove the deployed stack (destructive — empties the bucket first).
+ws-template-destroy STACK="rant-rustyant-ws":
+    sam delete --stack-name {{STACK}} --no-prompts

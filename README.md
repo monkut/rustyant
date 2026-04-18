@@ -114,8 +114,28 @@ printf '*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n' | \
   curl -s --data-binary @- http://localhost:9000/lambda-url/rustyant/
 ```
 
+## Deploying the WebSocket API
+
+The [`infra/template.yaml`](infra/template.yaml) SAM template provisions the API Gateway WebSocket API, the `rustyant-ws` Lambda, the S3 bucket, and the IAM policy granting `execute-api:ManageConnections`. Deployment requires the `sam` CLI, `cargo-lambda`, and AWS credentials for the target account.
+
+```bash
+just ws-template-validate                       # sam validate --lint
+just ws-template-build                          # sam build (invokes cargo-lambda)
+just ws-template-deploy BUCKET=my-kv-bucket     # creates stack rant-rustyant-ws
+```
+
+Outputs include `WebSocketUrl`, which is the `wss://…` URL to hand to the Python client:
+
+```python
+from rustyant import Client
+c = Client("wss://abc123.execute-api.ap-northeast-1.amazonaws.com/prod")
+c.set("hello", "world")
+```
+
+The HTTP variant (Lambda URL fronting the `rustyant` binary) is deployed separately via `just lambda-deploy` — not provisioned by this template.
+
 ## Status
 
-Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch, S3-backed storage with per-key TTL, 56+ Rust tests (8 RESP units + 8 WS units + 34 handler integration + 6 floci-gated S3), 8 Python client encoder tests, CI on GitHub Actions with floci as a service container.
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch, S3-backed storage with per-key TTL, 56+ Rust tests (8 RESP units + 8 WS units + 34 handler integration + 6 floci-gated S3), 8 Python client encoder tests, CI on GitHub Actions with floci as a service container, SAM template for the WebSocket stack.
 
-Not wired: no SAM/Terraform template for deploying the WebSocket API (see [clients/python/README.md](clients/python/README.md) for the expected API shape). No conditional-write concurrency control — read-modify-write commands (INCR, HSET, etc.) are last-writer-wins under concurrency.
+Not wired: no CI step for `sam validate`; no end-to-end test driving a real WebSocket connection against the deployed binary. No conditional-write concurrency control — read-modify-write commands (INCR, HSET, etc.) are last-writer-wins under concurrency.
