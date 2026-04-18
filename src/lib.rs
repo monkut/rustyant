@@ -5,6 +5,7 @@ pub mod resp;
 pub mod settings;
 pub mod state;
 pub mod storage;
+pub mod ws;
 
 pub use error::{Result, RustyAntError};
 pub use settings::Settings;

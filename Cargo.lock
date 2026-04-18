@@ -158,6 +158,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-apigatewaymanagement"
+version = "1.74.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a57d1f6c98de5463b8d1cdeb302b09214906fb2d3d0cc0ceae2d75c3464ae91"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.96.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -503,6 +525,22 @@ name = "aws_lambda_events"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7319a086b79c3ff026a33a61e80f04fd3885fbb73237981ea080d21944e1cb1c"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-serde",
+ "query_map",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aws_lambda_events"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "144ec7565561115498a288850cc6a42b279e09b6c4b88f623eecb9c8ca96c08c"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1452,7 +1490,7 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67fe279be7f89f5f72c97c3a96f45c43db8edab1007320ecc6a5741273b4d6db"
 dependencies = [
- "aws_lambda_events",
+ "aws_lambda_events 0.15.1",
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
@@ -2052,10 +2090,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-sdk-apigatewaymanagement",
  "aws-sdk-s3",
+ "aws_lambda_events 0.16.1",
+ "base64 0.22.1",
  "bytes",
  "bytes-utils",
  "lambda_http",
+ "lambda_runtime",
  "redis-protocol",
  "serde",
  "serde_json",
