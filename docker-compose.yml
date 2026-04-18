@@ -1,0 +1,31 @@
+# Floci (https://github.com/floci-io/floci) — MIT-licensed local AWS emulator.
+# Chosen over LocalStack (which moved S3 behind a paid tier) and MiniStack
+# (less mature). Port 4566 matches the familiar LocalStack default, so no
+# Rust-side changes were needed — AWS_ENDPOINT_URL + path-style addressing
+# already works.
+#
+# rustyant itself runs natively via `cargo lambda watch`; we use floci only
+# for S3.
+#
+# Start:  just floci-up
+# Stop:   just floci-down
+# Seed:   just floci-seed
+
+services:
+  floci:
+    image: hectorvent/floci:latest
+    container_name: rustyant-floci
+    # Host networking avoids docker's bridge NAT, which isn't wired up cleanly
+    # on every host's iptables. Floci listens directly on the host's port 4566.
+    network_mode: host
+    environment:
+      FLOCI_DEFAULT_REGION: us-east-1
+      FLOCI_DEFAULT_ACCOUNT_ID: "000000000000"
+      FLOCI_STORAGE_MODE: memory
+      QUARKUS_HTTP_PORT: "4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/ > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s

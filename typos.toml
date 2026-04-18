@@ -1,0 +1,15 @@
+[files]
+extend-exclude = [
+  "target/",
+  "*.lock",
+  "data/",
+]
+
+[default]
+extend-ignore-re = [
+  # SHA/hash-like tokens
+  "(?i)\\b[a-f0-9]{7,40}\\b",
+]
+
+[default.extend-identifiers]
+# Add project-specific identifiers that look like typos here.

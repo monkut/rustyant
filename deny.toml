@@ -1,0 +1,68 @@
+# cargo-deny — https://embarkstudios.github.io/cargo-deny/
+# Run with: cargo deny check
+
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Ignored advisories originate from AWS SDK transitive deps (TLS stack +
+# time). They resolve only when AWS publishes aws-smithy-*/aws-config/aws-sdk-*
+# releases that bump hyper-rustls/rustls/time. Re-check on each aws-sdk-s3 or
+# aws-config version bump and remove any that clear.
+ignore = [
+  "RUSTSEC-2025-0134", # rustls-pemfile unmaintained (archived Aug 2025)
+  "RUSTSEC-2026-0009", # time crate — stack-exhaustion DoS
+  "RUSTSEC-2026-0098", # rustls-webpki 0.101.x URI name constraints
+  "RUSTSEC-2026-0099", # rustls-webpki 0.101.x wildcard name constraints
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.92
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  "LicenseRef-KICONIAWORKS-Customers",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+  # Standardize on rustls for TLS
+  { name = "openssl" },
+  { name = "openssl-sys" },
+  { name = "native-tls" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

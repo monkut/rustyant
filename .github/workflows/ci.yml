@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: fmt + clippy + typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - uses: crate-ci/typos@master
+
+  test:
+    name: nextest (+ floci integration)
+    runs-on: ubuntu-latest
+    services:
+      floci:
+        image: hectorvent/floci:latest
+        ports:
+          - 4566:4566
+        env:
+          FLOCI_DEFAULT_REGION: us-east-1
+          FLOCI_DEFAULT_ACCOUNT_ID: "000000000000"
+          FLOCI_STORAGE_MODE: memory
+          QUARKUS_HTTP_PORT: "4566"
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/ > /dev/null"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+          --health-start-period 10s
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localhost:4566
+      RUSTYANT_FLOCI_URL: http://localhost:4566
+      RUSTYANT_FLOCI_BUCKET: rustyant-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Seed floci bucket
+        run: |
+          aws --endpoint-url=http://localhost:4566 --region us-east-1 \
+            s3api create-bucket --bucket "$RUSTYANT_FLOCI_BUCKET"
+      - name: nextest (CI profile)
+        run: cargo nextest run --all-features --profile ci
+      - name: doctests
+        run: cargo test --doc --all-features
+      - name: upload junit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  audit:
+    name: cargo-audit + cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny,cargo-machete
+      - run: cargo audit
+      - run: cargo deny check
+      - run: cargo machete
+        continue-on-error: true
+
+  msrv:
+    name: MSRV build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(grep -E '^rust-version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-features --all-targets

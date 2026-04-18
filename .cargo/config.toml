@@ -1,0 +1,11 @@
+# Cargo aliases — short names for common commands. Complements the justfile.
+[alias]
+c    = "check --all-targets"
+ck   = "clippy --all-targets --all-features -- -D warnings"
+fmt-check = "fmt --all -- --check"
+t    = "nextest run"
+d    = "doc --no-deps --open"
+
+[build]
+# Prefer incremental builds locally; CI sets CARGO_INCREMENTAL=0 explicitly.
+incremental = true

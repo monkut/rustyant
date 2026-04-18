@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Nextest
+target/nextest/
+test-reports/
+junit.xml
+
+# Coverage
+*.profraw
+*.profdata
+cov/
+lcov.info
+coverage/
+
+# Logs
+*.log
+
+# Cached toolchain/docs
+.cargo-cache/
+docs-build/
