@@ -1,0 +1,28 @@
+[project]
+name = "rustyant"
+version = "0.1.0"
+description = "Python client for rustyant — Redis-compatible key-value store on AWS Lambda + S3"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "LicenseRef-KICONIAWORKS-Customers" }
+authors = [{ name = "monkut" }]
+dependencies = [
+    "hiredis>=2.0",
+    "websocket-client>=1.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/monkut/rustyant"
+Repository = "https://github.com/monkut/rustyant"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rustyant"]

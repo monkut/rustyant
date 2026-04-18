@@ -20,14 +20,23 @@ path = "src/lib.rs"
 name = "rustyant"
 path = "src/main.rs"
 
+# WebSocket transport variant — same library, different Lambda event shape.
+[[bin]]
+name = "rustyant-ws"
+path = "src/bin/ws.rs"
+
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
 bytes-utils = "0.1"
 lambda_http = { version = "0.13", default-features = false, features = ["apigw_rest", "apigw_http", "tracing"] }
+lambda_runtime = "0.13"
+aws_lambda_events = { version = "0.16", default-features = false, features = ["apigw"] }
 redis-protocol = { version = "5", features = ["resp2", "resp3", "bytes"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
+aws-sdk-apigatewaymanagement = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

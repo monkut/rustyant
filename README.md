@@ -1,12 +1,21 @@
 # rustyant
 
-RustyAnt is a Lambda front end providing a Redis-compatible (RESP-over-HTTP) key-value store backed by S3.
+RustyAnt is a Lambda front end providing a Redis-compatible key-value store backed by S3.
 
 Sibling project to [rustyhip](https://github.com/monkut/rustyhip) (SQLite-over-S3). Same architectural wedge — your data is just files in your S3 bucket — applied to Redis semantics.
 
-## Protocol
+## Transports
 
-RESP commands are sent as HTTP POST bodies to the Lambda URL. The response body is a RESP reply.
+Two Lambda binaries ship from the same library:
+
+| Binary | Transport | AWS front door | Use when |
+|---|---|---|---|
+| `rustyant` | RESP-over-HTTP | Lambda URL / API Gateway HTTP | One-shot batch calls, curl/CI, fewer moving parts |
+| `rustyant-ws` | RESP-over-WebSocket | API Gateway WebSocket API | redis-py-style client usage, persistent connection, pipelining |
+
+### HTTP transport
+
+RESP commands as HTTP POST bodies to the Lambda URL; reply is the response body.
 
 ```
 POST /  HTTP/1.1
@@ -15,8 +24,6 @@ Content-Type: application/resp
 *3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n
 ```
 
-Response:
-
 ```
 HTTP/1.1 200 OK
 Content-Type: application/resp
@@ -24,7 +31,20 @@ Content-Type: application/resp
 +OK\r\n
 ```
 
-This is not a drop-in replacement for a real Redis client — pipelining, MULTI/EXEC, and PUB/SUB are not supported by the HTTP transport. Suited for agent tool calls, batch KV reads/writes, and serverless workloads.
+### WebSocket transport
+
+API Gateway WS API routes `$connect` / `$disconnect` / `$default` events to the `rustyant-ws` Lambda. Each inbound WebSocket frame carries one RESP2 command; the Lambda posts the reply back on the same connection via the API Gateway Management API. Persistent connection → no per-command HTTP handshake, pipelining works, lower tail latency.
+
+Use the [Python client](clients/python/README.md) for a `redis-py`-shaped API:
+
+```python
+from rustyant import Client
+c = Client("wss://abc.execute-api.us-east-1.amazonaws.com/prod")
+c.set("k", "v")
+c.get("k")  # b"v"
+```
+
+Neither transport supports `MULTI`/`EXEC`, `SUBSCRIBE`/`PUBLISH`, or streams.
 
 ## Command Surface
 
@@ -96,4 +116,6 @@ printf '*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n' | \
 
 ## Status
 
-Working scaffold: RESP-over-HTTP transport, full string/hash/list/set/zset command dispatch, S3-backed storage with per-key TTL. 8 RESP round-trip tests passing. No integration tests against a real Lambda runtime yet; no CI, no deny.toml, no pre-commit config (see the sibling rustyhip repo for the full tooling template).
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch, S3-backed storage with per-key TTL, 56+ Rust tests (8 RESP units + 8 WS units + 34 handler integration + 6 floci-gated S3), 8 Python client encoder tests, CI on GitHub Actions with floci as a service container.
+
+Not wired: no SAM/Terraform template for deploying the WebSocket API (see [clients/python/README.md](clients/python/README.md) for the expected API shape). No conditional-write concurrency control — read-modify-write commands (INCR, HSET, etc.) are last-writer-wins under concurrency.

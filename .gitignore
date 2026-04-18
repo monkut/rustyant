@@ -37,3 +37,9 @@ coverage/
 # Cached toolchain/docs
 .cargo-cache/
 docs-build/
+
+# Python clients
+**/.venv/
+**/__pycache__/
+**/*.egg-info/
+**/.pytest_cache/
