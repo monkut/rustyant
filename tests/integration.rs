@@ -194,6 +194,22 @@ async fn incr_on_non_integer_errors() {
 }
 
 #[tokio::test]
+async fn decr_on_missing_key_starts_at_minus_one() {
+    let state = test_state();
+    call(&state, &[b"DECR", b"c"]).await.expect_integer(-1);
+    call(&state, &[b"DECR", b"c"]).await.expect_integer(-2);
+    call(&state, &[b"DECRBY", b"c", b"10"]).await.expect_integer(-12);
+}
+
+#[tokio::test]
+async fn decrby_negative_value_increments() {
+    // Redis semantics: DECRBY k -5 is the same as INCRBY k 5.
+    let state = test_state();
+    call(&state, &[b"SET", b"n", b"10"]).await;
+    call(&state, &[b"DECRBY", b"n", b"-5"]).await.expect_integer(15);
+}
+
+#[tokio::test]
 async fn set_with_ex_sets_ttl() {
     let state = test_state();
     call(&state, &[b"SET", b"k", b"v", b"EX", b"60"]).await.expect_simple("OK");
