@@ -673,6 +673,161 @@ async fn new_read_commands_all_error_on_wrong_type() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Additional commands: GETSET, PERSIST, LINDEX, LSET, LREM, ZRANGEBYSCORE
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn getset_returns_old_and_clears_ttl() {
+    let state = test_state();
+    // No prior value → GETSET returns nil.
+    call(&state, &[b"GETSET", b"k", b"v1"]).await.expect_nil();
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"v1");
+    // Second GETSET returns the prior value.
+    call(&state, &[b"GETSET", b"k", b"v2"]).await.expect_bulk(b"v1");
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"v2");
+}
+
+#[tokio::test]
+async fn getset_clears_existing_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v", b"EX", b"120"]).await;
+    call(&state, &[b"GETSET", b"k", b"new"]).await.expect_bulk(b"v");
+    // TTL cleared — GETSET matches SET's overwrite semantics.
+    call(&state, &[b"TTL", b"k"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn persist_removes_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v", b"EX", b"60"]).await;
+    call(&state, &[b"PERSIST", b"k"]).await.expect_integer(1);
+    call(&state, &[b"TTL", b"k"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn persist_returns_zero_when_no_ttl_or_missing() {
+    let state = test_state();
+    call(&state, &[b"PERSIST", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"PERSIST", b"k"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn lindex_positive_and_negative() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c", b"d"]).await;
+    call(&state, &[b"LINDEX", b"l", b"0"]).await.expect_bulk(b"a");
+    call(&state, &[b"LINDEX", b"l", b"3"]).await.expect_bulk(b"d");
+    call(&state, &[b"LINDEX", b"l", b"-1"]).await.expect_bulk(b"d");
+    call(&state, &[b"LINDEX", b"l", b"-4"]).await.expect_bulk(b"a");
+    // Out of range → nil.
+    call(&state, &[b"LINDEX", b"l", b"4"]).await.expect_nil();
+    call(&state, &[b"LINDEX", b"l", b"-5"]).await.expect_nil();
+    // Missing key → nil.
+    call(&state, &[b"LINDEX", b"missing", b"0"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn lset_updates_element() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c"]).await;
+    call(&state, &[b"LSET", b"l", b"1", b"B"]).await.expect_simple("OK");
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[0].as_ref(), b"a");
+    assert_eq!(items[1].as_ref(), b"B");
+    assert_eq!(items[2].as_ref(), b"c");
+    // Negative index.
+    call(&state, &[b"LSET", b"l", b"-1", b"C"]).await.expect_simple("OK");
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[2].as_ref(), b"C");
+}
+
+#[tokio::test]
+async fn lset_errors_on_missing_key_or_bad_index() {
+    let state = test_state();
+    call(&state, &[b"LSET", b"missing", b"0", b"x"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"RPUSH", b"l", b"a"]).await;
+    call(&state, &[b"LSET", b"l", b"5", b"x"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"LSET", b"l", b"-5", b"x"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn lrem_positive_count_removes_from_head() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"a", b"c", b"a"]).await;
+    call(&state, &[b"LREM", b"l", b"2", b"a"]).await.expect_integer(2);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[0].as_ref(), b"b");
+    assert_eq!(items[1].as_ref(), b"c");
+    assert_eq!(items[2].as_ref(), b"a"); // third occurrence survives
+}
+
+#[tokio::test]
+async fn lrem_negative_count_removes_from_tail() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"a", b"c", b"a"]).await;
+    call(&state, &[b"LREM", b"l", b"-2", b"a"]).await.expect_integer(2);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[0].as_ref(), b"a"); // first survives (removed last two)
+    assert_eq!(items[1].as_ref(), b"b");
+    assert_eq!(items[2].as_ref(), b"c");
+}
+
+#[tokio::test]
+async fn lrem_zero_count_removes_all() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"a", b"a"]).await;
+    call(&state, &[b"LREM", b"l", b"0", b"a"]).await.expect_integer(3);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].as_ref(), b"b");
+}
+
+#[tokio::test]
+async fn lrem_empties_and_deletes_key() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"a"]).await;
+    call(&state, &[b"LREM", b"l", b"0", b"a"]).await.expect_integer(2);
+    call(&state, &[b"EXISTS", b"l"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zrangebyscore_inclusive_bounds() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"2", b"3"]).await.into_bulk_array();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0].as_ref(), b"b");
+    assert_eq!(m[1].as_ref(), b"c");
+}
+
+#[tokio::test]
+async fn zrangebyscore_exclusive_bounds() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    // (1 3 means score > 1 and score <= 3.
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"(1", b"3"]).await.into_bulk_array();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0].as_ref(), b"b");
+    assert_eq!(m[1].as_ref(), b"c");
+    // Fully exclusive.
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"(1", b"(3"]).await.into_bulk_array();
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0].as_ref(), b"b");
+}
+
+#[tokio::test]
+async fn zrangebyscore_infinity_bounds() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"-inf", b"+inf"]).await.into_bulk_array();
+    assert_eq!(m.len(), 3);
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"-inf", b"2"]).await.into_bulk_array();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[1].as_ref(), b"b");
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {

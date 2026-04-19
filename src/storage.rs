@@ -35,6 +35,51 @@ pub enum TtlResult {
     Ms(i64),
 }
 
+/// Score-bound for `ZRANGEBYSCORE` matching Redis's syntax: bare number is
+/// inclusive, `(N` is exclusive, `+inf` / `-inf` are the extremes.
+#[derive(Debug, Clone, Copy)]
+pub enum ScoreBound {
+    Inclusive(f64),
+    Exclusive(f64),
+    MinusInf,
+    PlusInf,
+}
+
+impl ScoreBound {
+    pub fn parse(s: &str) -> Result<Self, RustyAntError> {
+        if s == "-inf" {
+            return Ok(Self::MinusInf);
+        }
+        if s == "+inf" || s == "inf" {
+            return Ok(Self::PlusInf);
+        }
+        if let Some(rest) = s.strip_prefix('(') {
+            let v: f64 = rest.parse().map_err(|_| RustyAntError::Parse("score is not a float".into()))?;
+            return Ok(Self::Exclusive(v));
+        }
+        let v: f64 = s.parse().map_err(|_| RustyAntError::Parse("score is not a float".into()))?;
+        Ok(Self::Inclusive(v))
+    }
+
+    fn ge_min(self, score: f64) -> bool {
+        match self {
+            Self::Inclusive(v) => score >= v,
+            Self::Exclusive(v) => score > v,
+            Self::MinusInf => true,
+            Self::PlusInf => false,
+        }
+    }
+
+    fn le_max(self, score: f64) -> bool {
+        match self {
+            Self::Inclusive(v) => score <= v,
+            Self::Exclusive(v) => score < v,
+            Self::MinusInf => false,
+            Self::PlusInf => true,
+        }
+    }
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
@@ -58,6 +103,44 @@ fn resolve_range(len: i64, start: i64, stop: i64) -> Option<(usize, usize)> {
 
 fn wrong_type(key: &str) -> RustyAntError {
     RustyAntError::WrongType { key: key.to_string() }
+}
+
+/// Remove up to `count` occurrences of `target` from `list`. Redis semantics:
+/// count > 0 removes from head, count < 0 removes from tail, count == 0
+/// removes all. Returns the number of elements removed.
+fn remove_list_occurrences(list: &mut Vec<Vec<u8>>, target: &[u8], count: i64) -> i64 {
+    let mut removed: i64 = 0;
+    if count >= 0 {
+        let max = if count == 0 { i64::MAX } else { count };
+        let mut i = 0;
+        while i < list.len() && removed < max {
+            if list[i].as_slice() == target {
+                list.remove(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+    } else {
+        let max = -count;
+        let mut i = list.len();
+        while i > 0 && removed < max {
+            i -= 1;
+            if list[i].as_slice() == target {
+                list.remove(i);
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Sort a `ZSet` by (score asc, member asc), then filter by the min/max
+/// bounds. Shared between `S3Storage` and `InMemoryStorage`.
+fn filter_zset_by_score(map: BTreeMap<String, f64>, min: ScoreBound, max: ScoreBound) -> Vec<String> {
+    let mut sorted: Vec<(String, f64)> = map.into_iter().collect();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    sorted.into_iter().filter(|(_, s)| min.ge_min(*s) && max.le_max(*s)).map(|(m, _)| m).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +200,9 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn get_string(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError>;
     async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError>;
+    async fn getset(&self, key: &str, value: Bytes) -> Result<Option<Bytes>, RustyAntError>;
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError>;
+    async fn persist(&self, key: &str) -> Result<bool, RustyAntError>;
 
     /// Default: sequential `get_string` per key. Impls may override with a
     /// batched S3 request.
@@ -155,6 +240,9 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn list_pop(&self, key: &str, count: usize, left: bool) -> Result<Vec<Bytes>, RustyAntError>;
     async fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Bytes>, RustyAntError>;
     async fn llen(&self, key: &str) -> Result<i64, RustyAntError>;
+    async fn lindex(&self, key: &str, index: i64) -> Result<Option<Bytes>, RustyAntError>;
+    async fn lset(&self, key: &str, index: i64, value: Bytes) -> Result<(), RustyAntError>;
+    async fn lrem(&self, key: &str, count: i64, value: Bytes) -> Result<i64, RustyAntError>;
 
     async fn sadd(&self, key: &str, members: Vec<String>) -> Result<i64, RustyAntError>;
     async fn srem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
@@ -166,6 +254,7 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
     async fn zincr_by(&self, key: &str, member: &str, delta: f64) -> Result<f64, RustyAntError>;
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError>;
+    async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError>;
     async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError>;
     async fn zcard(&self, key: &str) -> Result<i64, RustyAntError>;
 }
@@ -658,6 +747,96 @@ impl Storage for S3Storage {
         }
     }
 
+    async fn getset(&self, key: &str, value: Bytes) -> Result<Option<Bytes>, RustyAntError> {
+        self.cas(key, move |entry| {
+            let old = match entry {
+                Some(StoredValue { value: Value::String(data), .. }) => Some(Bytes::from(data.clone())),
+                Some(_) => return Err(wrong_type(key)),
+                None => None,
+            };
+            // Redis: GETSET clears any existing TTL (matches SET semantics).
+            let new_entry = StoredValue { expires_at_ms: None, value: Value::String(value.to_vec()) };
+            Ok(CasAction::Write(new_entry, old))
+        })
+        .await
+    }
+
+    async fn persist(&self, key: &str) -> Result<bool, RustyAntError> {
+        self.cas(key, move |entry| match entry {
+            Some(existing) if existing.expires_at_ms.is_some() => {
+                let mut new_entry = existing.clone();
+                new_entry.expires_at_ms = None;
+                Ok(CasAction::Write(new_entry, true))
+            }
+            _ => Ok(CasAction::NoOp(false)),
+        })
+        .await
+    }
+
+    async fn lindex(&self, key: &str, index: i64) -> Result<Option<Bytes>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::List(l), .. }) => {
+                let len = i64::try_from(l.len()).unwrap_or(i64::MAX);
+                let actual = if index < 0 { len + index } else { index };
+                if actual < 0 || actual >= len {
+                    return Ok(None);
+                }
+                let i = usize::try_from(actual).unwrap_or(0);
+                Ok(Some(Bytes::from(l[i].clone())))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
+        }
+    }
+
+    async fn lset(&self, key: &str, index: i64, value: Bytes) -> Result<(), RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Err(RustyAntError::Parse("no such key".into())),
+            };
+            let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+            let actual = if index < 0 { len + index } else { index };
+            if actual < 0 || actual >= len {
+                return Err(RustyAntError::Parse("index out of range".into()));
+            }
+            let i = usize::try_from(actual).unwrap_or(0);
+            list[i] = value.to_vec();
+            let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+            Ok(CasAction::Write(new_entry, ()))
+        })
+        .await
+    }
+
+    async fn lrem(&self, key: &str, count: i64, value: Bytes) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let target = value.as_ref();
+            let removed = remove_list_occurrences(&mut list, target, count);
+            if list.is_empty() {
+                Ok(CasAction::Delete(removed))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+                Ok(CasAction::Write(new_entry, removed))
+            }
+        })
+        .await
+    }
+
+    async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError> {
+        let map = match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => m,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        Ok(filter_zset_by_score(map, min, max))
+    }
+
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError> {
         let field = field.to_string();
         self.cas(key, move |entry| {
@@ -1139,6 +1318,102 @@ impl Storage for InMemoryStorage {
             Some(_) => Err(wrong_type(key)),
             None => Ok(0),
         }
+    }
+
+    async fn getset(&self, key: &str, value: Bytes) -> Result<Option<Bytes>, RustyAntError> {
+        let old = match self.load(key) {
+            Some(StoredValue { value: Value::String(data), .. }) => Some(Bytes::from(data)),
+            Some(_) => return Err(wrong_type(key)),
+            None => None,
+        };
+        let entry = StoredValue { expires_at_ms: None, value: Value::String(value.to_vec()) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(old)
+    }
+
+    async fn persist(&self, key: &str) -> Result<bool, RustyAntError> {
+        // Evict expired keys first so we don't "persist" a zombie.
+        if self.load(key).is_none() {
+            return Ok(false);
+        }
+        Ok(self.with_entry_mut(|map| {
+            let Some(entry) = map.get_mut(key) else {
+                return false;
+            };
+            if entry.expires_at_ms.is_some() {
+                entry.expires_at_ms = None;
+                true
+            } else {
+                false
+            }
+        }))
+    }
+
+    async fn lindex(&self, key: &str, index: i64) -> Result<Option<Bytes>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::List(l), .. }) => {
+                let len = i64::try_from(l.len()).unwrap_or(i64::MAX);
+                let actual = if index < 0 { len + index } else { index };
+                if actual < 0 || actual >= len {
+                    return Ok(None);
+                }
+                let i = usize::try_from(actual).unwrap_or(0);
+                Ok(Some(Bytes::from(l[i].clone())))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
+        }
+    }
+
+    async fn lset(&self, key: &str, index: i64, value: Bytes) -> Result<(), RustyAntError> {
+        let (mut list, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Err(RustyAntError::Parse("no such key".into())),
+        };
+        let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+        let actual = if index < 0 { len + index } else { index };
+        if actual < 0 || actual >= len {
+            return Err(RustyAntError::Parse("index out of range".into()));
+        }
+        let i = usize::try_from(actual).unwrap_or(0);
+        list[i] = value.to_vec();
+        let entry = StoredValue { expires_at_ms, value: Value::List(list) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(())
+    }
+
+    async fn lrem(&self, key: &str, count: i64, value: Bytes) -> Result<i64, RustyAntError> {
+        let (mut list, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(0),
+        };
+        let removed = remove_list_occurrences(&mut list, value.as_ref(), count);
+        if list.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::List(list) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(removed)
+    }
+
+    async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError> {
+        let map = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => m,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        Ok(filter_zset_by_score(map, min, max))
     }
 
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError> {
