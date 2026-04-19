@@ -923,6 +923,36 @@ async fn scan_empty_store_returns_done() {
     assert!(next.is_none());
 }
 
+#[tokio::test]
+async fn type_returns_none_for_missing_key() {
+    let state = test_state();
+    call(&state, &[b"TYPE", b"missing"]).await.expect_simple("none");
+}
+
+#[tokio::test]
+async fn type_reports_each_value_kind() {
+    let state = test_state();
+    call(&state, &[b"SET", b"s", b"v"]).await;
+    call(&state, &[b"HSET", b"h", b"f", b"v"]).await;
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"SADD", b"set1", b"m"]).await;
+    call(&state, &[b"ZADD", b"z", b"1", b"m"]).await;
+
+    call(&state, &[b"TYPE", b"s"]).await.expect_simple("string");
+    call(&state, &[b"TYPE", b"h"]).await.expect_simple("hash");
+    call(&state, &[b"TYPE", b"l"]).await.expect_simple("list");
+    call(&state, &[b"TYPE", b"set1"]).await.expect_simple("set");
+    call(&state, &[b"TYPE", b"z"]).await.expect_simple("zset");
+}
+
+#[tokio::test]
+async fn type_returns_none_after_expiry() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v", b"PX", b"10"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    call(&state, &[b"TYPE", b"k"]).await.expect_simple("none");
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {

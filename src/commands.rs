@@ -113,6 +113,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "TTL" => handle_ttl(state, args).await,
         "KEYS" => handle_keys(state, args).await,
         "SCAN" => handle_scan(state, args).await,
+        "TYPE" => handle_type(state, args).await,
         "INCR" => handle_incrby(state, args, 1).await,
         "INCRBY" => {
             let delta = parse_delta(&args)?;
@@ -501,6 +502,13 @@ async fn handle_keys(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     let pattern = arg_as_str(&args[0])?;
     let keys = state.storage.keys(pattern).await?;
     Ok(RespReply::Array(keys.into_iter().map(|k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))).collect()))
+}
+
+async fn handle_type(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("TYPE", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    let kind = state.storage.kind(key).await?.unwrap_or("none");
+    Ok(RespReply::SimpleString(kind.into()))
 }
 
 async fn handle_scan(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {

@@ -105,6 +105,17 @@ fn wrong_type(key: &str) -> RustyAntError {
     RustyAntError::WrongType { key: key.to_string() }
 }
 
+/// Redis `TYPE` reply tag for a stored value.
+const fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "string",
+        Value::Hash(_) => "hash",
+        Value::List(_) => "list",
+        Value::Set(_) => "set",
+        Value::ZSet(_) => "zset",
+    }
+}
+
 /// Remove up to `count` occurrences of `target` from `list`. Redis semantics:
 /// count > 0 removes from head, count < 0 removes from tail, count == 0
 /// removes all. Returns the number of elements removed.
@@ -196,6 +207,9 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn exists(&self, key: &str) -> Result<bool, RustyAntError>;
     async fn expire_at(&self, key: &str, expires_at_ms: i64) -> Result<bool, RustyAntError>;
     async fn ttl_ms(&self, key: &str) -> Result<TtlResult, RustyAntError>;
+    /// Redis `TYPE` — returns the value-kind tag (`"string"`, `"hash"`,
+    /// `"list"`, `"set"`, `"zset"`) or `None` when the key is missing/expired.
+    async fn kind(&self, key: &str) -> Result<Option<&'static str>, RustyAntError>;
 
     async fn get_string(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError>;
@@ -453,6 +467,10 @@ impl Storage for S3Storage {
 
     async fn exists(&self, key: &str) -> Result<bool, RustyAntError> {
         Ok(self.load(key).await?.is_some())
+    }
+
+    async fn kind(&self, key: &str) -> Result<Option<&'static str>, RustyAntError> {
+        Ok(self.load(key).await?.map(|v| value_kind(&v.value)))
     }
 
     async fn expire_at(&self, key: &str, expires_at_ms: i64) -> Result<bool, RustyAntError> {
@@ -1070,6 +1088,10 @@ impl Storage for InMemoryStorage {
 
     async fn exists(&self, key: &str) -> Result<bool, RustyAntError> {
         Ok(self.load(key).is_some())
+    }
+
+    async fn kind(&self, key: &str) -> Result<Option<&'static str>, RustyAntError> {
+        Ok(self.load(key).map(|v| value_kind(&v.value)))
     }
 
     async fn expire_at(&self, key: &str, expires_at_ms: i64) -> Result<bool, RustyAntError> {
