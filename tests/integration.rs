@@ -526,6 +526,86 @@ async fn zcard_counts_members() {
     call(&state, &[b"ZCARD", b"z"]).await.expect_integer(3);
 }
 
+// ---------------------------------------------------------------------------
+// Additional mutating commands (HINCRBY, SREM, ZREM, ZINCRBY)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hincrby_creates_field_at_zero() {
+    let state = test_state();
+    call(&state, &[b"HINCRBY", b"h", b"counter", b"5"]).await.expect_integer(5);
+    call(&state, &[b"HINCRBY", b"h", b"counter", b"3"]).await.expect_integer(8);
+    call(&state, &[b"HINCRBY", b"h", b"counter", b"-10"]).await.expect_integer(-2);
+}
+
+#[tokio::test]
+async fn hincrby_on_non_integer_field_errors() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"name", b"alice"]).await;
+    call(&state, &[b"HINCRBY", b"h", b"name", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn srem_returns_count_removed() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"a", b"b", b"c"]).await;
+    call(&state, &[b"SREM", b"s", b"a", b"b", b"missing"]).await.expect_integer(2);
+    call(&state, &[b"SCARD", b"s"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn srem_empties_and_deletes_key() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"x"]).await;
+    call(&state, &[b"SREM", b"s", b"x"]).await.expect_integer(1);
+    call(&state, &[b"EXISTS", b"s"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zrem_returns_count_removed() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZREM", b"z", b"a", b"c", b"missing"]).await.expect_integer(2);
+    call(&state, &[b"ZCARD", b"z"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn zrem_empties_and_deletes_key() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"ZREM", b"z", b"a"]).await.expect_integer(1);
+    call(&state, &[b"EXISTS", b"z"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zincrby_creates_member_at_zero() {
+    let state = test_state();
+    call(&state, &[b"ZINCRBY", b"z", b"5", b"member"]).await.expect_bulk(b"5");
+    call(&state, &[b"ZINCRBY", b"z", b"2.5", b"member"]).await.expect_bulk(b"7.5");
+    call(&state, &[b"ZSCORE", b"z", b"member"]).await.expect_bulk(b"7.5");
+}
+
+#[tokio::test]
+async fn zincrby_reorders_in_zrange() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b"]).await;
+    // Push a past b by +10.
+    call(&state, &[b"ZINCRBY", b"z", b"10", b"a"]).await.expect_bulk(b"11");
+    let items = call(&state, &[b"ZRANGE", b"z", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[0].as_ref(), b"b");
+    assert_eq!(items[1].as_ref(), b"a");
+}
+
+#[tokio::test]
+async fn new_write_commands_error_on_wrong_type() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"HINCRBY", b"k", b"f", b"1"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"SREM", b"k", b"x"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZREM", b"k", b"x"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZINCRBY", b"k", b"1", b"m"]).await.expect_error_prefix("ERR");
+}
+
 #[tokio::test]
 async fn new_read_commands_all_error_on_wrong_type() {
     let state = test_state();

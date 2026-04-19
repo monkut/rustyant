@@ -45,6 +45,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HVALS" => handle_hvals(state, args).await,
         "HEXISTS" => handle_hexists(state, args).await,
         "HMGET" => handle_hmget(state, args).await,
+        "HINCRBY" => handle_hincrby(state, args).await,
         // Lists
         "LPUSH" => handle_push(state, args, true).await,
         "RPUSH" => handle_push(state, args, false).await,
@@ -54,11 +55,14 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "LLEN" => handle_llen(state, args).await,
         // Sets
         "SADD" => handle_sadd(state, args).await,
+        "SREM" => handle_srem(state, args).await,
         "SMEMBERS" => handle_smembers(state, args).await,
         "SISMEMBER" => handle_sismember(state, args).await,
         "SCARD" => handle_scard(state, args).await,
         // Sorted sets
         "ZADD" => handle_zadd(state, args).await,
+        "ZREM" => handle_zrem(state, args).await,
+        "ZINCRBY" => handle_zincrby(state, args).await,
         "ZRANGE" => handle_zrange(state, args).await,
         "ZSCORE" => handle_zscore(state, args).await,
         "ZCARD" => handle_zcard(state, args).await,
@@ -387,6 +391,42 @@ async fn handle_zcard(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
     arity("ZCARD", args.len() == 1)?;
     let n = state.storage.zcard(arg_as_str(&args[0])?).await?;
     Ok(RespReply::Integer(n))
+}
+
+// ---- Additional mutating commands -----------------------------------------
+
+async fn handle_hincrby(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HINCRBY", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let field = arg_as_str(&args[1])?;
+    let delta = parse_i64(&args[2], "increment")?;
+    let new_val = state.storage.hincr_by(key, field, delta).await?;
+    Ok(RespReply::Integer(new_val))
+}
+
+async fn handle_srem(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SREM", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let members: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let removed = state.storage.srem(key, &members).await?;
+    Ok(RespReply::Integer(removed))
+}
+
+async fn handle_zrem(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZREM", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let members: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let removed = state.storage.zrem(key, &members).await?;
+    Ok(RespReply::Integer(removed))
+}
+
+async fn handle_zincrby(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZINCRBY", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let delta = parse_f64(&args[1], "increment")?;
+    let member = arg_as_str(&args[2])?;
+    let new_score = state.storage.zincr_by(key, member, delta).await?;
+    Ok(RespReply::BulkString(Some(Bytes::from(format_score(new_score).into_bytes()))))
 }
 
 /// Match Redis's score formatting: integers as `"42"`, finite floats via
