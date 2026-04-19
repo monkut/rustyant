@@ -64,6 +64,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install redis-py for the compat tests
+        # tests/redis_py_compat.rs shells out to `python3 -c "import redis; ..."`;
+        # without this step the tests skip gracefully but produce no coverage.
+        run: python -m pip install redis
       - name: Seed floci bucket
         run: |
           aws --endpoint-url=http://localhost:4566 --region us-east-1 \
