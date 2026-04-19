@@ -257,6 +257,21 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError>;
     async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError>;
     async fn zcard(&self, key: &str) -> Result<i64, RustyAntError>;
+
+    /// Return every key matching `pattern` (Redis-style glob: `*`, `?`).
+    /// On S3 this fans out to repeated `ListObjectsV2` calls until the
+    /// prefix is exhausted; on large keyspaces prefer `scan`.
+    async fn keys(&self, pattern: &str) -> Result<Vec<String>, RustyAntError>;
+
+    /// Incremental key iteration. `cursor=None` starts a fresh scan; a
+    /// `Some(token)` return means more pages remain, `None` means the
+    /// scan is exhausted. `count` bounds the batch size.
+    async fn scan(
+        &self,
+        cursor: Option<&str>,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(Vec<String>, Option<String>), RustyAntError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,6 +852,64 @@ impl Storage for S3Storage {
         Ok(filter_zset_by_score(map, min, max))
     }
 
+    async fn keys(&self, pattern: &str) -> Result<Vec<String>, RustyAntError> {
+        let wm = wildmatch::WildMatch::new(pattern);
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(&self.prefix);
+            if let Some(c) = &cursor {
+                req = req.continuation_token(c);
+            }
+            let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
+            for obj in resp.contents() {
+                if let Some(full) = obj.key() {
+                    if let Some(rel) = full.strip_prefix(self.prefix.as_str()) {
+                        if wm.matches(rel) {
+                            out.push(rel.to_string());
+                        }
+                    }
+                }
+            }
+            match resp.next_continuation_token() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn scan(
+        &self,
+        cursor: Option<&str>,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(Vec<String>, Option<String>), RustyAntError> {
+        let wm = pattern.map(wildmatch::WildMatch::new);
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&self.prefix)
+            .max_keys(i32::try_from(count).unwrap_or(i32::MAX));
+        if let Some(c) = cursor {
+            req = req.continuation_token(c);
+        }
+        let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
+        let mut matched: Vec<String> = Vec::new();
+        for obj in resp.contents() {
+            if let Some(full) = obj.key() {
+                if let Some(rel) = full.strip_prefix(self.prefix.as_str()) {
+                    if wm.as_ref().is_none_or(|w| w.matches(rel)) {
+                        matched.push(rel.to_string());
+                    }
+                }
+            }
+        }
+        let next = resp.next_continuation_token().map(String::from);
+        Ok((matched, next))
+    }
+
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError> {
         let field = field.to_string();
         self.cas(key, move |entry| {
@@ -1414,6 +1487,46 @@ impl Storage for InMemoryStorage {
             None => return Ok(Vec::new()),
         };
         Ok(filter_zset_by_score(map, min, max))
+    }
+
+    async fn keys(&self, pattern: &str) -> Result<Vec<String>, RustyAntError> {
+        let wm = wildmatch::WildMatch::new(pattern);
+        let now = now_ms();
+        Ok(self.with_entry_mut(|map| {
+            map.iter()
+                .filter(|(_, v)| v.expires_at_ms.is_none_or(|exp| exp > now))
+                .filter(|(k, _)| wm.matches(k))
+                .map(|(k, _)| k.clone())
+                .collect()
+        }))
+    }
+
+    async fn scan(
+        &self,
+        cursor: Option<&str>,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(Vec<String>, Option<String>), RustyAntError> {
+        let wm = pattern.map(wildmatch::WildMatch::new);
+        let now = now_ms();
+        // Cursor semantics for InMemoryStorage: the cursor is the last key
+        // returned on the previous call. BTreeMap gives us ordered iteration,
+        // so "keys strictly greater than cursor" is a stable continuation.
+        Ok(self.with_entry_mut(|map| {
+            let start_after = cursor;
+            let live_matched: Vec<String> = map
+                .iter()
+                .filter(|(k, _)| start_after.is_none_or(|c| k.as_str() > c))
+                .filter(|(_, v)| v.expires_at_ms.is_none_or(|exp| exp > now))
+                .filter(|(k, _)| wm.as_ref().is_none_or(|w| w.matches(k)))
+                .take(count + 1) // +1 peek to know whether more exist
+                .map(|(k, _)| k.clone())
+                .collect();
+            let has_more = live_matched.len() > count;
+            let batch = if has_more { live_matched[..count].to_vec() } else { live_matched };
+            let next = if has_more { batch.last().cloned() } else { None };
+            (batch, next)
+        }))
     }
 
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError> {

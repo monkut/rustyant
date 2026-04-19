@@ -828,6 +828,100 @@ async fn zrangebyscore_infinity_bounds() {
     assert_eq!(m[1].as_ref(), b"b");
 }
 
+// ---------------------------------------------------------------------------
+// KEYS and SCAN
+// ---------------------------------------------------------------------------
+
+fn bulks_to_strs(items: &[Bytes]) -> Vec<String> {
+    items.iter().map(|b| String::from_utf8(b.to_vec()).expect("utf8")).collect()
+}
+
+#[tokio::test]
+async fn keys_matches_everything() {
+    let state = test_state();
+    call(&state, &[b"SET", b"alpha", b"1"]).await;
+    call(&state, &[b"SET", b"beta", b"2"]).await;
+    call(&state, &[b"HSET", b"gamma", b"f", b"v"]).await;
+    let mut keys = bulks_to_strs(&call(&state, &[b"KEYS", b"*"]).await.into_bulk_array());
+    keys.sort();
+    assert_eq!(keys, vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]);
+}
+
+#[tokio::test]
+async fn keys_glob_star_and_question() {
+    let state = test_state();
+    for k in ["user:1", "user:2", "user:10", "other"] {
+        call(&state, &[b"SET", k.as_bytes(), b"v"]).await;
+    }
+    let mut m = bulks_to_strs(&call(&state, &[b"KEYS", b"user:*"]).await.into_bulk_array());
+    m.sort();
+    assert_eq!(m, vec!["user:1".to_string(), "user:10".to_string(), "user:2".to_string()]);
+    let mut m = bulks_to_strs(&call(&state, &[b"KEYS", b"user:?"]).await.into_bulk_array());
+    m.sort();
+    assert_eq!(m, vec!["user:1".to_string(), "user:2".to_string()]);
+}
+
+#[tokio::test]
+async fn keys_excludes_expired() {
+    let state = test_state();
+    // PX=1 with short sleep guarantees expiry.
+    call(&state, &[b"SET", b"will-expire", b"v", b"PX", b"1"]).await;
+    call(&state, &[b"SET", b"stays", b"v"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let keys = bulks_to_strs(&call(&state, &[b"KEYS", b"*"]).await.into_bulk_array());
+    assert_eq!(keys, vec!["stays".to_string()]);
+}
+
+#[tokio::test]
+async fn scan_paginates_full_keyspace() {
+    // SCAN's reply is a nested [cursor, [keys...]] array that the flat
+    // `into_bulk_array` helper can't parse; exercise scan semantics through
+    // the storage layer directly instead.
+    let state = test_state();
+    for i in 0..15 {
+        let k = format!("k{i:02}");
+        call(&state, &[b"SET", k.as_bytes(), b"v"]).await;
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let (first, next) = state.storage.scan(None, None, 5).await.expect("scan");
+    assert_eq!(first.len(), 5);
+    seen.extend(first);
+    let mut cursor = next.expect("more pages");
+    let (second, next) = state.storage.scan(Some(&cursor), None, 5).await.expect("scan");
+    assert_eq!(second.len(), 5);
+    seen.extend(second);
+    cursor = next.expect("more pages");
+    let (third, next) = state.storage.scan(Some(&cursor), None, 5).await.expect("scan");
+    assert_eq!(third.len(), 5);
+    seen.extend(third);
+    assert!(next.is_none(), "expected scan exhausted");
+    seen.sort();
+    let expected: Vec<String> = (0..15).map(|i| format!("k{i:02}")).collect();
+    assert_eq!(seen, expected);
+}
+
+#[tokio::test]
+async fn scan_with_match_pattern_filters() {
+    let state = test_state();
+    call(&state, &[b"SET", b"user:1", b"v"]).await;
+    call(&state, &[b"SET", b"user:2", b"v"]).await;
+    call(&state, &[b"SET", b"other", b"v"]).await;
+
+    let (matched, _next) = state.storage.scan(None, Some("user:*"), 100).await.expect("scan");
+    let mut m: Vec<String> = matched;
+    m.sort();
+    assert_eq!(m, vec!["user:1".to_string(), "user:2".to_string()]);
+}
+
+#[tokio::test]
+async fn scan_empty_store_returns_done() {
+    let state = test_state();
+    let (keys, next) = state.storage.scan(None, None, 10).await.expect("scan");
+    assert_eq!(keys.len(), 0);
+    assert!(next.is_none());
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {
