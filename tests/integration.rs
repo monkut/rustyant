@@ -231,6 +231,36 @@ async fn expire_on_missing_key_returns_zero() {
     call(&state, &[b"EXPIRE", b"nope", b"100"]).await.expect_integer(0);
 }
 
+#[tokio::test]
+async fn expireat_accepts_absolute_unix_seconds() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    // 100s from now → unix seconds roughly now + 100.
+    let target = (rustyant::storage::now_ms() / 1000 + 100).to_string();
+    call(&state, &[b"EXPIREAT", b"k", target.as_bytes()]).await.expect_integer(1);
+    // TTL should be in (0, 100].
+    let reply = call(&state, &[b"TTL", b"k"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw);
+    let n: i64 = raw.trim_start_matches(':').trim_end().parse().expect("parse int");
+    assert!((1..=100).contains(&n), "TTL out of range: {n}");
+}
+
+#[tokio::test]
+async fn pexpireat_accepts_absolute_unix_milliseconds() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    // Past timestamp → key expires immediately.
+    call(&state, &[b"PEXPIREAT", b"k", b"1"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"k"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn expireat_on_missing_key_returns_zero() {
+    let state = test_state();
+    let future = (rustyant::storage::now_ms() / 1000 + 60).to_string();
+    call(&state, &[b"EXPIREAT", b"missing", future.as_bytes()]).await.expect_integer(0);
+}
+
 // ---------------------------------------------------------------------------
 // Hashes
 // ---------------------------------------------------------------------------
