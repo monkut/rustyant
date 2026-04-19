@@ -54,12 +54,12 @@ Implemented:
 |---|---|
 | Server | `PING` |
 | Strings | `GET`, `SET` (+ `EX` / `PX` options), `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `INCR`, `INCRBY` |
-| Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL` |
-| Lists | `LPUSH`, `RPUSH`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE` |
-| Sets | `SADD` |
-| Sorted Sets | `ZADD`, `ZRANGE` |
+| Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HMGET` |
+| Lists | `LPUSH`, `RPUSH`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN` |
+| Sets | `SADD`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
+| Sorted Sets | `ZADD`, `ZRANGE`, `ZSCORE`, `ZCARD` |
 
-Not implemented (PRs welcome): `GETSET`, `MGET`, `MSET`, `SETNX`, `SETEX`, `PERSIST`, `KEYS`, `SCAN`, `HEXISTS`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD`, `ZREM`, `ZSCORE`, `ZINCRBY`, `ZRANGEBYSCORE`, `ZCARD`, and all pub/sub, transactions, scripting, streams, geo.
+Not implemented (PRs welcome): `GETSET`, `MGET`, `MSET`, `SETNX`, `SETEX`, `PERSIST`, `KEYS`, `SCAN`, `HINCRBY`, `LINDEX`, `LSET`, `LREM`, `SREM`, `ZREM`, `ZINCRBY`, `ZRANGEBYSCORE`, and all pub/sub, transactions, scripting, streams, geo.
 
 ### Concurrency
 
