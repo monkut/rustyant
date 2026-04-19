@@ -26,6 +26,10 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         // Strings
         "GET" => handle_get(state, args).await,
         "SET" => handle_set(state, args).await,
+        "SETNX" => handle_setnx(state, args).await,
+        "SETEX" => handle_setex(state, args).await,
+        "MGET" => handle_mget(state, args).await,
+        "MSET" => handle_mset(state, args).await,
         "DEL" => handle_del(state, args).await,
         "EXISTS" => handle_exists(state, args).await,
         "EXPIRE" => handle_expire(state, args).await,
@@ -391,6 +395,50 @@ async fn handle_zcard(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
     arity("ZCARD", args.len() == 1)?;
     let n = state.storage.zcard(arg_as_str(&args[0])?).await?;
     Ok(RespReply::Integer(n))
+}
+
+// ---- String multi-key + NX/EX ---------------------------------------------
+
+async fn handle_setnx(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SETNX", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let set = state.storage.set_string_nx(key, args[1].clone(), None).await?;
+    Ok(RespReply::Integer(i64::from(set)))
+}
+
+async fn handle_setex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SETEX", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let secs = parse_i64(&args[1], "seconds")?;
+    if secs <= 0 {
+        return Err(RustyAntError::Parse("SETEX seconds must be positive".into()));
+    }
+    let expires_at_ms = Some(now_ms() + secs * 1000);
+    state.storage.set_string(key, args[2].clone(), expires_at_ms).await?;
+    Ok(RespReply::ok())
+}
+
+async fn handle_mget(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("MGET", !args.is_empty())?;
+    let keys: Vec<String> = args.iter().map(arg_as_string).collect::<Result<_, _>>()?;
+    let vals = state.storage.mget(&keys).await?;
+    Ok(RespReply::Array(
+        vals.into_iter().map(|v| v.map_or(RespReply::Nil, |b| RespReply::BulkString(Some(b)))).collect(),
+    ))
+}
+
+async fn handle_mset(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() || args.len() % 2 != 0 {
+        return Err(RustyAntError::WrongArity { command: "MSET".into() });
+    }
+    let mut pairs: Vec<(String, Bytes)> = Vec::with_capacity(args.len() / 2);
+    let mut i = 0;
+    while i < args.len() {
+        pairs.push((arg_as_string(&args[i])?, args[i + 1].clone()));
+        i += 2;
+    }
+    state.storage.mset(pairs).await?;
+    Ok(RespReply::ok())
 }
 
 // ---- Additional mutating commands -----------------------------------------

@@ -53,13 +53,15 @@ Implemented:
 | Group | Commands |
 |---|---|
 | Server | `PING` |
-| Strings | `GET`, `SET` (+ `EX` / `PX` options), `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `INCR`, `INCRBY` |
+| Strings | `GET`, `SET` (+ `EX` / `PX` options), `SETNX`, `SETEX`, `MGET`, `MSET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `INCR`, `INCRBY` |
 | Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HMGET`, `HINCRBY` |
 | Lists | `LPUSH`, `RPUSH`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN` |
 | Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
 | Sorted Sets | `ZADD`, `ZREM`, `ZINCRBY`, `ZRANGE`, `ZSCORE`, `ZCARD` |
 
-Not implemented (PRs welcome): `GETSET`, `MGET`, `MSET`, `SETNX`, `SETEX`, `PERSIST`, `KEYS`, `SCAN`, `LINDEX`, `LSET`, `LREM`, `ZRANGEBYSCORE`, and all pub/sub, transactions, scripting, streams, geo.
+Not implemented (PRs welcome): `GETSET`, `PERSIST`, `KEYS`, `SCAN`, `LINDEX`, `LSET`, `LREM`, `ZRANGEBYSCORE`, and all pub/sub, transactions, scripting, streams, geo.
+
+`MSET` is **not atomic across keys** — a failure partway through leaves earlier keys set. Real Redis is atomic here; rustyant's S3 backing makes the all-or-none semantic expensive, and the fire-and-forget variant is fine for most workloads.
 
 ### Concurrency
 
