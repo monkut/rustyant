@@ -1,6 +1,16 @@
-"""Python client for rustyant (Redis-compatible KV over AWS Lambda + S3)."""
+"""rustyant — `redis-py` adapters for a rustyant deployment."""
 
-from rustyant.client import Client, RustyAntError
+from rustyant.connection import (
+    RustyAntHttpConnection,
+    RustyAntWSConnection,
+    connect_http,
+    connect_ws,
+)
 
-__all__ = ["Client", "RustyAntError"]
-__version__ = "0.1.0"
+__all__ = [
+    "RustyAntHttpConnection",
+    "RustyAntWSConnection",
+    "connect_http",
+    "connect_ws",
+]
+__version__ = "0.3.0"

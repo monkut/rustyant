@@ -35,14 +35,19 @@ Content-Type: application/resp
 
 API Gateway WS API routes `$connect` / `$disconnect` / `$default` events to the `rustyant-ws` Lambda. Each inbound WebSocket frame carries one RESP2 command; the Lambda posts the reply back on the same connection via the API Gateway Management API. Persistent connection → no per-command HTTP handshake, pipelining works, lower tail latency.
 
-Use the [Python client](clients/python/README.md) for a `redis-py`-shaped API:
+Use the [redis-py adapters](clients/python/README.md) — `redis.Redis(...)` works directly:
 
 ```python
-from rustyant import Client
-c = Client("wss://abc.execute-api.us-east-1.amazonaws.com/prod")
-c.set("k", "v")
-c.get("k")  # b"v"
+from rustyant import connect_ws, connect_http
+
+r = connect_ws("wss://abc.execute-api.us-east-1.amazonaws.com/prod")
+r.set("k", "v"); r.get("k")  # b"v"
+
+r = connect_http("https://abc.lambda-url.us-east-1.on.aws")
+r.set("k", "v"); r.get("k")  # b"v"
 ```
+
+The `connect_ws` / `connect_http` helpers return a `redis.Redis` instance backed by a `RustyAntWSConnection` / `RustyAntHttpConnection` — so anything that consumes a `redis.Redis` (ORMs, session stores, rate-limiters, third-party libs) works unchanged.
 
 Neither transport supports `MULTI`/`EXEC`, `SUBSCRIBE`/`PUBLISH`, or streams.
 
