@@ -58,13 +58,16 @@ Implemented:
 | Group | Commands |
 |---|---|
 | Server | `PING` |
+| Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options) |
 | Strings | `GET`, `SET` (+ `EX` / `PX` options), `GETSET`, `SETNX`, `SETEX`, `MGET`, `MSET`, `DEL`, `EXISTS`, `EXPIRE`, `PERSIST`, `TTL`, `INCR`, `INCRBY` |
 | Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HMGET`, `HINCRBY` |
 | Lists | `LPUSH`, `RPUSH`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM` |
 | Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
 | Sorted Sets | `ZADD`, `ZREM`, `ZINCRBY`, `ZRANGE`, `ZRANGEBYSCORE`, `ZSCORE`, `ZCARD` |
 
-Not implemented (PRs welcome): `KEYS`, `SCAN` (both need S3 `ListObjectsV2`), and all pub/sub, transactions, scripting, streams, geo.
+`KEYS` paginates through `ListObjectsV2` in full and filters by the wildmatch pattern — O(n) over the keyspace, safe at low cardinality, proportionally slower for larger buckets. `SCAN` delegates the page boundary to S3 via a continuation token, returning one `ListObjectsV2` page per call; `MATCH` is applied client-side, so the per-page yield may be smaller than `COUNT` when a pattern is narrow.
+
+Not implemented (PRs welcome): pub/sub, transactions, scripting, streams, geo.
 
 `MSET` is **not atomic across keys** — a failure partway through leaves earlier keys set. Real Redis is atomic here; rustyant's S3 backing makes the all-or-none semantic expensive, and the fire-and-forget variant is fine for most workloads.
 
