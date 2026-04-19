@@ -25,6 +25,9 @@ pub enum RustyAntError {
     #[error("s3: {0}")]
     S3(String),
 
+    #[error("too much contention on key — retries exhausted")]
+    Contention,
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

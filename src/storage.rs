@@ -61,6 +61,48 @@ fn wrong_type(key: &str) -> RustyAntError {
 }
 
 // ---------------------------------------------------------------------------
+// S3 optimistic-locking primitives.
+//
+// Every read-modify-write (INCR / HSET / HDEL / LPUSH / RPUSH / LPOP / RPOP /
+// SADD / ZADD / EXPIRE) follows the same pattern: load the entry with its
+// ETag, compute the new entry locally, then conditionally PutObject with
+// If-Match: <etag> (or If-None-Match: * for creates). A 412 Precondition
+// Failed means another writer landed first; we back off briefly and retry.
+//
+// After `MAX_CAS_RETRIES` unsuccessful attempts we return
+// `RustyAntError::Contention`, which the command layer surfaces as RESP
+// `-ERR`. In practice conflicts resolve within one retry under typical load.
+// ---------------------------------------------------------------------------
+
+const MAX_CAS_RETRIES: u32 = 5;
+
+#[derive(Debug)]
+enum CasCondition {
+    CreateOnly,
+    IfMatch(String),
+}
+
+/// Decision emitted by a CAS modify closure.
+enum CasAction<R> {
+    /// Write the given entry under the CAS condition, return `R` on success.
+    Write(StoredValue, R),
+    /// Unconditionally delete the key (used when a mutation empties a
+    /// collection — Redis semantics require the key to disappear).
+    Delete(R),
+    /// No write needed; return `R` immediately.
+    NoOp(R),
+}
+
+async fn cas_backoff(attempt: u32) {
+    if attempt == 0 {
+        return;
+    }
+    let shift = (attempt - 1).min(4);
+    let ms = 10u64 * (1u64 << shift);
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+// ---------------------------------------------------------------------------
 // Storage trait — defines the command-facing persistence API. Both the
 // production S3-backed storage and the test in-memory storage implement this.
 // ---------------------------------------------------------------------------
@@ -112,11 +154,13 @@ impl S3Storage {
         format!("{}{}", self.prefix, redis_key)
     }
 
-    async fn load_raw(&self, redis_key: &str) -> Result<Option<StoredValue>, RustyAntError> {
+    /// Load the current entry and its `ETag`. Returns `None` for missing or
+    /// expired keys (expired keys are deleted best-effort here).
+    async fn load_with_etag(&self, redis_key: &str) -> Result<Option<(StoredValue, String)>, RustyAntError> {
         let res = self.client.get_object().bucket(&self.bucket).key(self.key(redis_key)).send().await;
-
         match res {
             Ok(output) => {
+                let etag = output.e_tag().unwrap_or("").to_string();
                 let bytes = output
                     .body
                     .collect()
@@ -124,7 +168,13 @@ impl S3Storage {
                     .map_err(|e| RustyAntError::S3(format!("collect body: {e}")))?
                     .into_bytes();
                 let entry: StoredValue = serde_json::from_slice(&bytes)?;
-                Ok(Some(entry))
+                if is_expired(&entry) {
+                    // Best-effort GC. Swallowing the error is OK — the next
+                    // access will notice the expiry and try again.
+                    let _ = self.delete_raw(redis_key).await;
+                    return Ok(None);
+                }
+                Ok(Some((entry, etag)))
             }
             Err(e) => {
                 let svc = e.into_service_error();
@@ -133,16 +183,13 @@ impl S3Storage {
         }
     }
 
+    /// Convenience for read-only callers that don't need the `ETag`.
     async fn load(&self, redis_key: &str) -> Result<Option<StoredValue>, RustyAntError> {
-        match self.load_raw(redis_key).await? {
-            Some(v) if is_expired(&v) => {
-                self.delete_raw(redis_key).await?;
-                Ok(None)
-            }
-            other => Ok(other),
-        }
+        Ok(self.load_with_etag(redis_key).await?.map(|(e, _)| e))
     }
 
+    /// Unconditional PUT. Used for `set_string`, which has overwrite
+    /// semantics and does not need CAS.
     async fn save(&self, redis_key: &str, entry: &StoredValue) -> Result<(), RustyAntError> {
         let body = serde_json::to_vec(entry)?;
         self.client
@@ -157,6 +204,34 @@ impl S3Storage {
         Ok(())
     }
 
+    /// Conditional PUT. Returns `Err(Contention)` on HTTP 412, which the
+    /// CAS retry loop turns into another read-modify-write attempt.
+    async fn save_cas(&self, redis_key: &str, entry: &StoredValue, cond: CasCondition) -> Result<(), RustyAntError> {
+        let body = serde_json::to_vec(entry)?;
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.key(redis_key))
+            .body(ByteStream::from(body))
+            .content_type("application/json");
+        match cond {
+            CasCondition::CreateOnly => req = req.if_none_match("*"),
+            CasCondition::IfMatch(etag) => req = req.if_match(etag),
+        }
+        match req.send().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let is_412 = e.raw_response().is_some_and(|r| r.status().as_u16() == 412);
+                if is_412 {
+                    Err(RustyAntError::Contention)
+                } else {
+                    Err(RustyAntError::S3(e.into_service_error().to_string()))
+                }
+            }
+        }
+    }
+
     async fn delete_raw(&self, redis_key: &str) -> Result<(), RustyAntError> {
         self.client
             .delete_object()
@@ -166,6 +241,41 @@ impl S3Storage {
             .await
             .map_err(|e| RustyAntError::S3(e.to_string()))?;
         Ok(())
+    }
+
+    /// Read-modify-write helper: runs `modify` against the latest entry,
+    /// writes the result back under ETag-based optimistic locking, retrying
+    /// up to `MAX_CAS_RETRIES` times on contention.
+    async fn cas<F, R>(&self, redis_key: &str, mut modify: F) -> Result<R, RustyAntError>
+    where
+        F: FnMut(Option<&StoredValue>) -> Result<CasAction<R>, RustyAntError>,
+    {
+        for attempt in 0..MAX_CAS_RETRIES {
+            cas_backoff(attempt).await;
+            let loaded = self.load_with_etag(redis_key).await?;
+            let (existing, etag) = match &loaded {
+                Some((e, t)) => (Some(e), Some(t.clone())),
+                None => (None, None),
+            };
+            match modify(existing)? {
+                CasAction::NoOp(r) => return Ok(r),
+                CasAction::Delete(r) => {
+                    if etag.is_some() {
+                        self.delete_raw(redis_key).await?;
+                    }
+                    return Ok(r);
+                }
+                CasAction::Write(new_entry, r) => {
+                    let cond = etag.map_or(CasCondition::CreateOnly, CasCondition::IfMatch);
+                    match self.save_cas(redis_key, &new_entry, cond).await {
+                        Ok(()) => return Ok(r),
+                        Err(RustyAntError::Contention) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        Err(RustyAntError::Contention)
     }
 }
 
@@ -184,14 +294,14 @@ impl Storage for S3Storage {
     }
 
     async fn expire_at(&self, key: &str, expires_at_ms: i64) -> Result<bool, RustyAntError> {
-        match self.load(key).await? {
-            Some(mut entry) => {
-                entry.expires_at_ms = Some(expires_at_ms);
-                self.save(key, &entry).await?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        self.cas(key, move |entry| {
+            entry.map_or(Ok(CasAction::NoOp(false)), |existing| {
+                let mut new_entry = existing.clone();
+                new_entry.expires_at_ms = Some(expires_at_ms);
+                Ok(CasAction::Write(new_entry, true))
+            })
+        })
+        .await
     }
 
     async fn ttl_ms(&self, key: &str) -> Result<TtlResult, RustyAntError> {
@@ -214,36 +324,43 @@ impl Storage for S3Storage {
     }
 
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError> {
-        let (current, expires_at_ms) = match self.load(key).await? {
-            Some(StoredValue { value: Value::String(data), expires_at_ms }) => {
-                let s =
-                    std::str::from_utf8(&data).map_err(|_| RustyAntError::Parse("value is not an integer".into()))?;
-                let n: i64 = s.parse().map_err(|_| RustyAntError::Parse("value is not an integer".into()))?;
-                (n, expires_at_ms)
-            }
-            Some(_) => return Err(wrong_type(key)),
-            None => (0, None),
-        };
-        let new_val = current.checked_add(delta).ok_or_else(|| RustyAntError::Parse("increment overflow".into()))?;
-        self.save(key, &StoredValue { expires_at_ms, value: Value::String(new_val.to_string().into_bytes()) }).await?;
-        Ok(new_val)
+        self.cas(key, move |entry| {
+            let (current, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::String(data), expires_at_ms }) => {
+                    let s = std::str::from_utf8(data)
+                        .map_err(|_| RustyAntError::Parse("value is not an integer".into()))?;
+                    let n: i64 = s.parse().map_err(|_| RustyAntError::Parse("value is not an integer".into()))?;
+                    (n, *expires_at_ms)
+                }
+                Some(_) => return Err(wrong_type(key)),
+                None => (0, None),
+            };
+            let new_val =
+                current.checked_add(delta).ok_or_else(|| RustyAntError::Parse("increment overflow".into()))?;
+            let new_entry = StoredValue { expires_at_ms, value: Value::String(new_val.to_string().into_bytes()) };
+            Ok(CasAction::Write(new_entry, new_val))
+        })
+        .await
     }
 
     async fn hset(&self, key: &str, pairs: Vec<(String, Bytes)>) -> Result<i64, RustyAntError> {
-        let (mut map, expires_at_ms) = match self.load(key).await? {
-            Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m, expires_at_ms),
-            Some(_) => return Err(wrong_type(key)),
-            None => (BTreeMap::new(), None),
-        };
-        let mut new_fields: i64 = 0;
-        for (field, value) in pairs {
-            if !map.contains_key(&field) {
-                new_fields += 1;
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            let mut new_fields: i64 = 0;
+            for (field, value) in &pairs {
+                if !map.contains_key(field) {
+                    new_fields += 1;
+                }
+                map.insert(field.clone(), value.to_vec());
             }
-            map.insert(field, value.to_vec());
-        }
-        self.save(key, &StoredValue { expires_at_ms, value: Value::Hash(map) }).await?;
-        Ok(new_fields)
+            let new_entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
+            Ok(CasAction::Write(new_entry, new_fields))
+        })
+        .await
     }
 
     async fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, RustyAntError> {
@@ -255,23 +372,27 @@ impl Storage for S3Storage {
     }
 
     async fn hdel(&self, key: &str, fields: &[String]) -> Result<i64, RustyAntError> {
-        let (mut map, expires_at_ms) = match self.load(key).await? {
-            Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m, expires_at_ms),
-            Some(_) => return Err(wrong_type(key)),
-            None => return Ok(0),
-        };
-        let mut removed: i64 = 0;
-        for f in fields {
-            if map.remove(f).is_some() {
-                removed += 1;
+        let fields = fields.to_vec();
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let mut removed: i64 = 0;
+            for f in &fields {
+                if map.remove(f).is_some() {
+                    removed += 1;
+                }
             }
-        }
-        if map.is_empty() {
-            self.delete_raw(key).await?;
-        } else {
-            self.save(key, &StoredValue { expires_at_ms, value: Value::Hash(map) }).await?;
-        }
-        Ok(removed)
+            if map.is_empty() {
+                Ok(CasAction::Delete(removed))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
+                Ok(CasAction::Write(new_entry, removed))
+            }
+        })
+        .await
     }
 
     async fn hgetall(&self, key: &str) -> Result<Vec<(String, Bytes)>, RustyAntError> {
@@ -285,44 +406,50 @@ impl Storage for S3Storage {
     }
 
     async fn list_push(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError> {
-        let (mut list, expires_at_ms) = match self.load(key).await? {
-            Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
-            Some(_) => return Err(wrong_type(key)),
-            None => (Vec::new(), None),
-        };
-        for v in values {
-            if left {
-                list.insert(0, v.to_vec());
-            } else {
-                list.push(v.to_vec());
+        self.cas(key, move |entry| {
+            let (mut list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (Vec::new(), None),
+            };
+            for v in &values {
+                if left {
+                    list.insert(0, v.to_vec());
+                } else {
+                    list.push(v.to_vec());
+                }
             }
-        }
-        let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
-        self.save(key, &StoredValue { expires_at_ms, value: Value::List(list) }).await?;
-        Ok(len)
+            let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+            let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+            Ok(CasAction::Write(new_entry, len))
+        })
+        .await
     }
 
     async fn list_pop(&self, key: &str, count: usize, left: bool) -> Result<Vec<Bytes>, RustyAntError> {
-        let (mut list, expires_at_ms) = match self.load(key).await? {
-            Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
-            Some(_) => return Err(wrong_type(key)),
-            None => return Ok(Vec::new()),
-        };
-        let take = count.min(list.len());
-        let mut out: Vec<Bytes> = Vec::with_capacity(take);
-        for _ in 0..take {
-            if left {
-                out.push(Bytes::from(list.remove(0)));
-            } else {
-                out.push(Bytes::from(list.pop().expect("len checked above")));
+        self.cas(key, move |entry| {
+            let (mut list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(Vec::new())),
+            };
+            let take = count.min(list.len());
+            let mut out: Vec<Bytes> = Vec::with_capacity(take);
+            for _ in 0..take {
+                if left {
+                    out.push(Bytes::from(list.remove(0)));
+                } else {
+                    out.push(Bytes::from(list.pop().expect("len checked above")));
+                }
             }
-        }
-        if list.is_empty() {
-            self.delete_raw(key).await?;
-        } else {
-            self.save(key, &StoredValue { expires_at_ms, value: Value::List(list) }).await?;
-        }
-        Ok(out)
+            if list.is_empty() {
+                Ok(CasAction::Delete(out))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+                Ok(CasAction::Write(new_entry, out))
+            }
+        })
+        .await
     }
 
     async fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Bytes>, RustyAntError> {
@@ -339,36 +466,42 @@ impl Storage for S3Storage {
     }
 
     async fn sadd(&self, key: &str, members: Vec<String>) -> Result<i64, RustyAntError> {
-        let (mut set, expires_at_ms) = match self.load(key).await? {
-            Some(StoredValue { value: Value::Set(s), expires_at_ms }) => (s, expires_at_ms),
-            Some(_) => return Err(wrong_type(key)),
-            None => (BTreeSet::new(), None),
-        };
-        let mut added: i64 = 0;
-        for m in members {
-            if set.insert(m) {
-                added += 1;
+        self.cas(key, move |entry| {
+            let (mut set, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Set(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeSet::new(), None),
+            };
+            let mut added: i64 = 0;
+            for m in &members {
+                if set.insert(m.clone()) {
+                    added += 1;
+                }
             }
-        }
-        self.save(key, &StoredValue { expires_at_ms, value: Value::Set(set) }).await?;
-        Ok(added)
+            let new_entry = StoredValue { expires_at_ms, value: Value::Set(set) };
+            Ok(CasAction::Write(new_entry, added))
+        })
+        .await
     }
 
     async fn zadd(&self, key: &str, pairs: Vec<(f64, String)>) -> Result<i64, RustyAntError> {
-        let (mut map, expires_at_ms) = match self.load(key).await? {
-            Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m, expires_at_ms),
-            Some(_) => return Err(wrong_type(key)),
-            None => (BTreeMap::new(), None),
-        };
-        let mut added: i64 = 0;
-        for (score, member) in pairs {
-            if !map.contains_key(&member) {
-                added += 1;
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            let mut added: i64 = 0;
+            for (score, member) in &pairs {
+                if !map.contains_key(member) {
+                    added += 1;
+                }
+                map.insert(member.clone(), *score);
             }
-            map.insert(member, score);
-        }
-        self.save(key, &StoredValue { expires_at_ms, value: Value::ZSet(map) }).await?;
-        Ok(added)
+            let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
+            Ok(CasAction::Write(new_entry, added))
+        })
+        .await
     }
 
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError> {

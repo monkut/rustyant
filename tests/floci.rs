@@ -17,6 +17,9 @@ use rustyant::storage::{S3Storage, Storage};
 
 const DEFAULT_BUCKET: &str = "rustyant-ci";
 
+/// Worker count for the concurrent-INCR convergence test.
+const TASKS: usize = 8;
+
 fn floci_env() -> Option<(String, String)> {
     let url = std::env::var("RUSTYANT_FLOCI_URL").ok()?;
     let bucket = std::env::var("RUSTYANT_FLOCI_BUCKET").unwrap_or_else(|_| DEFAULT_BUCKET.to_string());
@@ -140,6 +143,45 @@ async fn s3_set_and_zset_roundtrip() {
 
     storage.delete(set_key).await.ok();
     storage.delete(zset_key).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_concurrent_incr_converges() {
+    // Proves the CAS retry loop: N parallel INCR-by-1 tasks must each
+    // succeed and the final value must equal N. Under last-writer-wins
+    // semantics (pre-CAS) this test routinely lost increments.
+    //
+    // Gated on `RUSTYANT_S3_CAS=1` because floci silently ignores
+    // `If-Match` / `If-None-Match` headers — a PUT against floci with a
+    // deliberately wrong ETag returns 200 with a fresh ETag, not 412.
+    // Real AWS S3 (which enforces conditional writes since November 2024)
+    // is required to actually validate this path. Set the env var once
+    // you're pointing at a real S3 endpoint.
+    let storage = floci_test!("concurrent-incr");
+    if std::env::var("RUSTYANT_S3_CAS").is_err() {
+        eprintln!("SKIP: RUSTYANT_S3_CAS not set (floci does not enforce If-Match)");
+        return;
+    }
+
+    let key = "counter";
+    storage.delete(key).await.ok();
+
+    let mut handles = Vec::with_capacity(TASKS);
+    for _ in 0..TASKS {
+        let s = storage.clone();
+        let k = key.to_string();
+        handles.push(tokio::spawn(async move { s.incr_by(&k, 1).await }));
+    }
+    for h in handles {
+        h.await.expect("task").expect("incr_by ok");
+    }
+
+    let raw = storage.get_string(key).await.expect("get").expect("some");
+    let s = std::str::from_utf8(&raw).expect("utf8");
+    let final_val: u64 = s.parse().expect("int");
+    assert_eq!(final_val, TASKS as u64, "lost increments — CAS retry loop failed");
+
+    storage.delete(key).await.ok();
 }
 
 #[tokio::test]
