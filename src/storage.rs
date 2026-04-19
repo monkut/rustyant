@@ -384,6 +384,25 @@ impl S3Storage {
         Ok(())
     }
 
+    /// Conditional DELETE. Returns `Err(Contention)` on HTTP 412, which the
+    /// CAS retry loop turns into another read-modify-write attempt. Used when
+    /// a mutation empties a collection (HDEL/LPOP/RPOP/SREM/ZREM of the last
+    /// member) so an unrelated concurrent writer's new value isn't clobbered.
+    async fn delete_if_match(&self, redis_key: &str, etag: &str) -> Result<(), RustyAntError> {
+        let res = self.client.delete_object().bucket(&self.bucket).key(self.key(redis_key)).if_match(etag).send().await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let is_412 = e.raw_response().is_some_and(|r| r.status().as_u16() == 412);
+                if is_412 {
+                    Err(RustyAntError::Contention)
+                } else {
+                    Err(RustyAntError::S3(e.into_service_error().to_string()))
+                }
+            }
+        }
+    }
+
     /// Read-modify-write helper: runs `modify` against the latest entry,
     /// writes the result back under ETag-based optimistic locking, retrying
     /// up to `MAX_CAS_RETRIES` times on contention.
@@ -400,12 +419,14 @@ impl S3Storage {
             };
             match modify(existing)? {
                 CasAction::NoOp(r) => return Ok(r),
-                CasAction::Delete(r) => {
-                    if etag.is_some() {
-                        self.delete_raw(redis_key).await?;
-                    }
-                    return Ok(r);
-                }
+                CasAction::Delete(r) => match etag {
+                    Some(e) => match self.delete_if_match(redis_key, &e).await {
+                        Ok(()) => return Ok(r),
+                        Err(RustyAntError::Contention) => (),
+                        Err(err) => return Err(err),
+                    },
+                    None => return Ok(r),
+                },
                 CasAction::Write(new_entry, r) => {
                     let cond = etag.map_or(CasCondition::CreateOnly, CasCondition::IfMatch);
                     match self.save_cas(redis_key, &new_entry, cond).await {
