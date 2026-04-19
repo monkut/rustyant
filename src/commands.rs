@@ -36,6 +36,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "EXPIRE" => handle_expire(state, args).await,
         "PERSIST" => handle_persist(state, args).await,
         "TTL" => handle_ttl(state, args).await,
+        "KEYS" => handle_keys(state, args).await,
+        "SCAN" => handle_scan(state, args).await,
         "INCR" => handle_incrby(state, args, 1).await,
         "INCRBY" => {
             let delta = parse_delta(&args)?;
@@ -417,6 +419,53 @@ async fn handle_persist(state: &State, args: Vec<Bytes>) -> Result<RespReply, Ru
     let key = arg_as_str(&args[0])?;
     let cleared = state.storage.persist(key).await?;
     Ok(RespReply::Integer(i64::from(cleared)))
+}
+
+async fn handle_keys(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("KEYS", args.len() == 1)?;
+    let pattern = arg_as_str(&args[0])?;
+    let keys = state.storage.keys(pattern).await?;
+    Ok(RespReply::Array(keys.into_iter().map(|k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))).collect()))
+}
+
+async fn handle_scan(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SCAN", !args.is_empty())?;
+    let cursor_arg = arg_as_str(&args[0])?;
+    // Redis convention: "0" means start / done.
+    let cursor: Option<String> = if cursor_arg == "0" { None } else { Some(cursor_arg.to_string()) };
+
+    let mut pattern: Option<String> = None;
+    let mut count: usize = 10; // Redis default
+    let mut i = 1;
+    while i < args.len() {
+        let opt = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match opt.as_str() {
+            "MATCH" => {
+                let v = args.get(i + 1).ok_or_else(|| RustyAntError::Parse("MATCH requires a pattern".into()))?;
+                pattern = Some(arg_as_string(v)?);
+                i += 2;
+            }
+            "COUNT" => {
+                let v = args.get(i + 1).ok_or_else(|| RustyAntError::Parse("COUNT requires a value".into()))?;
+                let c = parse_i64(v, "COUNT")?;
+                if c <= 0 {
+                    return Err(RustyAntError::Parse("COUNT must be positive".into()));
+                }
+                count = usize::try_from(c).unwrap_or(10);
+                i += 2;
+            }
+            other => {
+                return Err(RustyAntError::Parse(format!("unsupported SCAN option: {other}")));
+            }
+        }
+    }
+
+    let (keys, next) = state.storage.scan(cursor.as_deref(), pattern.as_deref(), count).await?;
+    let cursor_out = next.unwrap_or_else(|| "0".to_string());
+    Ok(RespReply::Array(vec![
+        RespReply::BulkString(Some(Bytes::from(cursor_out.into_bytes()))),
+        RespReply::Array(keys.into_iter().map(|k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))).collect()),
+    ]))
 }
 
 async fn handle_lindex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
