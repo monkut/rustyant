@@ -58,7 +58,7 @@ Implemented:
 | Group | Commands |
 |---|---|
 | Server | `PING` |
-| Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options) |
+| Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE` |
 | Strings | `GET`, `SET` (+ `EX` / `PX` options), `GETSET`, `SETNX`, `SETEX`, `MGET`, `MSET`, `DEL`, `EXISTS`, `EXPIRE`, `PERSIST`, `TTL`, `INCR`, `INCRBY` |
 | Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HMGET`, `HINCRBY` |
 | Lists | `LPUSH`, `RPUSH`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM` |
