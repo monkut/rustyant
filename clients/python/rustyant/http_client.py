@@ -3,8 +3,13 @@ Rustyant HTTP client — one POST per command, RESP2 in body/response.
 
 Alternative to the WebSocket `Client` when the rustyant Lambda is fronted by
 an HTTP endpoint (Lambda Function URL, API Gateway HTTP API, or the legacy
-REST API). Simpler to deploy — no WebSocket API infrastructure — at the cost
-of per-command HTTP + TLS handshake.
+REST API). Both HTTP and WebSocket deployments are VPC-less and have
+equivalent infrastructure footprint — the distinction is developer-facing:
+the HTTP path is one Lambda behind one HTTPS route, while the WebSocket path
+needs `$connect`/`$disconnect`/`$default` routes and the
+`execute-api:ManageConnections` IAM grant so the Lambda can reply via the
+management API. Trade-off: HTTP pays a per-command TLS handshake; WebSocket
+pays the handshake once per connection.
 
 Example:
 

@@ -43,7 +43,7 @@ from rustyant import Client
 with Client("wss://abc.execute-api.us-east-1.amazonaws.com/prod") as c:
     c.set("k", "v"); c.get("k")  # b"v"
 
-# HTTP — one POST per command, simpler deploy
+# HTTP — one POST per command, Lambda Function URL works
 from rustyant import HttpClient
 with HttpClient("https://abc.lambda-url.us-east-1.on.aws") as c:
     c.set("k", "v"); c.get("k")  # b"v"

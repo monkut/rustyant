@@ -12,12 +12,14 @@ uv pip install rustyant
 
 ## Transports
 
-| Class | Transport | When to use |
+| Class | Transport | Server side |
 |---|---|---|
-| `Client` | WebSocket (wss://) | Persistent connection, no per-command handshake, pipelining |
-| `HttpClient` | HTTPS (https://) | One POST per command; simpler deploy — Lambda Function URL works |
+| `Client` | WebSocket (wss://) | API Gateway WebSocket API → Lambda; persistent connection, pipelining |
+| `HttpClient` | HTTPS (https://) | Lambda Function URL or API Gateway HTTP API; one POST per command |
 
-Both expose the same `redis-py`-shaped method surface (`get`/`set`/`hset`/…) via a shared base class.
+Both server-side options are VPC-less with roughly the same footprint. The HTTP path is one Lambda behind one HTTPS route; the WebSocket path adds three routes (`$connect`/`$disconnect`/`$default`) plus the `execute-api:ManageConnections` IAM grant so the Lambda can reply via the management API. HTTP pays a per-command TLS handshake; WebSocket pays it once per connection.
+
+Both clients expose the same `redis-py`-shaped method surface (`get`/`set`/`hset`/…) via a shared base class.
 
 ## Usage — WebSocket
 
