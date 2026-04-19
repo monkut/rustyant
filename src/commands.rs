@@ -109,6 +109,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "DEL" => handle_del(state, args).await,
         "EXISTS" => handle_exists(state, args).await,
         "EXPIRE" => handle_expire(state, args).await,
+        "EXPIREAT" => handle_expireat(state, args).await,
+        "PEXPIREAT" => handle_pexpireat(state, args).await,
         "PERSIST" => handle_persist(state, args).await,
         "TTL" => handle_ttl(state, args).await,
         "KEYS" => handle_keys(state, args).await,
@@ -256,6 +258,22 @@ async fn handle_expire(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
     let key = arg_as_str(&args[0])?;
     let secs = parse_i64(&args[1], "seconds")?;
     let set = state.storage.expire_at(key, now_ms() + secs * 1000).await?;
+    Ok(RespReply::Integer(i64::from(set)))
+}
+
+async fn handle_expireat(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("EXPIREAT", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let unix_secs = parse_i64(&args[1], "unix-time-seconds")?;
+    let set = state.storage.expire_at(key, unix_secs.saturating_mul(1000)).await?;
+    Ok(RespReply::Integer(i64::from(set)))
+}
+
+async fn handle_pexpireat(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("PEXPIREAT", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let unix_ms = parse_i64(&args[1], "unix-time-milliseconds")?;
+    let set = state.storage.expire_at(key, unix_ms).await?;
     Ok(RespReply::Integer(i64::from(set)))
 }
 
