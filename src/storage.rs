@@ -127,6 +127,7 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn hvals(&self, key: &str) -> Result<Vec<Bytes>, RustyAntError>;
     async fn hexists(&self, key: &str, field: &str) -> Result<bool, RustyAntError>;
     async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError>;
+    async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError>;
 
     async fn list_push(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError>;
     async fn list_pop(&self, key: &str, count: usize, left: bool) -> Result<Vec<Bytes>, RustyAntError>;
@@ -134,11 +135,14 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn llen(&self, key: &str) -> Result<i64, RustyAntError>;
 
     async fn sadd(&self, key: &str, members: Vec<String>) -> Result<i64, RustyAntError>;
+    async fn srem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
     async fn smembers(&self, key: &str) -> Result<Vec<String>, RustyAntError>;
     async fn sismember(&self, key: &str, member: &str) -> Result<bool, RustyAntError>;
     async fn scard(&self, key: &str) -> Result<i64, RustyAntError>;
 
     async fn zadd(&self, key: &str, pairs: Vec<(f64, String)>) -> Result<i64, RustyAntError>;
+    async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
+    async fn zincr_by(&self, key: &str, member: &str, delta: f64) -> Result<f64, RustyAntError>;
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError>;
     async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError>;
     async fn zcard(&self, key: &str) -> Result<i64, RustyAntError>;
@@ -619,6 +623,100 @@ impl Storage for S3Storage {
             None => Ok(0),
         }
     }
+
+    async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError> {
+        let field = field.to_string();
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            let current: i64 = map
+                .get(&field)
+                .map(|v| {
+                    let s = std::str::from_utf8(v)
+                        .map_err(|_| RustyAntError::Parse("hash value is not an integer".into()))?;
+                    s.parse::<i64>().map_err(|_| RustyAntError::Parse("hash value is not an integer".into()))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let new_val =
+                current.checked_add(delta).ok_or_else(|| RustyAntError::Parse("increment overflow".into()))?;
+            map.insert(field.clone(), new_val.to_string().into_bytes());
+            let new_entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
+            Ok(CasAction::Write(new_entry, new_val))
+        })
+        .await
+    }
+
+    async fn srem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError> {
+        let members = members.to_vec();
+        self.cas(key, move |entry| {
+            let (mut set, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Set(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let mut removed: i64 = 0;
+            for m in &members {
+                if set.remove(m) {
+                    removed += 1;
+                }
+            }
+            if set.is_empty() {
+                Ok(CasAction::Delete(removed))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::Set(set) };
+                Ok(CasAction::Write(new_entry, removed))
+            }
+        })
+        .await
+    }
+
+    async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError> {
+        let members = members.to_vec();
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let mut removed: i64 = 0;
+            for m in &members {
+                if map.remove(m).is_some() {
+                    removed += 1;
+                }
+            }
+            if map.is_empty() {
+                Ok(CasAction::Delete(removed))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
+                Ok(CasAction::Write(new_entry, removed))
+            }
+        })
+        .await
+    }
+
+    async fn zincr_by(&self, key: &str, member: &str, delta: f64) -> Result<f64, RustyAntError> {
+        let member = member.to_string();
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            let current = map.get(&member).copied().unwrap_or(0.0);
+            let new_score = current + delta;
+            if new_score.is_nan() {
+                return Err(RustyAntError::Parse("resulting score is NaN".into()));
+            }
+            map.insert(member.clone(), new_score);
+            let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
+            Ok(CasAction::Write(new_entry, new_score))
+        })
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1089,99 @@ impl Storage for InMemoryStorage {
             Some(_) => Err(wrong_type(key)),
             None => Ok(0),
         }
+    }
+
+    async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError> {
+        let (mut map, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => (BTreeMap::new(), None),
+        };
+        let current: i64 = map
+            .get(field)
+            .map(|v| {
+                let s =
+                    std::str::from_utf8(v).map_err(|_| RustyAntError::Parse("hash value is not an integer".into()))?;
+                s.parse::<i64>().map_err(|_| RustyAntError::Parse("hash value is not an integer".into()))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let new_val = current.checked_add(delta).ok_or_else(|| RustyAntError::Parse("increment overflow".into()))?;
+        map.insert(field.to_string(), new_val.to_string().into_bytes());
+        let entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(new_val)
+    }
+
+    async fn srem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError> {
+        let (mut set, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), expires_at_ms }) => (s, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(0),
+        };
+        let mut removed: i64 = 0;
+        for m in members {
+            if set.remove(m) {
+                removed += 1;
+            }
+        }
+        if set.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::Set(set) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(removed)
+    }
+
+    async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError> {
+        let (mut map, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(0),
+        };
+        let mut removed: i64 = 0;
+        for m in members {
+            if map.remove(m).is_some() {
+                removed += 1;
+            }
+        }
+        if map.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(removed)
+    }
+
+    async fn zincr_by(&self, key: &str, member: &str, delta: f64) -> Result<f64, RustyAntError> {
+        let (mut map, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => (BTreeMap::new(), None),
+        };
+        let current = map.get(member).copied().unwrap_or(0.0);
+        let new_score = current + delta;
+        if new_score.is_nan() {
+            return Err(RustyAntError::Parse("resulting score is NaN".into()));
+        }
+        map.insert(member.to_string(), new_score);
+        let entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(new_score)
     }
 }
 
