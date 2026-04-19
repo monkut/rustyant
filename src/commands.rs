@@ -101,6 +101,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         // Strings
         "GET" => handle_get(state, args).await,
         "GETSET" => handle_getset(state, args).await,
+        "GETDEL" => handle_getdel(state, args).await,
         "SET" => handle_set(state, args).await,
         "SETNX" => handle_setnx(state, args).await,
         "SETEX" => handle_setex(state, args).await,
@@ -511,6 +512,13 @@ async fn handle_getset(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
     arity("GETSET", args.len() == 2)?;
     let key = arg_as_str(&args[0])?;
     let old = state.storage.getset(key, args[1].clone()).await?;
+    Ok(old.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(v))))
+}
+
+async fn handle_getdel(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("GETDEL", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    let old = state.storage.get_and_delete(key).await?;
     Ok(old.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(v))))
 }
 

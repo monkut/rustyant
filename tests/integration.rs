@@ -210,6 +210,29 @@ async fn decrby_negative_value_increments() {
 }
 
 #[tokio::test]
+async fn getdel_returns_value_and_removes_key() {
+    let state = test_state();
+    call(&state, &[b"SET", b"token", b"abc123"]).await;
+    call(&state, &[b"GETDEL", b"token"]).await.expect_bulk(b"abc123");
+    call(&state, &[b"EXISTS", b"token"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"token"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn getdel_on_missing_key_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"GETDEL", b"ghost"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn getdel_on_wrong_type_errors_and_preserves_key() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"queue", b"item"]).await;
+    call(&state, &[b"GETDEL", b"queue"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"EXISTS", b"queue"]).await.expect_integer(1);
+}
+
+#[tokio::test]
 async fn set_with_ex_sets_ttl() {
     let state = test_state();
     call(&state, &[b"SET", b"k", b"v", b"EX", b"60"]).await.expect_simple("OK");
