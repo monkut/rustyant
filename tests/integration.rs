@@ -417,6 +417,124 @@ async fn zadd_odd_args_errors() {
     call(&state, &[b"ZADD", b"z", b"1"]).await.expect_error_prefix("ERR");
 }
 
+// ---------------------------------------------------------------------------
+// Additional read-only commands (HLEN / HKEYS / HVALS / HEXISTS / HMGET,
+// LLEN, SMEMBERS / SISMEMBER / SCARD, ZSCORE / ZCARD)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hlen_counts_fields() {
+    let state = test_state();
+    call(&state, &[b"HLEN", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"HSET", b"h", b"a", b"1", b"b", b"2", b"c", b"3"]).await;
+    call(&state, &[b"HLEN", b"h"]).await.expect_integer(3);
+}
+
+#[tokio::test]
+async fn hkeys_returns_field_names_sorted() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"b", b"2", b"a", b"1"]).await;
+    let items = call(&state, &[b"HKEYS", b"h"]).await.into_bulk_array();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].as_ref(), b"a");
+    assert_eq!(items[1].as_ref(), b"b");
+}
+
+#[tokio::test]
+async fn hvals_returns_values() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"a", b"x", b"b", b"y"]).await;
+    let items = call(&state, &[b"HVALS", b"h"]).await.into_bulk_array();
+    assert_eq!(items.len(), 2);
+    // Keys are BTreeMap-ordered (a, b); values follow the same order.
+    assert_eq!(items[0].as_ref(), b"x");
+    assert_eq!(items[1].as_ref(), b"y");
+}
+
+#[tokio::test]
+async fn hexists_returns_0_or_1() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"name", b"alice"]).await;
+    call(&state, &[b"HEXISTS", b"h", b"name"]).await.expect_integer(1);
+    call(&state, &[b"HEXISTS", b"h", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"HEXISTS", b"nope", b"field"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn hmget_returns_nil_for_missing_fields() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"a", b"1", b"c", b"3"]).await;
+    let raw = call(&state, &[b"HMGET", b"h", b"a", b"b", b"c"]).await.raw;
+    // Array of 3: bulk "1", nil, bulk "3"
+    assert_eq!(&raw, b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n");
+}
+
+#[tokio::test]
+async fn llen_counts_elements() {
+    let state = test_state();
+    call(&state, &[b"LLEN", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c"]).await;
+    call(&state, &[b"LLEN", b"l"]).await.expect_integer(3);
+    call(&state, &[b"LPOP", b"l"]).await;
+    call(&state, &[b"LLEN", b"l"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn smembers_returns_all() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"z", b"a", b"m"]).await;
+    let items = call(&state, &[b"SMEMBERS", b"s"]).await.into_bulk_array();
+    assert_eq!(items.len(), 3);
+    // BTreeSet ordering → alphabetical.
+    assert_eq!(items[0].as_ref(), b"a");
+    assert_eq!(items[1].as_ref(), b"m");
+    assert_eq!(items[2].as_ref(), b"z");
+}
+
+#[tokio::test]
+async fn sismember_returns_0_or_1() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"alice", b"bob"]).await;
+    call(&state, &[b"SISMEMBER", b"s", b"alice"]).await.expect_integer(1);
+    call(&state, &[b"SISMEMBER", b"s", b"carol"]).await.expect_integer(0);
+    call(&state, &[b"SISMEMBER", b"nope", b"x"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn scard_counts_members() {
+    let state = test_state();
+    call(&state, &[b"SCARD", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"SADD", b"s", b"a", b"b", b"c", b"a"]).await;
+    call(&state, &[b"SCARD", b"s"]).await.expect_integer(3);
+}
+
+#[tokio::test]
+async fn zscore_returns_score_or_nil() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2.5", b"b"]).await;
+    call(&state, &[b"ZSCORE", b"z", b"a"]).await.expect_bulk(b"1");
+    call(&state, &[b"ZSCORE", b"z", b"b"]).await.expect_bulk(b"2.5");
+    call(&state, &[b"ZSCORE", b"z", b"missing"]).await.expect_nil();
+    call(&state, &[b"ZSCORE", b"nope", b"m"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn zcard_counts_members() {
+    let state = test_state();
+    call(&state, &[b"ZCARD", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZCARD", b"z"]).await.expect_integer(3);
+}
+
+#[tokio::test]
+async fn new_read_commands_all_error_on_wrong_type() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    for cmd in [b"HLEN" as &[u8], b"HKEYS", b"HVALS", b"LLEN", b"SMEMBERS", b"SCARD", b"ZCARD"] {
+        call(&state, &[cmd, b"k"]).await.expect_error_prefix("ERR");
+    }
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {

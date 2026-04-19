@@ -122,15 +122,26 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, RustyAntError>;
     async fn hdel(&self, key: &str, fields: &[String]) -> Result<i64, RustyAntError>;
     async fn hgetall(&self, key: &str) -> Result<Vec<(String, Bytes)>, RustyAntError>;
+    async fn hlen(&self, key: &str) -> Result<i64, RustyAntError>;
+    async fn hkeys(&self, key: &str) -> Result<Vec<String>, RustyAntError>;
+    async fn hvals(&self, key: &str) -> Result<Vec<Bytes>, RustyAntError>;
+    async fn hexists(&self, key: &str, field: &str) -> Result<bool, RustyAntError>;
+    async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError>;
 
     async fn list_push(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError>;
     async fn list_pop(&self, key: &str, count: usize, left: bool) -> Result<Vec<Bytes>, RustyAntError>;
     async fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Bytes>, RustyAntError>;
+    async fn llen(&self, key: &str) -> Result<i64, RustyAntError>;
 
     async fn sadd(&self, key: &str, members: Vec<String>) -> Result<i64, RustyAntError>;
+    async fn smembers(&self, key: &str) -> Result<Vec<String>, RustyAntError>;
+    async fn sismember(&self, key: &str, member: &str) -> Result<bool, RustyAntError>;
+    async fn scard(&self, key: &str) -> Result<i64, RustyAntError>;
 
     async fn zadd(&self, key: &str, pairs: Vec<(f64, String)>) -> Result<i64, RustyAntError>;
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError>;
+    async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError>;
+    async fn zcard(&self, key: &str) -> Result<i64, RustyAntError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +529,96 @@ impl Storage for S3Storage {
         };
         Ok(sorted[s..=e].iter().map(|(m, _)| m.clone()).collect())
     }
+
+    async fn hlen(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(i64::try_from(m.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn hkeys(&self, key: &str) -> Result<Vec<String>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.into_keys().collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn hvals(&self, key: &str) -> Result<Vec<Bytes>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.into_values().map(Bytes::from).collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn hexists(&self, key: &str, field: &str) -> Result<bool, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.contains_key(field)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(false),
+        }
+    }
+
+    async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => {
+                Ok(fields.iter().map(|f| m.get(f).map(|v| Bytes::from(v.clone()))).collect())
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(fields.iter().map(|_| None).collect()),
+        }
+    }
+
+    async fn llen(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::List(l), .. }) => Ok(i64::try_from(l.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn smembers(&self, key: &str) -> Result<Vec<String>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(s.into_iter().collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn sismember(&self, key: &str, member: &str) -> Result<bool, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(s.contains(member)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(false),
+        }
+    }
+
+    async fn scard(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(i64::try_from(s.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(m.get(member).copied()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
+        }
+    }
+
+    async fn zcard(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(i64::try_from(m.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +901,96 @@ impl Storage for InMemoryStorage {
             return Ok(Vec::new());
         };
         Ok(sorted[s..=e].iter().map(|(m, _)| m.clone()).collect())
+    }
+
+    async fn hlen(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(i64::try_from(m.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn hkeys(&self, key: &str) -> Result<Vec<String>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.into_keys().collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn hvals(&self, key: &str) -> Result<Vec<Bytes>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.into_values().map(Bytes::from).collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn hexists(&self, key: &str, field: &str) -> Result<bool, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.contains_key(field)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(false),
+        }
+    }
+
+    async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), .. }) => {
+                Ok(fields.iter().map(|f| m.get(f).map(|v| Bytes::from(v.clone()))).collect())
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(fields.iter().map(|_| None).collect()),
+        }
+    }
+
+    async fn llen(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::List(l), .. }) => Ok(i64::try_from(l.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn smembers(&self, key: &str) -> Result<Vec<String>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(s.into_iter().collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn sismember(&self, key: &str, member: &str) -> Result<bool, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(s.contains(member)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(false),
+        }
+    }
+
+    async fn scard(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(i64::try_from(s.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(m.get(member).copied()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
+        }
+    }
+
+    async fn zcard(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(i64::try_from(m.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
     }
 }
 

@@ -40,17 +40,28 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HGET" => handle_hget(state, args).await,
         "HDEL" => handle_hdel(state, args).await,
         "HGETALL" => handle_hgetall(state, args).await,
+        "HLEN" => handle_hlen(state, args).await,
+        "HKEYS" => handle_hkeys(state, args).await,
+        "HVALS" => handle_hvals(state, args).await,
+        "HEXISTS" => handle_hexists(state, args).await,
+        "HMGET" => handle_hmget(state, args).await,
         // Lists
         "LPUSH" => handle_push(state, args, true).await,
         "RPUSH" => handle_push(state, args, false).await,
         "LPOP" => handle_pop(state, args, true).await,
         "RPOP" => handle_pop(state, args, false).await,
         "LRANGE" => handle_lrange(state, args).await,
+        "LLEN" => handle_llen(state, args).await,
         // Sets
         "SADD" => handle_sadd(state, args).await,
+        "SMEMBERS" => handle_smembers(state, args).await,
+        "SISMEMBER" => handle_sismember(state, args).await,
+        "SCARD" => handle_scard(state, args).await,
         // Sorted sets
         "ZADD" => handle_zadd(state, args).await,
         "ZRANGE" => handle_zrange(state, args).await,
+        "ZSCORE" => handle_zscore(state, args).await,
+        "ZCARD" => handle_zcard(state, args).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
     }
 }
@@ -299,4 +310,101 @@ async fn handle_zrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
     Ok(RespReply::Array(
         members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
     ))
+}
+
+// ---- Additional read-only commands ----------------------------------------
+
+async fn handle_hlen(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HLEN", args.len() == 1)?;
+    let n = state.storage.hlen(arg_as_str(&args[0])?).await?;
+    Ok(RespReply::Integer(n))
+}
+
+async fn handle_hkeys(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HKEYS", args.len() == 1)?;
+    let keys = state.storage.hkeys(arg_as_str(&args[0])?).await?;
+    Ok(RespReply::Array(keys.into_iter().map(|k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))).collect()))
+}
+
+async fn handle_hvals(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HVALS", args.len() == 1)?;
+    let vals = state.storage.hvals(arg_as_str(&args[0])?).await?;
+    Ok(RespReply::Array(vals.into_iter().map(|v| RespReply::BulkString(Some(v))).collect()))
+}
+
+async fn handle_hexists(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HEXISTS", args.len() == 2)?;
+    let present = state.storage.hexists(arg_as_str(&args[0])?, arg_as_str(&args[1])?).await?;
+    Ok(RespReply::Integer(i64::from(present)))
+}
+
+async fn handle_hmget(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HMGET", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let fields: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let vals = state.storage.hmget(key, &fields).await?;
+    Ok(RespReply::Array(
+        vals.into_iter().map(|v| v.map_or(RespReply::Nil, |b| RespReply::BulkString(Some(b)))).collect(),
+    ))
+}
+
+async fn handle_llen(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LLEN", args.len() == 1)?;
+    let n = state.storage.llen(arg_as_str(&args[0])?).await?;
+    Ok(RespReply::Integer(n))
+}
+
+async fn handle_smembers(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SMEMBERS", args.len() == 1)?;
+    let members = state.storage.smembers(arg_as_str(&args[0])?).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_sismember(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SISMEMBER", args.len() == 2)?;
+    let present = state.storage.sismember(arg_as_str(&args[0])?, arg_as_str(&args[1])?).await?;
+    Ok(RespReply::Integer(i64::from(present)))
+}
+
+async fn handle_scard(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SCARD", args.len() == 1)?;
+    let n = state.storage.scard(arg_as_str(&args[0])?).await?;
+    Ok(RespReply::Integer(n))
+}
+
+async fn handle_zscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZSCORE", args.len() == 2)?;
+    let score = state.storage.zscore(arg_as_str(&args[0])?, arg_as_str(&args[1])?).await?;
+    Ok(score.map_or(RespReply::Nil, |s| {
+        // Redis returns scores as bulk strings using the canonical float format.
+        RespReply::BulkString(Some(Bytes::from(format_score(s).into_bytes())))
+    }))
+}
+
+async fn handle_zcard(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZCARD", args.len() == 1)?;
+    let n = state.storage.zcard(arg_as_str(&args[0])?).await?;
+    Ok(RespReply::Integer(n))
+}
+
+/// Match Redis's score formatting: integers as `"42"`, finite floats via
+/// their shortest round-trippable decimal, special values spelled out.
+fn format_score(s: f64) -> String {
+    if s.is_nan() {
+        return "nan".to_string();
+    }
+    if s.is_infinite() {
+        return (if s > 0.0 { "inf" } else { "-inf" }).to_string();
+    }
+    // Integer-valued scores inside i64 range → render without a decimal point.
+    // Casting through the safe integer window first keeps clippy's truncation
+    // lint satisfied.
+    if s.fract() == 0.0 && s.abs() < 9.007_199_254_740_992e15 {
+        #[allow(clippy::cast_possible_truncation)] // fract==0 && range checked
+        let as_int = s as i64;
+        return as_int.to_string();
+    }
+    format!("{s}")
 }
