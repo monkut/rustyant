@@ -121,6 +121,12 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
             let delta = parse_delta(&args)?;
             handle_incrby(state, args, delta).await
         }
+        "DECR" => handle_incrby(state, args, -1).await,
+        "DECRBY" => {
+            let delta = parse_delta(&args)?;
+            let neg = delta.checked_neg().ok_or_else(|| RustyAntError::Parse("decrement overflow".into()))?;
+            handle_incrby(state, args, neg).await
+        }
         // Hashes
         "HSET" => handle_hset(state, args).await,
         "HGET" => handle_hget(state, args).await,
