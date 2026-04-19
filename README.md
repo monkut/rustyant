@@ -142,15 +142,19 @@ just ws-template-deploy BUCKET=my-kv-bucket     # creates stack rant-rustyant-ws
 Outputs include `WebSocketUrl`, which is the `wss://…` URL to hand to the Python client:
 
 ```python
-from rustyant import Client
-c = Client("wss://abc123.execute-api.ap-northeast-1.amazonaws.com/prod")
-c.set("hello", "world")
+from rustyant import connect_ws
+r = connect_ws("wss://abc123.execute-api.ap-northeast-1.amazonaws.com/prod")
+r.set("hello", "world")
 ```
 
 The HTTP variant (Lambda URL fronting the `rustyant` binary) is deployed separately via `just lambda-deploy` — not provisioned by this template.
 
+## Observability
+
+The `rustyant` and `rustyant-ws` binaries emit structured JSON logs via `tracing`; each dispatched command produces one log line with `command`, `argc`, `outcome` (ok / wrong_type / contention / s3 / …), and `duration_ms`. When `RUSTYANT_EMF_NAMESPACE` is set (the SAM template sets it to `rustyant` by default), each dispatch also emits a CloudWatch Embedded Metric Format line — CloudWatch Logs auto-extracts `DispatchCount` and `DispatchLatency` under that namespace, dimensioned by `{Command, Outcome}`, so dashboards can slice by command and failure mode without SDK calls.
+
 ## Status
 
-Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch, S3-backed storage with per-key TTL, 56+ Rust tests (8 RESP units + 8 WS units + 34 handler integration + 6 floci-gated S3), 8 Python client encoder tests, CI on GitHub Actions with floci as a service container, SAM template for the WebSocket stack.
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 123 Rust tests across 5 suites (18 lib units + 81 HTTP integration + 11 redis-py compat + 6 WebSocket E2E + 7 encoder) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
 
-Not wired: no CI step for `sam validate`; no end-to-end test driving a real WebSocket connection against the deployed binary. No conditional-write concurrency control — read-modify-write commands (INCR, HSET, etc.) are last-writer-wins under concurrency.
+Not wired: no end-to-end test driving a real WebSocket connection against a deployed binary in AWS; the `s3_concurrent_incr_converges` CAS test is gated behind `RUSTYANT_S3_CAS=1` because floci doesn't enforce `If-Match` headers.
