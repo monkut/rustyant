@@ -116,7 +116,29 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
 
     async fn get_string(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError>;
+    async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError>;
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError>;
+
+    /// Default: sequential `get_string` per key. Impls may override with a
+    /// batched S3 request.
+    async fn mget(&self, keys: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(self.get_string(k).await?);
+        }
+        Ok(out)
+    }
+
+    /// Default: sequential `set_string` per pair. Not atomic across keys —
+    /// a failure midway leaves some keys set. Real Redis is atomic; that
+    /// semantic isn't worth emulating over S3 without a dedicated transaction
+    /// log, and the S3 backing makes the fire-and-forget variant fast enough.
+    async fn mset(&self, pairs: Vec<(String, Bytes)>) -> Result<(), RustyAntError> {
+        for (k, v) in pairs {
+            self.set_string(&k, v, None).await?;
+        }
+        Ok(())
+    }
 
     async fn hset(&self, key: &str, pairs: Vec<(String, Bytes)>) -> Result<i64, RustyAntError>;
     async fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, RustyAntError>;
@@ -336,6 +358,18 @@ impl Storage for S3Storage {
 
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError> {
         self.save(key, &StoredValue { expires_at_ms, value: Value::String(value.to_vec()) }).await
+    }
+
+    async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError> {
+        // Surface any expired entry so `If-None-Match: *` doesn't reject
+        // a legitimate create because the zombie object hasn't been swept yet.
+        let _ = self.load_with_etag(key).await?;
+        let entry = StoredValue { expires_at_ms, value: Value::String(value.to_vec()) };
+        match self.save_cas(key, &entry, CasCondition::CreateOnly).await {
+            Ok(()) => Ok(true),
+            Err(RustyAntError::Contention) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError> {
@@ -801,6 +835,22 @@ impl Storage for InMemoryStorage {
             map.insert(key.to_string(), entry);
         });
         Ok(())
+    }
+
+    async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError> {
+        let entry = StoredValue { expires_at_ms, value: Value::String(value.to_vec()) };
+        Ok(self.with_entry_mut(|map| {
+            // Evict any expired occupant; then the emptiness check is honest.
+            if let Some(existing) = map.get(key) {
+                if is_expired(existing) {
+                    map.remove(key);
+                } else {
+                    return false;
+                }
+            }
+            map.insert(key.to_string(), entry);
+            true
+        }))
     }
 
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError> {

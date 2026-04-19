@@ -418,6 +418,64 @@ async fn zadd_odd_args_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// String multi-key + NX/EX (SETNX, SETEX, MGET, MSET)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn setnx_sets_missing_key() {
+    let state = test_state();
+    call(&state, &[b"SETNX", b"k", b"v1"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"v1");
+    // Second SETNX must not overwrite.
+    call(&state, &[b"SETNX", b"k", b"v2"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"v1");
+}
+
+#[tokio::test]
+async fn setex_sets_value_with_ttl() {
+    let state = test_state();
+    call(&state, &[b"SETEX", b"k", b"120", b"v"]).await.expect_simple("OK");
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"v");
+    // TTL should be ~120s.
+    let reply = call(&state, &[b"TTL", b"k"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw);
+    let n: i64 = raw.trim_start_matches(':').trim_end().parse().expect("int");
+    assert!((110..=120).contains(&n), "TTL out of range: {n}");
+}
+
+#[tokio::test]
+async fn setex_rejects_non_positive_seconds() {
+    let state = test_state();
+    call(&state, &[b"SETEX", b"k", b"0", b"v"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"SETEX", b"k", b"-5", b"v"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn mget_returns_nil_for_missing_keys() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    call(&state, &[b"SET", b"c", b"3"]).await;
+    let raw = call(&state, &[b"MGET", b"a", b"b", b"c"]).await.raw;
+    // Array of 3: bulk "1", nil, bulk "3"
+    assert_eq!(&raw, b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n");
+}
+
+#[tokio::test]
+async fn mset_sets_all_pairs() {
+    let state = test_state();
+    call(&state, &[b"MSET", b"a", b"1", b"b", b"2", b"c", b"3"]).await.expect_simple("OK");
+    call(&state, &[b"GET", b"a"]).await.expect_bulk(b"1");
+    call(&state, &[b"GET", b"b"]).await.expect_bulk(b"2");
+    call(&state, &[b"GET", b"c"]).await.expect_bulk(b"3");
+}
+
+#[tokio::test]
+async fn mset_odd_args_errors() {
+    let state = test_state();
+    call(&state, &[b"MSET", b"a", b"1", b"b"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
 // Additional read-only commands (HLEN / HKEYS / HVALS / HEXISTS / HMGET,
 // LLEN, SMEMBERS / SISMEMBER / SCARD, ZSCORE / ZCARD)
 // ---------------------------------------------------------------------------
