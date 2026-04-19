@@ -1,6 +1,6 @@
 [project]
 name = "rustyant"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for rustyant — Redis-compatible key-value store on AWS Lambda + S3"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -8,6 +8,7 @@ license = { text = "LicenseRef-KICONIAWORKS-Customers" }
 authors = [{ name = "monkut" }]
 dependencies = [
     "hiredis>=2.0",
+    "requests>=2.31",
     "websocket-client>=1.7",
 ]
 

@@ -1,6 +1,6 @@
 # rustyant — Python client
 
-Python client for [rustyant](https://github.com/monkut/rustyant) — a Redis-compatible key-value store served over AWS API Gateway WebSocket + Lambda + S3.
+Python client for [rustyant](https://github.com/monkut/rustyant) — a Redis-compatible key-value store served over AWS Lambda + S3. Two transports, one API.
 
 ## Install
 
@@ -10,7 +10,16 @@ pip install rustyant
 uv pip install rustyant
 ```
 
-## Usage
+## Transports
+
+| Class | Transport | When to use |
+|---|---|---|
+| `Client` | WebSocket (wss://) | Persistent connection, no per-command handshake, pipelining |
+| `HttpClient` | HTTPS (https://) | One POST per command; simpler deploy — Lambda Function URL works |
+
+Both expose the same `redis-py`-shaped method surface (`get`/`set`/`hset`/…) via a shared base class.
+
+## Usage — WebSocket
 
 ```python
 from rustyant import Client
@@ -39,6 +48,26 @@ Context-manager form auto-closes the WebSocket:
 with Client("wss://…") as c:
     c.set("k", "v")
 ```
+
+## Usage — HTTP
+
+```python
+from rustyant import HttpClient
+
+# Point at a Lambda Function URL or API Gateway HTTP API
+c = HttpClient("https://abc123.lambda-url.us-east-1.on.aws")
+
+c.set("hello", "world")
+assert c.get("hello") == b"world"
+
+# Everything else is identical:
+c.hset("profile", "name", "alice")
+c.zadd("scores", {"alice": 10, "bob": 5})
+
+c.close()
+```
+
+`HttpClient` re-uses a `requests.Session` internally, so keep-alive and connection pooling work against long-lived handles. Pass `session=...` to inject a pre-configured session (custom adapters, retry policies, auth headers). Any session you pass is not closed by `HttpClient.close()`.
 
 ## Command surface
 

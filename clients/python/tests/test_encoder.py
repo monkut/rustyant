@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from rustyant.client import _encode_command
+from rustyant._base import _encode_command
 
 
 @pytest.mark.parametrize(
