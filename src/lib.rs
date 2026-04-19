@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod error;
 pub mod handler;
+pub mod metrics;
 pub mod resp;
 pub mod settings;
 pub mod state;

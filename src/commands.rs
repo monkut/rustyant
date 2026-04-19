@@ -4,6 +4,7 @@ use bytes::Bytes;
 use tracing::info;
 
 use crate::error::RustyAntError;
+use crate::metrics;
 use crate::resp::RespReply;
 use crate::state::State;
 use crate::storage::{ScoreBound, TtlResult, now_ms};
@@ -77,6 +78,9 @@ pub async fn dispatch(state: &State, command_tokens: Vec<Bytes>) -> RespReply {
         duration_ms,
         "command dispatched",
     );
+    if let Some(ns) = state.settings.emf_namespace.as_deref() {
+        metrics::emit_command_metrics(ns, &cmd_name, outcome.as_str(), duration_ms);
+    }
     match result {
         Ok(reply) => reply,
         Err(e) => RespReply::err(format!("ERR {e}")),

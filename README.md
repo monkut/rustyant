@@ -106,6 +106,7 @@ just test                 # cargo-nextest
 - `BUCKET` (required) — S3 bucket holding the key objects.
 - `KEY_PREFIX` (default `rustyant/`) — prefix prepended to every key.
 - `AWS_REGION`, `AWS_ENDPOINT_URL` — standard AWS env; `AWS_ENDPOINT_URL` points at a local S3 emulator.
+- `RUSTYANT_EMF_NAMESPACE` (optional) — when set, each dispatched command emits a CloudWatch Embedded Metric Format line to stdout with `DispatchCount` and `DispatchLatency` under the given namespace, dimensioned by `{Command, Outcome}`. Unset in local dev so the terminal stays clean; the SAM template sets it to `rustyant` for deployed Lambdas.
 
 ### Local S3 (floci)
 

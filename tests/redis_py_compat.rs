@@ -42,6 +42,7 @@ fn test_state() -> State {
         key_prefix: "redis-py/".to_string(),
         aws_region: None,
         aws_endpoint_url: None,
+        emf_namespace: None,
     };
     State::with_storage(settings, Arc::new(InMemoryStorage::new()))
 }

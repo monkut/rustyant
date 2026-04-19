@@ -46,6 +46,7 @@ Globals:
         KEY_PREFIX: !Ref KeyPrefix
         LOG_LEVEL: !Ref LogLevel
         RUST_LOG: !Ref LogLevel
+        RUSTYANT_EMF_NAMESPACE: rustyant
 
 Resources:
   # --- Storage ------------------------------------------------------------
