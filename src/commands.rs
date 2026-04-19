@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::error::RustyAntError;
 use crate::resp::RespReply;
 use crate::state::State;
-use crate::storage::{TtlResult, now_ms};
+use crate::storage::{ScoreBound, TtlResult, now_ms};
 
 pub async fn dispatch(state: &State, command_tokens: Vec<Bytes>) -> RespReply {
     match run(state, command_tokens).await {
@@ -25,6 +25,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "PING" => Ok(RespReply::SimpleString("PONG".into())),
         // Strings
         "GET" => handle_get(state, args).await,
+        "GETSET" => handle_getset(state, args).await,
         "SET" => handle_set(state, args).await,
         "SETNX" => handle_setnx(state, args).await,
         "SETEX" => handle_setex(state, args).await,
@@ -33,6 +34,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "DEL" => handle_del(state, args).await,
         "EXISTS" => handle_exists(state, args).await,
         "EXPIRE" => handle_expire(state, args).await,
+        "PERSIST" => handle_persist(state, args).await,
         "TTL" => handle_ttl(state, args).await,
         "INCR" => handle_incrby(state, args, 1).await,
         "INCRBY" => {
@@ -57,6 +59,9 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "RPOP" => handle_pop(state, args, false).await,
         "LRANGE" => handle_lrange(state, args).await,
         "LLEN" => handle_llen(state, args).await,
+        "LINDEX" => handle_lindex(state, args).await,
+        "LSET" => handle_lset(state, args).await,
+        "LREM" => handle_lrem(state, args).await,
         // Sets
         "SADD" => handle_sadd(state, args).await,
         "SREM" => handle_srem(state, args).await,
@@ -68,6 +73,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZREM" => handle_zrem(state, args).await,
         "ZINCRBY" => handle_zincrby(state, args).await,
         "ZRANGE" => handle_zrange(state, args).await,
+        "ZRANGEBYSCORE" => handle_zrangebyscore(state, args).await,
         "ZSCORE" => handle_zscore(state, args).await,
         "ZCARD" => handle_zcard(state, args).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
@@ -397,7 +403,57 @@ async fn handle_zcard(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
     Ok(RespReply::Integer(n))
 }
 
-// ---- String multi-key + NX/EX ---------------------------------------------
+// ---- String multi-key + NX/EX + GETSET + PERSIST --------------------------
+
+async fn handle_getset(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("GETSET", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let old = state.storage.getset(key, args[1].clone()).await?;
+    Ok(old.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(v))))
+}
+
+async fn handle_persist(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("PERSIST", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    let cleared = state.storage.persist(key).await?;
+    Ok(RespReply::Integer(i64::from(cleared)))
+}
+
+async fn handle_lindex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LINDEX", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let index = parse_i64(&args[1], "index")?;
+    let elem = state.storage.lindex(key, index).await?;
+    Ok(elem.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(v))))
+}
+
+async fn handle_lset(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LSET", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let index = parse_i64(&args[1], "index")?;
+    state.storage.lset(key, index, args[2].clone()).await?;
+    Ok(RespReply::ok())
+}
+
+async fn handle_lrem(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LREM", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let count = parse_i64(&args[1], "count")?;
+    let value = args[2].clone();
+    let removed = state.storage.lrem(key, count, value).await?;
+    Ok(RespReply::Integer(removed))
+}
+
+async fn handle_zrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZRANGEBYSCORE", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let min = ScoreBound::parse(arg_as_str(&args[1])?)?;
+    let max = ScoreBound::parse(arg_as_str(&args[2])?)?;
+    let members = state.storage.zrangebyscore(key, min, max).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
 
 async fn handle_setnx(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
     arity("SETNX", args.len() == 2)?;
