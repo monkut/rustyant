@@ -1,5 +1,5 @@
 use lambda_http::{Body, Error, Request, Response};
-use tracing::{error, info};
+use tracing::error;
 
 use crate::commands;
 use crate::resp;
@@ -24,7 +24,6 @@ pub async fn handle(state: State, event: Request) -> Result<Response<Body>, Erro
         return error_response("empty command");
     }
 
-    info!(argc = argv.len(), "dispatching command");
     let reply = commands::dispatch(&state, argv).await;
 
     let encoded = reply.encode().map_err(|e| Error::from(format!("encode: {e}")))?;

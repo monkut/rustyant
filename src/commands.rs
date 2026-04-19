@@ -1,12 +1,83 @@
+use std::time::Instant;
+
 use bytes::Bytes;
+use tracing::info;
 
 use crate::error::RustyAntError;
 use crate::resp::RespReply;
 use crate::state::State;
 use crate::storage::{ScoreBound, TtlResult, now_ms};
 
+/// Coarse classification of a dispatch result, emitted as a structured log
+/// field so `CloudWatch` queries can count/alert by outcome without string
+/// parsing error messages.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Outcome {
+    Ok,
+    UnknownCommand,
+    WrongArity,
+    WrongType,
+    Parse,
+    RespParse,
+    Contention,
+    S3,
+    Config,
+    Io,
+    Serde,
+}
+
+impl Outcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::UnknownCommand => "unknown_command",
+            Self::WrongArity => "wrong_arity",
+            Self::WrongType => "wrong_type",
+            Self::Parse => "parse",
+            Self::RespParse => "resp_parse",
+            Self::Contention => "contention",
+            Self::S3 => "s3",
+            Self::Config => "config",
+            Self::Io => "io",
+            Self::Serde => "serde",
+        }
+    }
+
+    const fn classify(result: &Result<RespReply, RustyAntError>) -> Self {
+        match result {
+            Ok(_) => Self::Ok,
+            Err(RustyAntError::UnknownCommand(_)) => Self::UnknownCommand,
+            Err(RustyAntError::WrongArity { .. }) => Self::WrongArity,
+            Err(RustyAntError::WrongType { .. }) => Self::WrongType,
+            Err(RustyAntError::Parse(_)) => Self::Parse,
+            Err(RustyAntError::RespParse(_)) => Self::RespParse,
+            Err(RustyAntError::Contention) => Self::Contention,
+            Err(RustyAntError::S3(_)) => Self::S3,
+            Err(RustyAntError::Config(_)) => Self::Config,
+            Err(RustyAntError::Io(_)) => Self::Io,
+            Err(RustyAntError::Serde(_)) => Self::Serde,
+        }
+    }
+}
+
 pub async fn dispatch(state: &State, command_tokens: Vec<Bytes>) -> RespReply {
-    match run(state, command_tokens).await {
+    let cmd_name = command_tokens
+        .first()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .map_or_else(|| "?".to_string(), str::to_ascii_uppercase);
+    let argc = command_tokens.len();
+    let start = Instant::now();
+    let result = run(state, command_tokens).await;
+    let outcome = Outcome::classify(&result);
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    info!(
+        command = %cmd_name,
+        argc,
+        outcome = outcome.as_str(),
+        duration_ms,
+        "command dispatched",
+    );
+    match result {
         Ok(reply) => reply,
         Err(e) => RespReply::err(format!("ERR {e}")),
     }
