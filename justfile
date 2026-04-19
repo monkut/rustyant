@@ -21,6 +21,16 @@ fix:
 test:
     cargo nextest run --all-features
 
+# Run redis-py compatibility tests (requires python3 + the `redis` package).
+test-redis-py:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python3 -c 'import redis' 2>/dev/null || {
+        echo "installing redis-py via pip --user"
+        python3 -m pip install --user redis
+    }
+    cargo nextest run --all-features --test redis_py_compat
+
 # Run floci-gated integration tests (requires `just floci-up` + `just floci-seed`).
 test-floci BUCKET="rustyant-dev":
     #!/usr/bin/env bash
