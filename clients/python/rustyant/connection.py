@@ -279,7 +279,7 @@ def _split_resp2_frames(buf: bytes) -> list[bytes]:
     while pos < len(buf):
         consumed = _frame_len(buf, pos)
         if consumed == 0:
-            # Incomplete / unparseable tail — refuse to send it so the
+            # Incomplete / unparsable tail — refuse to send it so the
             # caller sees the truncation rather than silently losing data.
             raise redis.exceptions.ConnectionError(
                 f"rustyant: outgoing RESP2 stream not frame-aligned at byte {pos}"
