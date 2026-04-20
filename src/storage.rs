@@ -589,6 +589,27 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
         pattern: Option<&str>,
         count: usize,
     ) -> Result<(Vec<String>, Option<String>), RustyAntError>;
+
+    /// Total live key count. On S3 this is a full `ListObjectsV2` walk
+    /// (proportional to keyspace size); recently-expired keys that have
+    /// not yet been GC'd are still counted, matching Redis's lazy-expiry
+    /// behavior.
+    async fn dbsize(&self) -> Result<i64, RustyAntError>;
+
+    /// Wipe every key in the namespace. Drives both `FLUSHDB` and `FLUSHALL`
+    /// — rustyant has only one logical database, so the two commands collapse
+    /// to the same operation.
+    async fn flushall(&self) -> Result<(), RustyAntError>;
+
+    /// Pick one key uniformly at random from the live keyspace, or `None`
+    /// when the namespace is empty. Backs `RANDOMKEY`.
+    async fn random_key(&self) -> Result<Option<String>, RustyAntError>;
+
+    /// Copy `from`'s value (and TTL) to `to`. Returns `true` when the copy
+    /// happened, `false` when it was refused — source missing, destination
+    /// already present without `replace`, or `from == to`. On S3 the two
+    /// objects aren't modified atomically, same caveat as `RENAME`.
+    async fn copy(&self, from: &str, to: &str, replace: bool) -> Result<bool, RustyAntError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1760,6 +1781,101 @@ impl Storage for S3Storage {
             Err(e) => Err(e),
         }
     }
+
+    async fn dbsize(&self) -> Result<i64, RustyAntError> {
+        let mut count: i64 = 0;
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(&self.prefix);
+            if let Some(c) = &cursor {
+                req = req.continuation_token(c);
+            }
+            let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
+            count = count.saturating_add(i64::try_from(resp.contents().len()).unwrap_or(i64::MAX));
+            match resp.next_continuation_token() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        Ok(count)
+    }
+
+    async fn flushall(&self) -> Result<(), RustyAntError> {
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(&self.prefix);
+            if let Some(c) = &cursor {
+                req = req.continuation_token(c);
+            }
+            let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
+            // S3 batch DeleteObjects accepts up to 1000 keys per request,
+            // exactly matching ListObjectsV2's page size, so one delete
+            // call per list page is the natural batching.
+            let ids: Vec<aws_sdk_s3::types::ObjectIdentifier> = resp
+                .contents()
+                .iter()
+                .filter_map(|o| o.key())
+                .map(|k| {
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(k)
+                        .build()
+                        .map_err(|e| RustyAntError::S3(format!("object id: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+            if !ids.is_empty() {
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(ids))
+                    .quiet(true)
+                    .build()
+                    .map_err(|e| RustyAntError::S3(format!("delete payload: {e}")))?;
+                self.client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .map_err(|e| RustyAntError::S3(e.to_string()))?;
+            }
+            match resp.next_continuation_token() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    async fn random_key(&self) -> Result<Option<String>, RustyAntError> {
+        // Walk the full keyspace then pick — S3 has no native random sampling.
+        // Documented as O(n) in the README.
+        let all = self.keys("*").await?;
+        if all.is_empty() {
+            return Ok(None);
+        }
+        let idx = usize::try_from(pseudo_rand_u64() % (all.len() as u64)).unwrap_or(0);
+        Ok(Some(all[idx].clone()))
+    }
+
+    async fn copy(&self, from: &str, to: &str, replace: bool) -> Result<bool, RustyAntError> {
+        if from == to {
+            return Ok(false);
+        }
+        let Some(entry) = self.load(from).await? else {
+            return Ok(false);
+        };
+        let dest = self.load_with_etag(to).await?;
+        let cond = match (&dest, replace) {
+            (Some(_), false) => return Ok(false),
+            (Some((_, etag)), true) => CasCondition::IfMatch(etag.clone()),
+            (None, _) => CasCondition::CreateOnly,
+        };
+        match self.save_cas(to, &entry, cond).await {
+            Ok(()) => Ok(true),
+            // CAS race: a concurrent writer beat us. Surface as "not copied"
+            // rather than retrying — Redis COPY is a one-shot, not an RMW.
+            Err(RustyAntError::Contention) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2768,6 +2884,48 @@ impl Storage for InMemoryStorage {
 
     async fn zpopmax(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError> {
         self.zpop_inmem(key, count, true)
+    }
+
+    async fn dbsize(&self) -> Result<i64, RustyAntError> {
+        let now = now_ms();
+        Ok(self.with_entry_mut(|map| {
+            let n = map.values().filter(|v| v.expires_at_ms.is_none_or(|exp| exp > now)).count();
+            i64::try_from(n).unwrap_or(i64::MAX)
+        }))
+    }
+
+    async fn flushall(&self) -> Result<(), RustyAntError> {
+        self.with_entry_mut(BTreeMap::clear);
+        Ok(())
+    }
+
+    async fn random_key(&self) -> Result<Option<String>, RustyAntError> {
+        let now = now_ms();
+        let live: Vec<String> = self.with_entry_mut(|map| {
+            map.iter().filter(|(_, v)| v.expires_at_ms.is_none_or(|exp| exp > now)).map(|(k, _)| k.clone()).collect()
+        });
+        if live.is_empty() {
+            return Ok(None);
+        }
+        let idx = usize::try_from(pseudo_rand_u64() % (live.len() as u64)).unwrap_or(0);
+        Ok(Some(live[idx].clone()))
+    }
+
+    async fn copy(&self, from: &str, to: &str, replace: bool) -> Result<bool, RustyAntError> {
+        if from == to {
+            return Ok(false);
+        }
+        let Some(entry) = self.load(from) else {
+            return Ok(false);
+        };
+        let dest_present = self.load(to).is_some();
+        if dest_present && !replace {
+            return Ok(false);
+        }
+        self.with_entry_mut(|store| {
+            store.insert(to.to_string(), entry);
+        });
+        Ok(true)
     }
 }
 

@@ -1790,6 +1790,221 @@ async fn zpop_on_wrong_type_errors() {
     call(&state, &[b"ZPOPMAX", b"k"]).await.expect_error_prefix("ERR");
 }
 
+// ---------------------------------------------------------------------------
+// ECHO / TIME / DBSIZE / FLUSHDB / FLUSHALL / RANDOMKEY / UNLINK / COPY
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn echo_returns_input_bulk() {
+    let state = test_state();
+    call(&state, &[b"ECHO", b"hello world"]).await.expect_bulk(b"hello world");
+}
+
+#[tokio::test]
+async fn echo_passes_binary_payload_unchanged() {
+    let state = test_state();
+    call(&state, &[b"ECHO", b"\x00\xff\x01\x02"]).await.expect_bulk(b"\x00\xff\x01\x02");
+}
+
+#[tokio::test]
+async fn echo_wrong_arity_errors() {
+    let state = test_state();
+    call(&state, &[b"ECHO"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ECHO", b"a", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn time_returns_seconds_and_microseconds_pair() {
+    let state = test_state();
+    let parts = call(&state, &[b"TIME"]).await.into_bulk_array();
+    assert_eq!(parts.len(), 2, "expected [secs, micros]");
+    let secs: i64 = std::str::from_utf8(&parts[0]).expect("utf8 secs").parse().expect("parse secs");
+    let micros: i64 = std::str::from_utf8(&parts[1]).expect("utf8 micros").parse().expect("parse micros");
+    // Sanity: rustyant only ever ships forward in time, so the seconds field
+    // should be at least past the 2026 epoch boundary (1_767_225_600).
+    assert!(secs > 1_767_225_600, "secs implausibly small: {secs}");
+    assert!((0..1_000_000).contains(&micros), "micros out of band: {micros}");
+}
+
+#[tokio::test]
+async fn time_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"TIME", b"now"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn dbsize_empty_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"DBSIZE"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn dbsize_counts_every_value_kind() {
+    let state = test_state();
+    call(&state, &[b"SET", b"s", b"v"]).await;
+    call(&state, &[b"HSET", b"h", b"f", b"v"]).await;
+    call(&state, &[b"LPUSH", b"l", b"v"]).await;
+    call(&state, &[b"SADD", b"set", b"v"]).await;
+    call(&state, &[b"ZADD", b"z", b"1", b"v"]).await;
+    call(&state, &[b"DBSIZE"]).await.expect_integer(5);
+}
+
+#[tokio::test]
+async fn dbsize_drops_after_del() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    call(&state, &[b"SET", b"b", b"2"]).await;
+    call(&state, &[b"DEL", b"a"]).await;
+    call(&state, &[b"DBSIZE"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn flushdb_clears_every_key() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    call(&state, &[b"HSET", b"h", b"f", b"v"]).await;
+    call(&state, &[b"FLUSHDB"]).await.expect_simple("OK");
+    call(&state, &[b"DBSIZE"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"a"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn flushall_is_alias_of_flushdb() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    call(&state, &[b"FLUSHALL"]).await.expect_simple("OK");
+    call(&state, &[b"DBSIZE"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn flushdb_accepts_async_modifier() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    // Redis 4+ added the ASYNC / SYNC modifier; rustyant ignores the choice
+    // (always synchronous) but must not error on it.
+    call(&state, &[b"FLUSHDB", b"ASYNC"]).await.expect_simple("OK");
+    call(&state, &[b"DBSIZE"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn flushdb_rejects_unknown_modifier() {
+    let state = test_state();
+    call(&state, &[b"FLUSHDB", b"BOGUS"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn randomkey_empty_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"RANDOMKEY"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn randomkey_returns_one_of_existing_keys() {
+    let state = test_state();
+    call(&state, &[b"SET", b"alpha", b"1"]).await;
+    call(&state, &[b"SET", b"beta", b"2"]).await;
+    call(&state, &[b"SET", b"gamma", b"3"]).await;
+    let reply = call(&state, &[b"RANDOMKEY"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).into_owned();
+    assert!(
+        raw.contains("alpha") || raw.contains("beta") || raw.contains("gamma"),
+        "RANDOMKEY did not return a known key: {raw:?}"
+    );
+}
+
+#[tokio::test]
+async fn unlink_behaves_like_del() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    call(&state, &[b"SET", b"b", b"2"]).await;
+    call(&state, &[b"UNLINK", b"a", b"b", b"missing"]).await.expect_integer(2);
+    call(&state, &[b"EXISTS", b"a", b"b"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn copy_basic_creates_destination() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"v"]).await;
+    call(&state, &[b"COPY", b"src", b"dst"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"dst"]).await.expect_bulk(b"v");
+    // Source still present — COPY is not a move.
+    call(&state, &[b"GET", b"src"]).await.expect_bulk(b"v");
+}
+
+#[tokio::test]
+async fn copy_missing_source_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"COPY", b"missing", b"dst"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"dst"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn copy_dest_exists_without_replace_refuses() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"new"]).await;
+    call(&state, &[b"SET", b"dst", b"old"]).await;
+    call(&state, &[b"COPY", b"src", b"dst"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"dst"]).await.expect_bulk(b"old");
+}
+
+#[tokio::test]
+async fn copy_with_replace_overwrites_destination() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"new"]).await;
+    call(&state, &[b"SET", b"dst", b"old"]).await;
+    call(&state, &[b"COPY", b"src", b"dst", b"REPLACE"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"dst"]).await.expect_bulk(b"new");
+}
+
+#[tokio::test]
+async fn copy_self_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"COPY", b"k", b"k"]).await.expect_integer(0);
+    call(&state, &[b"COPY", b"k", b"k", b"REPLACE"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn copy_preserves_ttl_on_destination() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"v", b"EX", b"60"]).await;
+    call(&state, &[b"COPY", b"src", b"dst"]).await.expect_integer(1);
+    let reply = call(&state, &[b"TTL", b"dst"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).into_owned();
+    let ttl: i64 = raw.trim_start_matches(':').trim_end().parse().expect("ttl");
+    assert!((50..=60).contains(&ttl), "TTL not preserved on copy: {ttl}");
+}
+
+#[tokio::test]
+async fn copy_preserves_value_kind_for_collections() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"src", b"f", b"v"]).await;
+    call(&state, &[b"COPY", b"src", b"dst"]).await.expect_integer(1);
+    call(&state, &[b"HGET", b"dst", b"f"]).await.expect_bulk(b"v");
+    call(&state, &[b"HLEN", b"dst"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn copy_db_zero_is_accepted() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"v"]).await;
+    call(&state, &[b"COPY", b"src", b"dst", b"DB", b"0"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn copy_other_db_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"v"]).await;
+    call(&state, &[b"COPY", b"src", b"dst", b"DB", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn copy_unknown_option_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"v"]).await;
+    call(&state, &[b"COPY", b"src", b"dst", b"NUKE"]).await.expect_error_prefix("ERR");
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {

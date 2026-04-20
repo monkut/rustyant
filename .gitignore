@@ -14,6 +14,10 @@ Cargo.lock.bak
 .DS_Store
 Thumbs.db
 
+# Local agent overrides
+CLAUDE.md
+CLAUDE.local.md
+
 # Env / secrets
 .env
 .env.*
