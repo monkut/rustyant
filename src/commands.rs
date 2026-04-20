@@ -87,7 +87,7 @@ pub async fn dispatch(state: &State, command_tokens: Vec<Bytes>) -> RespReply {
     }
 }
 
-#[allow(clippy::large_stack_frames)]
+#[allow(clippy::large_stack_frames, clippy::too_many_lines)]
 async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
     let mut iter = tokens.into_iter();
     let cmd_bytes = iter.next().ok_or_else(|| RustyAntError::RespParse("empty command array".into()))?;
@@ -102,6 +102,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "GET" => handle_get(state, args).await,
         "GETSET" => handle_getset(state, args).await,
         "GETDEL" => handle_getdel(state, args).await,
+        "GETRANGE" => handle_getrange(state, args).await,
+        "SETRANGE" => handle_setrange(state, args).await,
         "STRLEN" => handle_strlen(state, args).await,
         "APPEND" => handle_append(state, args).await,
         "SET" => handle_set(state, args).await,
@@ -109,13 +111,18 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "SETEX" => handle_setex(state, args).await,
         "MGET" => handle_mget(state, args).await,
         "MSET" => handle_mset(state, args).await,
+        "MSETNX" => handle_msetnx(state, args).await,
         "DEL" => handle_del(state, args).await,
         "EXISTS" => handle_exists(state, args).await,
         "EXPIRE" => handle_expire(state, args).await,
         "EXPIREAT" => handle_expireat(state, args).await,
+        "PEXPIRE" => handle_pexpire(state, args).await,
         "PEXPIREAT" => handle_pexpireat(state, args).await,
         "PERSIST" => handle_persist(state, args).await,
         "TTL" => handle_ttl(state, args).await,
+        "PTTL" => handle_pttl(state, args).await,
+        "RENAME" => handle_rename(state, args).await,
+        "RENAMENX" => handle_renamenx(state, args).await,
         "KEYS" => handle_keys(state, args).await,
         "SCAN" => handle_scan(state, args).await,
         "TYPE" => handle_type(state, args).await,
@@ -124,6 +131,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
             let delta = parse_delta(&args)?;
             handle_incrby(state, args, delta).await
         }
+        "INCRBYFLOAT" => handle_incrbyfloat(state, args).await,
         "DECR" => handle_incrby(state, args, -1).await,
         "DECRBY" => {
             let delta = parse_delta(&args)?;
@@ -174,7 +182,13 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZREM" => handle_zrem(state, args).await,
         "ZINCRBY" => handle_zincrby(state, args).await,
         "ZRANGE" => handle_zrange(state, args).await,
+        "ZREVRANGE" => handle_zrevrange(state, args).await,
         "ZRANGEBYSCORE" => handle_zrangebyscore(state, args).await,
+        "ZREVRANGEBYSCORE" => handle_zrevrangebyscore(state, args).await,
+        "ZREMRANGEBYRANK" => handle_zremrangebyrank(state, args).await,
+        "ZREMRANGEBYSCORE" => handle_zremrangebyscore(state, args).await,
+        "ZPOPMIN" => handle_zpop(state, args, false).await,
+        "ZPOPMAX" => handle_zpop(state, args, true).await,
         "ZSCORE" => handle_zscore(state, args).await,
         "ZCARD" => handle_zcard(state, args).await,
         "ZRANK" => handle_zrank(state, args, false).await,
@@ -898,4 +912,154 @@ fn format_score(s: f64) -> String {
         return as_int.to_string();
     }
     format!("{s}")
+}
+
+// ---- New keyspace commands -------------------------------------------------
+
+async fn handle_pexpire(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("PEXPIRE", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let ms = parse_i64(&args[1], "milliseconds")?;
+    let set = state.storage.expire_at(key, now_ms() + ms).await?;
+    Ok(RespReply::Integer(i64::from(set)))
+}
+
+async fn handle_pttl(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("PTTL", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    Ok(match state.storage.ttl_ms(key).await? {
+        TtlResult::NoKey => RespReply::Integer(-2),
+        TtlResult::NoExpire => RespReply::Integer(-1),
+        TtlResult::Ms(ms) => RespReply::Integer(ms),
+    })
+}
+
+async fn handle_rename(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("RENAME", args.len() == 2)?;
+    let from = arg_as_str(&args[0])?;
+    let to = arg_as_str(&args[1])?;
+    state.storage.rename(from, to).await?;
+    Ok(RespReply::ok())
+}
+
+async fn handle_renamenx(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("RENAMENX", args.len() == 2)?;
+    let from = arg_as_str(&args[0])?;
+    let to = arg_as_str(&args[1])?;
+    let renamed = state.storage.renamenx(from, to).await?;
+    Ok(RespReply::Integer(i64::from(renamed)))
+}
+
+// ---- New string commands ---------------------------------------------------
+
+async fn handle_incrbyfloat(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("INCRBYFLOAT", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let delta = parse_f64(&args[1], "increment")?;
+    let new = state.storage.incr_by_float(key, delta).await?;
+    Ok(RespReply::BulkString(Some(Bytes::from(format_score(new).into_bytes()))))
+}
+
+async fn handle_getrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("GETRANGE", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let start = parse_i64(&args[1], "start")?;
+    let end = parse_i64(&args[2], "end")?;
+    let slice = state.storage.getrange(key, start, end).await?;
+    Ok(RespReply::BulkString(Some(slice)))
+}
+
+async fn handle_setrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SETRANGE", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let offset = parse_i64(&args[1], "offset")?;
+    if offset < 0 {
+        return Err(RustyAntError::Parse("offset must be >= 0".into()));
+    }
+    let offset_u = usize::try_from(offset).unwrap_or(0);
+    let len = state.storage.setrange(key, offset_u, args[2].clone()).await?;
+    Ok(RespReply::Integer(len))
+}
+
+async fn handle_msetnx(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() || args.len() % 2 != 0 {
+        return Err(RustyAntError::WrongArity { command: "MSETNX".into() });
+    }
+    let mut pairs: Vec<(String, Bytes)> = Vec::with_capacity(args.len() / 2);
+    let mut i = 0;
+    while i < args.len() {
+        pairs.push((arg_as_string(&args[i])?, args[i + 1].clone()));
+        i += 2;
+    }
+    let all_set = state.storage.msetnx(pairs).await?;
+    Ok(RespReply::Integer(i64::from(all_set)))
+}
+
+// ---- New sorted-set commands ----------------------------------------------
+
+async fn handle_zrevrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZREVRANGE", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let start = parse_i64(&args[1], "start")?;
+    let stop = parse_i64(&args[2], "stop")?;
+    let members = state.storage.zrevrange(key, start, stop).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_zrevrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZREVRANGEBYSCORE", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    // Note: argument order is (max, min) — the reverse of ZRANGEBYSCORE —
+    // to match Redis's CLI convention.
+    let max = ScoreBound::parse(arg_as_str(&args[1])?)?;
+    let min = ScoreBound::parse(arg_as_str(&args[2])?)?;
+    let members = state.storage.zrevrangebyscore(key, max, min).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_zremrangebyrank(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZREMRANGEBYRANK", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let start = parse_i64(&args[1], "start")?;
+    let stop = parse_i64(&args[2], "stop")?;
+    let removed = state.storage.zremrangebyrank(key, start, stop).await?;
+    Ok(RespReply::Integer(removed))
+}
+
+async fn handle_zremrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZREMRANGEBYSCORE", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let min = ScoreBound::parse(arg_as_str(&args[1])?)?;
+    let max = ScoreBound::parse(arg_as_str(&args[2])?)?;
+    let removed = state.storage.zremrangebyscore(key, min, max).await?;
+    Ok(RespReply::Integer(removed))
+}
+
+async fn handle_zpop(state: &State, args: Vec<Bytes>, from_max: bool) -> Result<RespReply, RustyAntError> {
+    let cmd = if from_max { "ZPOPMAX" } else { "ZPOPMIN" };
+    arity(cmd, !args.is_empty() && args.len() <= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let count = if args.len() == 2 {
+        let c = parse_i64(&args[1], "count")?;
+        if c < 0 {
+            return Err(RustyAntError::Parse("count must be >= 0".into()));
+        }
+        usize::try_from(c).unwrap_or(0)
+    } else {
+        1
+    };
+    let popped =
+        if from_max { state.storage.zpopmax(key, count).await? } else { state.storage.zpopmin(key, count).await? };
+    // Flatten [(member, score), ...] into a flat RESP array matching Redis's
+    // `member, score, member, score, ...` encoding.
+    let mut flat: Vec<RespReply> = Vec::with_capacity(popped.len() * 2);
+    for (m, s) in popped {
+        flat.push(RespReply::BulkString(Some(Bytes::from(m.into_bytes()))));
+        flat.push(RespReply::BulkString(Some(Bytes::from(format_score(s).into_bytes()))));
+    }
+    Ok(RespReply::Array(flat))
 }
