@@ -532,6 +532,20 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn hstrlen(&self, key: &str, field: &str) -> Result<i64, RustyAntError>;
     async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError>;
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError>;
+    /// Incremental iteration over a hash's `(field, value)` pairs. `cursor=0`
+    /// starts a fresh scan; a non-zero return cursor means more pages remain,
+    /// `0` means the scan is exhausted. `count` bounds the batch size; `MATCH`
+    /// filtering runs after the batch is sliced, matching Redis's "COUNT is
+    /// advisory, MATCH can shrink a page" semantic. Both backends load the
+    /// full hash per call — pagination is a client-side ergonomic, not a
+    /// server-side cost saving, because the collection is one S3 object.
+    async fn hscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<(String, Bytes)>), RustyAntError>;
 
     async fn list_push(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError>;
     async fn list_pushx(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError>;
@@ -555,6 +569,14 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn sdiff(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError>;
     async fn spop(&self, key: &str, count: usize) -> Result<Vec<String>, RustyAntError>;
     async fn srandmember(&self, key: &str, count: i64, allow_duplicates: bool) -> Result<Vec<String>, RustyAntError>;
+    /// See [`Self::hscan`] for `cursor` / `count` / `pattern` semantics.
+    async fn sscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<String>), RustyAntError>;
 
     async fn zadd(&self, key: &str, pairs: Vec<(f64, String)>) -> Result<i64, RustyAntError>;
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
@@ -574,6 +596,16 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn zrevrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError>;
     async fn zcount(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError>;
     async fn zmscore(&self, key: &str, members: &[String]) -> Result<Vec<Option<f64>>, RustyAntError>;
+    /// See [`Self::hscan`] for pagination semantics. Iteration order follows
+    /// member lex order under the backing `BTreeMap`; Redis doesn't pin an
+    /// order, so callers that care must sort the accumulated result.
+    async fn zscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<(String, f64)>), RustyAntError>;
 
     /// Return every key matching `pattern` (Redis-style glob: `*`, `?`).
     /// On S3 this fans out to repeated `ListObjectsV2` calls until the
@@ -639,6 +671,40 @@ pub fn bit_at(data: &[u8], offset: u64) -> u8 {
     }
     let bit_in_byte = 7 - (offset % 8) as u8;
     (data[byte_idx] >> bit_in_byte) & 1
+}
+
+/// Paginate a deterministic collection for `HSCAN` / `SSCAN` / `ZSCAN`.
+/// `cursor` is an integer offset into the caller's sorted iteration; `count`
+/// bounds the batch before `MATCH` filtering is applied — Redis applies the
+/// pattern after the batch is sliced, so a single page can return fewer
+/// items than `count`.
+fn apply_collection_scan<T, F>(
+    items: Vec<T>,
+    cursor: u64,
+    count: usize,
+    pattern: Option<&str>,
+    extract_name: F,
+) -> (u64, Vec<T>)
+where
+    F: Fn(&T) -> &str,
+{
+    let total = items.len();
+    let offset = usize::try_from(cursor).unwrap_or(total);
+    if offset >= total {
+        return (0, Vec::new());
+    }
+    let end = offset.saturating_add(count).min(total);
+    let next_cursor = if end >= total { 0 } else { u64::try_from(end).unwrap_or(0) };
+    let batch = items.into_iter().skip(offset).take(end - offset);
+    // `*` matches everything — skip the WildMatch compile + per-item check.
+    let filtered: Vec<T> = match pattern {
+        Some(p) if p != "*" => {
+            let wm = wildmatch::WildMatch::new(p);
+            batch.filter(|x| wm.matches(extract_name(x))).collect()
+        }
+        _ => batch.collect(),
+    };
+    (next_cursor, filtered)
 }
 
 /// Mutate the bit at `offset` to `value` in `data`, zero-padding the buffer
@@ -1013,6 +1079,23 @@ impl Storage for S3Storage {
         }
     }
 
+    async fn hscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<(String, Bytes)>), RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => {
+                let items: Vec<(String, Bytes)> = m.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect();
+                Ok(apply_collection_scan(items, cursor, count, pattern, |(f, _)| f.as_str()))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok((0, Vec::new())),
+        }
+    }
+
     async fn list_push(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError> {
         self.cas(key, move |entry| {
             let (mut list, expires_at_ms) = match entry {
@@ -1195,6 +1278,23 @@ impl Storage for S3Storage {
         }
     }
 
+    async fn sscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<String>), RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Set(s), .. }) => {
+                let items: Vec<String> = s.into_iter().collect();
+                Ok(apply_collection_scan(items, cursor, count, pattern, String::as_str))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok((0, Vec::new())),
+        }
+    }
+
     async fn sismember(&self, key: &str, member: &str) -> Result<bool, RustyAntError> {
         match self.load(key).await? {
             Some(StoredValue { value: Value::Set(s), .. }) => Ok(s.contains(member)),
@@ -1261,6 +1361,23 @@ impl Storage for S3Storage {
             }
             Some(_) => Err(wrong_type(key)),
             None => Ok(members.iter().map(|_| None).collect()),
+        }
+    }
+
+    async fn zscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<(String, f64)>), RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                let items: Vec<(String, f64)> = m.into_iter().collect();
+                Ok(apply_collection_scan(items, cursor, count, pattern, |(mem, _)| mem.as_str()))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok((0, Vec::new())),
         }
     }
 
@@ -2142,6 +2259,23 @@ impl Storage for InMemoryStorage {
         }
     }
 
+    async fn hscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<(String, Bytes)>), RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), .. }) => {
+                let items: Vec<(String, Bytes)> = m.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect();
+                Ok(apply_collection_scan(items, cursor, count, pattern, |(f, _)| f.as_str()))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok((0, Vec::new())),
+        }
+    }
+
     async fn list_push(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError> {
         let (mut list, expires_at_ms) = match self.load(key) {
             Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
@@ -2326,6 +2460,23 @@ impl Storage for InMemoryStorage {
         }
     }
 
+    async fn sscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<String>), RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), .. }) => {
+                let items: Vec<String> = s.into_iter().collect();
+                Ok(apply_collection_scan(items, cursor, count, pattern, String::as_str))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok((0, Vec::new())),
+        }
+    }
+
     async fn sismember(&self, key: &str, member: &str) -> Result<bool, RustyAntError> {
         match self.load(key) {
             Some(StoredValue { value: Value::Set(s), .. }) => Ok(s.contains(member)),
@@ -2381,6 +2532,23 @@ impl Storage for InMemoryStorage {
             }
             Some(_) => Err(wrong_type(key)),
             None => Ok(members.iter().map(|_| None).collect()),
+        }
+    }
+
+    async fn zscan(
+        &self,
+        key: &str,
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> Result<(u64, Vec<(String, f64)>), RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                let items: Vec<(String, f64)> = m.into_iter().collect();
+                Ok(apply_collection_scan(items, cursor, count, pattern, |(mem, _)| mem.as_str()))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok((0, Vec::new())),
         }
     }
 

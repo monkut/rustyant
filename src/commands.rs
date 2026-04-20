@@ -165,6 +165,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HSTRLEN" => handle_hstrlen(state, args).await,
         "HMGET" => handle_hmget(state, args).await,
         "HINCRBY" => handle_hincrby(state, args).await,
+        "HSCAN" => handle_hscan(state, args).await,
         // Lists
         "LPUSH" => handle_push(state, args, true).await,
         "RPUSH" => handle_push(state, args, false).await,
@@ -191,6 +192,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "SDIFF" => handle_sdiff(state, args).await,
         "SPOP" => handle_spop(state, args).await,
         "SRANDMEMBER" => handle_srandmember(state, args).await,
+        "SSCAN" => handle_sscan(state, args).await,
         // Sorted sets
         "ZADD" => handle_zadd(state, args).await,
         "ZREM" => handle_zrem(state, args).await,
@@ -209,6 +211,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZREVRANK" => handle_zrank(state, args, true).await,
         "ZCOUNT" => handle_zcount(state, args).await,
         "ZMSCORE" => handle_zmscore(state, args).await,
+        "ZSCAN" => handle_zscan(state, args).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
     }
 }
@@ -656,10 +659,23 @@ async fn handle_scan(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     let cursor_arg = arg_as_str(&args[0])?;
     // Redis convention: "0" means start / done.
     let cursor: Option<String> = if cursor_arg == "0" { None } else { Some(cursor_arg.to_string()) };
+    let (pattern, count) = parse_scan_opts(&args, 1, "SCAN")?;
 
+    let (keys, next) = state.storage.scan(cursor.as_deref(), pattern.as_deref(), count).await?;
+    let cursor_out = next.unwrap_or_else(|| "0".to_string());
+    Ok(RespReply::Array(vec![
+        RespReply::BulkString(Some(Bytes::from(cursor_out.into_bytes()))),
+        RespReply::Array(keys.into_iter().map(|k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))).collect()),
+    ]))
+}
+
+/// Parse the trailing `[MATCH pattern] [COUNT n]` options common to SCAN /
+/// HSCAN / SSCAN / ZSCAN. `from` is the arg index to start at (past the
+/// command's fixed prefix — `1` for SCAN, `2` for collection scans).
+fn parse_scan_opts(args: &[Bytes], from: usize, cmd: &str) -> Result<(Option<String>, usize), RustyAntError> {
     let mut pattern: Option<String> = None;
-    let mut count: usize = 10; // Redis default
-    let mut i = 1;
+    let mut count: usize = 10;
+    let mut i = from;
     while i < args.len() {
         let opt = arg_as_str(&args[i])?.to_ascii_uppercase();
         match opt.as_str() {
@@ -678,17 +694,62 @@ async fn handle_scan(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
                 i += 2;
             }
             other => {
-                return Err(RustyAntError::Parse(format!("unsupported SCAN option: {other}")));
+                return Err(RustyAntError::Parse(format!("unsupported {cmd} option: {other}")));
             }
         }
     }
+    Ok((pattern, count))
+}
 
-    let (keys, next) = state.storage.scan(cursor.as_deref(), pattern.as_deref(), count).await?;
-    let cursor_out = next.unwrap_or_else(|| "0".to_string());
-    Ok(RespReply::Array(vec![
-        RespReply::BulkString(Some(Bytes::from(cursor_out.into_bytes()))),
-        RespReply::Array(keys.into_iter().map(|k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))).collect()),
-    ]))
+fn parse_scan_cursor(arg: &Bytes) -> Result<u64, RustyAntError> {
+    let n = parse_i64(arg, "cursor")?;
+    u64::try_from(n).map_err(|_| RustyAntError::Parse("cursor must be >= 0".into()))
+}
+
+fn scan_reply(next_cursor: u64, items: Vec<RespReply>) -> RespReply {
+    RespReply::Array(vec![
+        RespReply::BulkString(Some(Bytes::from(next_cursor.to_string().into_bytes()))),
+        RespReply::Array(items),
+    ])
+}
+
+async fn handle_hscan(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HSCAN", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let cursor = parse_scan_cursor(&args[1])?;
+    let (pattern, count) = parse_scan_opts(&args, 2, "HSCAN")?;
+    let (next, pairs) = state.storage.hscan(key, cursor, pattern.as_deref(), count).await?;
+    let mut flat: Vec<RespReply> = Vec::with_capacity(pairs.len() * 2);
+    for (field, value) in pairs {
+        flat.push(RespReply::BulkString(Some(Bytes::from(field.into_bytes()))));
+        flat.push(RespReply::BulkString(Some(value)));
+    }
+    Ok(scan_reply(next, flat))
+}
+
+async fn handle_sscan(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SSCAN", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let cursor = parse_scan_cursor(&args[1])?;
+    let (pattern, count) = parse_scan_opts(&args, 2, "SSCAN")?;
+    let (next, members) = state.storage.sscan(key, cursor, pattern.as_deref(), count).await?;
+    let items: Vec<RespReply> =
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect();
+    Ok(scan_reply(next, items))
+}
+
+async fn handle_zscan(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZSCAN", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let cursor = parse_scan_cursor(&args[1])?;
+    let (pattern, count) = parse_scan_opts(&args, 2, "ZSCAN")?;
+    let (next, pairs) = state.storage.zscan(key, cursor, pattern.as_deref(), count).await?;
+    let mut flat: Vec<RespReply> = Vec::with_capacity(pairs.len() * 2);
+    for (member, score) in pairs {
+        flat.push(RespReply::BulkString(Some(Bytes::from(member.into_bytes()))));
+        flat.push(RespReply::BulkString(Some(Bytes::from(format_score(score).into_bytes()))));
+    }
+    Ok(scan_reply(next, flat))
 }
 
 async fn handle_lindex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {

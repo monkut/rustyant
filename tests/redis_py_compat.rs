@@ -418,6 +418,36 @@ print('ok')
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_py_collection_scans() {
+    // redis-py's `*scan_iter` helpers call the underlying command until the
+    // cursor returns to 0 — the contract we implement. Running through them
+    // catches cursor-string / pair-flattening / score-formatting mismatches
+    // that a unit test against our own parser would miss.
+    run_redis_py_script(
+        r"
+import redis
+r = redis.Redis(host='127.0.0.1', port={port}, socket_timeout=5)
+
+r.hset('h', mapping={'user:1': 'a', 'user:2': 'b', 'other': 'c'})
+assert dict(r.hscan_iter('h')) == {b'user:1': b'a', b'user:2': b'b', b'other': b'c'}
+assert dict(r.hscan_iter('h', match='user:*')) == {b'user:1': b'a', b'user:2': b'b'}
+cursor, page = r.hscan('h', 0, count=100)
+assert cursor == 0
+assert dict(zip(page.keys(), page.values())) == {b'user:1': b'a', b'user:2': b'b', b'other': b'c'}
+
+r.sadd('s', 'alpha', 'beta', 'gamma')
+assert set(r.sscan_iter('s')) == {b'alpha', b'beta', b'gamma'}
+assert set(r.sscan_iter('s', match='a*')) == {b'alpha'}
+
+r.zadd('z', {'alice': 1.5, 'bob': 2, 'carol': 3.25})
+assert dict(r.zscan_iter('z')) == {b'alice': 1.5, b'bob': 2.0, b'carol': 3.25}
+print('ok')
+",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_py_pipeline() {
     // redis-py's pipeline batches commands and reads replies in order.
     // This exercises the TCP streaming path with multiple frames in flight.

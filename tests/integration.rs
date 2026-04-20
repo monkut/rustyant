@@ -1173,6 +1173,161 @@ async fn scan_empty_store_returns_done() {
     assert!(next.is_none());
 }
 
+// ---------------------------------------------------------------------------
+// HSCAN / SSCAN / ZSCAN
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hscan_paginates_full_hash() {
+    let state = test_state();
+    let mut args: Vec<&[u8]> = vec![b"HSET", b"h"];
+    let pairs: Vec<(String, String)> = (0..12).map(|i| (format!("f{i:02}"), format!("v{i:02}"))).collect();
+    let owned: Vec<Vec<u8>> = pairs.iter().flat_map(|(k, v)| [k.as_bytes().to_vec(), v.as_bytes().to_vec()]).collect();
+    for b in &owned {
+        args.push(b.as_slice());
+    }
+    call(&state, &args).await;
+
+    let mut seen: Vec<(String, Bytes)> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch) = state.storage.hscan("h", cursor, None, 5).await.expect("hscan");
+        seen.extend(batch);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    let want: Vec<(String, Bytes)> = pairs.into_iter().map(|(k, v)| (k, Bytes::from(v.into_bytes()))).collect();
+    assert_eq!(seen, want);
+}
+
+#[tokio::test]
+async fn hscan_match_filter_narrows_batch() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"user:1", b"a", b"user:2", b"b", b"other", b"c"]).await;
+    let (next, batch) = state.storage.hscan("h", 0, Some("user:*"), 100).await.expect("hscan");
+    assert_eq!(next, 0);
+    let mut fields: Vec<String> = batch.into_iter().map(|(f, _)| f).collect();
+    fields.sort();
+    assert_eq!(fields, vec!["user:1".to_string(), "user:2".to_string()]);
+}
+
+#[tokio::test]
+async fn hscan_missing_key_returns_done() {
+    let state = test_state();
+    let (next, batch) = state.storage.hscan("nope", 0, None, 10).await.expect("hscan");
+    assert_eq!(next, 0);
+    assert!(batch.is_empty());
+}
+
+#[tokio::test]
+async fn hscan_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"s", b"v"]).await;
+    let res = state.storage.hscan("s", 0, None, 10).await;
+    assert!(res.is_err(), "expected WRONGTYPE, got {res:?}");
+}
+
+#[tokio::test]
+async fn sscan_paginates_full_set() {
+    let state = test_state();
+    let mut args: Vec<&[u8]> = vec![b"SADD", b"s"];
+    let members: Vec<String> = (0..12).map(|i| format!("m{i:02}")).collect();
+    let owned: Vec<Vec<u8>> = members.iter().map(|m| m.as_bytes().to_vec()).collect();
+    for b in &owned {
+        args.push(b.as_slice());
+    }
+    call(&state, &args).await;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch) = state.storage.sscan("s", cursor, None, 5).await.expect("sscan");
+        seen.extend(batch);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort();
+    let mut want = members;
+    want.sort();
+    assert_eq!(seen, want);
+}
+
+#[tokio::test]
+async fn sscan_match_filter_narrows_batch() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"user:1", b"user:2", b"other"]).await;
+    let (next, batch) = state.storage.sscan("s", 0, Some("user:*"), 100).await.expect("sscan");
+    assert_eq!(next, 0);
+    let mut m = batch;
+    m.sort();
+    assert_eq!(m, vec!["user:1".to_string(), "user:2".to_string()]);
+}
+
+#[tokio::test]
+async fn zscan_paginates_with_scores() {
+    let state = test_state();
+    for (score, member) in [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")] {
+        call(&state, &[b"ZADD", b"z", score.to_string().as_bytes(), member.as_bytes()]).await;
+    }
+    let mut seen: Vec<(String, f64)> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch) = state.storage.zscan("z", cursor, None, 2).await.expect("zscan");
+        seen.extend(batch);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    let want: Vec<(String, f64)> = vec![("a", 1.0), ("b", 2.0), ("c", 3.0), ("d", 4.0), ("e", 5.0), ("f", 6.0)]
+        .into_iter()
+        .map(|(m, s)| (m.to_string(), s))
+        .collect();
+    assert_eq!(seen, want);
+}
+
+#[tokio::test]
+async fn hscan_wire_reply_has_cursor_and_pairs() {
+    // End-to-end wire check: a single-page HSCAN must return
+    // `[b"0", [field, value, field, value, ...]]` as a nested array.
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]).await;
+    let decoded = call(&state, &[b"HSCAN", b"h", b"0"]).await;
+    // Reply shape: *2\r\n$1\r\n0\r\n*4\r\n$...
+    assert!(
+        decoded.raw.starts_with(b"*2\r\n$1\r\n0\r\n*4\r\n"),
+        "unexpected wire: {:?}",
+        String::from_utf8_lossy(&decoded.raw)
+    );
+}
+
+#[tokio::test]
+async fn sscan_wrong_arity_errors() {
+    let state = test_state();
+    call(&state, &[b"SSCAN"]).await.expect_error_prefix("wrong number");
+    call(&state, &[b"SSCAN", b"k"]).await.expect_error_prefix("wrong number");
+}
+
+#[tokio::test]
+async fn zscan_negative_cursor_rejected() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"ZSCAN", b"z", b"-1"]).await.expect_error_prefix("cursor");
+}
+
+#[tokio::test]
+async fn hscan_unknown_option_rejected() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"f", b"v"]).await;
+    call(&state, &[b"HSCAN", b"h", b"0", b"NOVALUES"]).await.expect_error_prefix("unsupported HSCAN");
+}
+
 #[tokio::test]
 async fn type_returns_none_for_missing_key() {
     let state = test_state();
