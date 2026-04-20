@@ -233,6 +233,49 @@ async fn getdel_on_wrong_type_errors_and_preserves_key() {
 }
 
 #[tokio::test]
+async fn strlen_returns_byte_length() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"hello"]).await;
+    call(&state, &[b"STRLEN", b"k"]).await.expect_integer(5);
+}
+
+#[tokio::test]
+async fn strlen_on_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"STRLEN", b"ghost"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn strlen_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"queue", b"item"]).await;
+    call(&state, &[b"STRLEN", b"queue"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn append_to_missing_key_creates_string() {
+    let state = test_state();
+    call(&state, &[b"APPEND", b"k", b"hello"]).await.expect_integer(5);
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"hello");
+}
+
+#[tokio::test]
+async fn append_to_existing_string_concatenates() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"hello"]).await;
+    call(&state, &[b"APPEND", b"k", b" world"]).await.expect_integer(11);
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"hello world");
+}
+
+#[tokio::test]
+async fn append_on_wrong_type_errors_and_preserves_key() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"queue", b"item"]).await;
+    call(&state, &[b"APPEND", b"queue", b"x"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"LLEN", b"queue"]).await.expect_integer(1);
+}
+
+#[tokio::test]
 async fn set_with_ex_sets_ttl() {
     let state = test_state();
     call(&state, &[b"SET", b"k", b"v", b"EX", b"60"]).await.expect_simple("OK");
