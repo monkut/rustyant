@@ -167,6 +167,13 @@ fn filter_zset_by_score(map: BTreeMap<String, f64>, min: ScoreBound, max: ScoreB
     sorted.into_iter().filter(|(_, s)| min.ge_min(*s) && max.le_max(*s)).map(|(m, _)| m).collect()
 }
 
+/// Number of members whose score falls within `[min, max]` (inclusive/
+/// exclusive per `ScoreBound`). Shared between `S3Storage` and `InMemoryStorage`.
+fn count_zset_by_score(map: &BTreeMap<String, f64>, min: ScoreBound, max: ScoreBound) -> i64 {
+    let n = map.values().filter(|s| min.ge_min(**s) && max.le_max(**s)).count();
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
 // ---------------------------------------------------------------------------
 // S3 optimistic-locking primitives.
 //
@@ -291,6 +298,8 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn zcard(&self, key: &str) -> Result<i64, RustyAntError>;
     async fn zrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError>;
     async fn zrevrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError>;
+    async fn zcount(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError>;
+    async fn zmscore(&self, key: &str, members: &[String]) -> Result<Vec<Option<f64>>, RustyAntError>;
 
     /// Return every key matching `pattern` (Redis-style glob: `*`, `?`).
     /// On S3 this fans out to repeated `ListObjectsV2` calls until the
@@ -865,6 +874,24 @@ impl Storage for S3Storage {
             }
             Some(_) => Err(wrong_type(key)),
             None => Ok(None),
+        }
+    }
+
+    async fn zcount(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(count_zset_by_score(&m, min, max)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn zmscore(&self, key: &str, members: &[String]) -> Result<Vec<Option<f64>>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                Ok(members.iter().map(|mem| m.get(mem).copied()).collect())
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(members.iter().map(|_| None).collect()),
         }
     }
 
@@ -1569,6 +1596,24 @@ impl Storage for InMemoryStorage {
             Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(asc_rank_of(&m, member)),
             Some(_) => Err(wrong_type(key)),
             None => Ok(None),
+        }
+    }
+
+    async fn zcount(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(count_zset_by_score(&m, min, max)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn zmscore(&self, key: &str, members: &[String]) -> Result<Vec<Option<f64>>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                Ok(members.iter().map(|mem| m.get(mem).copied()).collect())
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(members.iter().map(|_| None).collect()),
         }
     }
 

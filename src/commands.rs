@@ -169,6 +169,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZCARD" => handle_zcard(state, args).await,
         "ZRANK" => handle_zrank(state, args, false).await,
         "ZREVRANK" => handle_zrank(state, args, true).await,
+        "ZCOUNT" => handle_zcount(state, args).await,
+        "ZMSCORE" => handle_zmscore(state, args).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
     }
 }
@@ -534,6 +536,30 @@ async fn handle_zrank(state: &State, args: Vec<Bytes>, reverse: bool) -> Result<
     let rank =
         if reverse { state.storage.zrevrank(key, member).await? } else { state.storage.zrank(key, member).await? };
     Ok(rank.map_or(RespReply::Nil, RespReply::Integer))
+}
+
+async fn handle_zcount(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZCOUNT", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let min = ScoreBound::parse(arg_as_str(&args[1])?)?;
+    let max = ScoreBound::parse(arg_as_str(&args[2])?)?;
+    let n = state.storage.zcount(key, min, max).await?;
+    Ok(RespReply::Integer(n))
+}
+
+async fn handle_zmscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZMSCORE", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let members: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let scores = state.storage.zmscore(key, &members).await?;
+    Ok(RespReply::Array(
+        scores
+            .into_iter()
+            .map(|s| {
+                s.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(Bytes::from(format_score(v).into_bytes()))))
+            })
+            .collect(),
+    ))
 }
 
 // ---- String multi-key + NX/EX + GETSET + PERSIST --------------------------
