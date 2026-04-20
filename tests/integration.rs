@@ -1486,6 +1486,216 @@ async fn pushx_on_wrong_type_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// LMOVE / RPOPLPUSH / LPOS
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lmove_right_to_left_moves_element() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"src", b"a", b"b", b"c"]).await;
+    call(&state, &[b"RPUSH", b"dst", b"x", b"y"]).await;
+    call(&state, &[b"LMOVE", b"src", b"dst", b"RIGHT", b"LEFT"]).await.expect_bulk(b"c");
+    let src = call(&state, &[b"LRANGE", b"src", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&src), vec!["a", "b"]);
+    let dst = call(&state, &[b"LRANGE", b"dst", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&dst), vec!["c", "x", "y"]);
+}
+
+#[tokio::test]
+async fn lmove_all_direction_combos() {
+    let state = test_state();
+    // LEFT → LEFT: pop head of src, push head of dst.
+    call(&state, &[b"RPUSH", b"s1", b"a", b"b"]).await;
+    call(&state, &[b"RPUSH", b"d1", b"y"]).await;
+    call(&state, &[b"LMOVE", b"s1", b"d1", b"LEFT", b"LEFT"]).await.expect_bulk(b"a");
+    let d1 = call(&state, &[b"LRANGE", b"d1", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&d1), vec!["a", "y"]);
+    // LEFT → RIGHT
+    call(&state, &[b"RPUSH", b"s2", b"a", b"b"]).await;
+    call(&state, &[b"RPUSH", b"d2", b"y"]).await;
+    call(&state, &[b"LMOVE", b"s2", b"d2", b"LEFT", b"RIGHT"]).await.expect_bulk(b"a");
+    let d2 = call(&state, &[b"LRANGE", b"d2", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&d2), vec!["y", "a"]);
+    // RIGHT → RIGHT
+    call(&state, &[b"RPUSH", b"s3", b"a", b"b"]).await;
+    call(&state, &[b"RPUSH", b"d3", b"y"]).await;
+    call(&state, &[b"LMOVE", b"s3", b"d3", b"RIGHT", b"RIGHT"]).await.expect_bulk(b"b");
+    let d3 = call(&state, &[b"LRANGE", b"d3", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&d3), vec!["y", "b"]);
+}
+
+#[tokio::test]
+async fn lmove_same_key_rotates() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c"]).await;
+    // RIGHT → LEFT rotates: c becomes new head.
+    call(&state, &[b"LMOVE", b"l", b"l", b"RIGHT", b"LEFT"]).await.expect_bulk(b"c");
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&items), vec!["c", "a", "b"]);
+}
+
+#[tokio::test]
+async fn lmove_creates_missing_destination() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"src", b"a", b"b"]).await;
+    call(&state, &[b"LMOVE", b"src", b"newdst", b"LEFT", b"RIGHT"]).await.expect_bulk(b"a");
+    call(&state, &[b"TYPE", b"newdst"]).await.expect_simple("list");
+    let dst = call(&state, &[b"LRANGE", b"newdst", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&dst), vec!["a"]);
+}
+
+#[tokio::test]
+async fn lmove_empty_source_returns_nil_and_leaves_dst() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"dst", b"y"]).await;
+    call(&state, &[b"LMOVE", b"missing", b"dst", b"LEFT", b"LEFT"]).await.expect_nil();
+    let dst = call(&state, &[b"LRANGE", b"dst", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&dst), vec!["y"]);
+}
+
+#[tokio::test]
+async fn lmove_wrong_source_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"s", b"v"]).await;
+    call(&state, &[b"RPUSH", b"d", b"x"]).await;
+    call(&state, &[b"LMOVE", b"s", b"d", b"LEFT", b"LEFT"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn lmove_wrong_destination_type_errors_without_popping() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"src", b"a", b"b"]).await;
+    call(&state, &[b"SET", b"dst", b"v"]).await;
+    call(&state, &[b"LMOVE", b"src", b"dst", b"LEFT", b"LEFT"]).await.expect_error_prefix("ERR");
+    // Source untouched.
+    let src = call(&state, &[b"LRANGE", b"src", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&src), vec!["a", "b"]);
+}
+
+#[tokio::test]
+async fn lmove_rejects_invalid_side() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a"]).await;
+    call(&state, &[b"LMOVE", b"l", b"l", b"UP", b"LEFT"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn rpoplpush_moves_tail_to_head() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"src", b"a", b"b", b"c"]).await;
+    call(&state, &[b"RPUSH", b"dst", b"y"]).await;
+    call(&state, &[b"RPOPLPUSH", b"src", b"dst"]).await.expect_bulk(b"c");
+    let dst = call(&state, &[b"LRANGE", b"dst", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&dst), vec!["c", "y"]);
+}
+
+#[tokio::test]
+async fn rpoplpush_same_key_rotates() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c"]).await;
+    call(&state, &[b"RPOPLPUSH", b"l", b"l"]).await.expect_bulk(b"c");
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(bulks_to_strs(&items), vec!["c", "a", "b"]);
+}
+
+#[tokio::test]
+async fn rpoplpush_missing_source_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"RPOPLPUSH", b"ghost", b"dst"]).await.expect_nil();
+    call(&state, &[b"EXISTS", b"dst"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn lpos_returns_first_match_index() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c", b"b", b"d"]).await;
+    call(&state, &[b"LPOS", b"l", b"b"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn lpos_missing_element_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b"]).await;
+    call(&state, &[b"LPOS", b"l", b"z"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn lpos_missing_key_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"LPOS", b"ghost", b"x"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn lpos_with_rank_skips_occurrences() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c", b"b", b"d", b"b"]).await;
+    // 2nd occurrence forward.
+    call(&state, &[b"LPOS", b"l", b"b", b"RANK", b"2"]).await.expect_integer(3);
+    // 1st occurrence backward.
+    call(&state, &[b"LPOS", b"l", b"b", b"RANK", b"-1"]).await.expect_integer(5);
+    // 2nd occurrence backward.
+    call(&state, &[b"LPOS", b"l", b"b", b"RANK", b"-2"]).await.expect_integer(3);
+}
+
+#[tokio::test]
+async fn lpos_rank_zero_errors() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a"]).await;
+    call(&state, &[b"LPOS", b"l", b"a", b"RANK", b"0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn lpos_with_count_zero_returns_all_matches() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"a", b"c", b"a"]).await;
+    let reply = call(&state, &[b"LPOS", b"l", b"a", b"COUNT", b"0"]).await;
+    // Array of integers :0 :2 :4.
+    assert_eq!(reply.raw, b"*3\r\n:0\r\n:2\r\n:4\r\n");
+}
+
+#[tokio::test]
+async fn lpos_with_count_n_limits_output() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"a", b"c", b"a"]).await;
+    let reply = call(&state, &[b"LPOS", b"l", b"a", b"COUNT", b"2"]).await;
+    assert_eq!(reply.raw, b"*2\r\n:0\r\n:2\r\n");
+}
+
+#[tokio::test]
+async fn lpos_count_with_no_matches_returns_empty_array() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b"]).await;
+    let reply = call(&state, &[b"LPOS", b"l", b"z", b"COUNT", b"0"]).await;
+    assert_eq!(reply.raw, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn lpos_count_with_negative_rank_returns_backward_order() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"a", b"c", b"a"]).await;
+    let reply = call(&state, &[b"LPOS", b"l", b"a", b"RANK", b"-1", b"COUNT", b"0"]).await;
+    // Backward walk yields indices 4, 2, 0.
+    assert_eq!(reply.raw, b"*3\r\n:4\r\n:2\r\n:0\r\n");
+}
+
+#[tokio::test]
+async fn lpos_maxlen_bounds_the_scan() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c", b"d", b"b"]).await;
+    // MAXLEN 2 only looks at indices 0 and 1 — finds b at 1.
+    call(&state, &[b"LPOS", b"l", b"b", b"MAXLEN", b"2"]).await.expect_integer(1);
+    // MAXLEN 1 only looks at index 0 — no match.
+    call(&state, &[b"LPOS", b"l", b"b", b"MAXLEN", b"1"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn lpos_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"LPOS", b"k", b"v"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
 // SINTER / SUNION / SDIFF / SMISMEMBER / SPOP / SRANDMEMBER
 // ---------------------------------------------------------------------------
 

@@ -557,6 +557,31 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn lrem(&self, key: &str, count: i64, value: Bytes) -> Result<i64, RustyAntError>;
     async fn linsert(&self, key: &str, before: bool, pivot: Bytes, value: Bytes) -> Result<i64, RustyAntError>;
     async fn ltrim(&self, key: &str, start: i64, stop: i64) -> Result<(), RustyAntError>;
+    /// Atomically pop one element from `from` (head if `from_left`, else tail)
+    /// and push it onto `to` (head if `to_left`, else tail). Returns the moved
+    /// element, or `None` when `from` is missing / empty. Same-key moves run
+    /// under a single CAS; cross-key moves are two-step on S3 (pop first, then
+    /// push) — same best-effort guarantee as `RENAME` / `COPY`.
+    async fn list_move(
+        &self,
+        from: &str,
+        to: &str,
+        from_left: bool,
+        to_left: bool,
+    ) -> Result<Option<Bytes>, RustyAntError>;
+    /// Return zero-based positions of `element` inside the list at `key`.
+    /// `rank` picks the k-th match (`1` = first forward, `-1` = first backward,
+    /// never `0`); `count` = `None` means "return the first match only",
+    /// `Some(0)` means "all matches", `Some(n)` means "up to n matches".
+    /// `maxlen` bounds how many elements are compared (`0` = unlimited).
+    async fn lpos(
+        &self,
+        key: &str,
+        element: &[u8],
+        rank: i64,
+        count: Option<usize>,
+        maxlen: usize,
+    ) -> Result<Vec<i64>, RustyAntError>;
 
     async fn sadd(&self, key: &str, members: Vec<String>) -> Result<i64, RustyAntError>;
     async fn srem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
@@ -705,6 +730,44 @@ where
         _ => batch.collect(),
     };
     (next_cursor, filtered)
+}
+
+/// Collect zero-based positions of `element` inside `list` for `LPOS`.
+///
+/// `rank` selects the k-th occurrence in the search direction (positive =
+/// head→tail, negative = tail→head). `wanted` is the maximum number of
+/// positions to return — the handler maps `LPOS`'s `COUNT 0` to `usize::MAX`
+/// ("all matches") and `COUNT` absent to `1` ("single match"). `limit` is
+/// `MAXLEN`; `0` means unlimited.
+pub fn scan_list_positions(list: &[Vec<u8>], element: &[u8], rank: i64, wanted: usize, limit: usize) -> Vec<i64> {
+    if rank == 0 || list.is_empty() || wanted == 0 {
+        return Vec::new();
+    }
+    let forward = rank > 0;
+    let skip = usize::try_from(rank.unsigned_abs()).unwrap_or(usize::MAX).saturating_sub(1);
+    let cap = if limit == 0 { usize::MAX } else { limit };
+
+    let mut hits: Vec<i64> = Vec::new();
+    let mut seen = 0_usize;
+    let indices: Box<dyn Iterator<Item = usize>> =
+        if forward { Box::new(0..list.len()) } else { Box::new((0..list.len()).rev()) };
+
+    for (compared, idx) in indices.enumerate() {
+        if compared >= cap {
+            break;
+        }
+        if list[idx].as_slice() == element {
+            if seen < skip {
+                seen += 1;
+                continue;
+            }
+            hits.push(i64::try_from(idx).unwrap_or(i64::MAX));
+            if hits.len() >= wanted {
+                break;
+            }
+        }
+    }
+    hits
 }
 
 /// Mutate the bit at `offset` to `value` in `data`, zero-padding the buffer
@@ -1613,6 +1676,102 @@ impl Storage for S3Storage {
             Ok(CasAction::Write(new_entry, len))
         })
         .await
+    }
+
+    async fn list_move(
+        &self,
+        from: &str,
+        to: &str,
+        from_left: bool,
+        to_left: bool,
+    ) -> Result<Option<Bytes>, RustyAntError> {
+        if from == to {
+            return self
+                .cas(from, move |entry| {
+                    let (mut list, expires_at_ms) = match entry {
+                        Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                        Some(_) => return Err(wrong_type(from)),
+                        None => return Ok(CasAction::NoOp(None)),
+                    };
+                    if list.is_empty() {
+                        return Ok(CasAction::NoOp(None));
+                    }
+                    let popped = if from_left { list.remove(0) } else { list.pop().expect("non-empty") };
+                    if to_left {
+                        list.insert(0, popped.clone());
+                    } else {
+                        list.push(popped.clone());
+                    }
+                    let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+                    Ok(CasAction::Write(new_entry, Some(Bytes::from(popped))))
+                })
+                .await;
+        }
+        // Pre-check dst type so we don't pop from src just to discover dst is
+        // the wrong type. TOCTOU: a concurrent writer could still swap dst to
+        // a non-list between here and the push — the push CAS closure will
+        // surface that as wrong_type, after the pop has already landed. Same
+        // best-effort guarantee as RENAME/COPY on S3.
+        match self.load(to).await? {
+            Some(StoredValue { value: Value::List(_), .. }) | None => {}
+            Some(_) => return Err(wrong_type(to)),
+        }
+        let popped: Option<Vec<u8>> = self
+            .cas(from, move |entry| {
+                let (mut list, expires_at_ms) = match entry {
+                    Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                    Some(_) => return Err(wrong_type(from)),
+                    None => return Ok(CasAction::NoOp(None)),
+                };
+                if list.is_empty() {
+                    return Ok(CasAction::NoOp(None));
+                }
+                let popped = if from_left { list.remove(0) } else { list.pop().expect("non-empty") };
+                if list.is_empty() {
+                    Ok(CasAction::Delete(Some(popped)))
+                } else {
+                    let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+                    Ok(CasAction::Write(new_entry, Some(popped)))
+                }
+            })
+            .await?;
+        let Some(popped) = popped else {
+            return Ok(None);
+        };
+        let out = popped.clone();
+        self.cas(to, move |entry| {
+            let (mut list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(to)),
+                None => (Vec::new(), None),
+            };
+            if to_left {
+                list.insert(0, popped.clone());
+            } else {
+                list.push(popped.clone());
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+            Ok(CasAction::Write(new_entry, ()))
+        })
+        .await?;
+        Ok(Some(Bytes::from(out)))
+    }
+
+    async fn lpos(
+        &self,
+        key: &str,
+        element: &[u8],
+        rank: i64,
+        count: Option<usize>,
+        maxlen: usize,
+    ) -> Result<Vec<i64>, RustyAntError> {
+        let list = match self.load(key).await? {
+            Some(StoredValue { value: Value::List(l), .. }) => l,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        let wanted = count.map_or(1, |c| if c == 0 { usize::MAX } else { c });
+        Ok(scan_list_positions(&list, element, rank, wanted, maxlen))
     }
 
     async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError> {
@@ -2838,6 +2997,86 @@ impl Storage for InMemoryStorage {
             store.insert(key.to_string(), entry);
         });
         Ok(len)
+    }
+
+    async fn list_move(
+        &self,
+        from: &str,
+        to: &str,
+        from_left: bool,
+        to_left: bool,
+    ) -> Result<Option<Bytes>, RustyAntError> {
+        // Expire-on-read both sides so a ghost entry doesn't block the move.
+        let _ = self.load(from);
+        if from != to {
+            let _ = self.load(to);
+        }
+        self.with_entry_mut(|store| {
+            if from != to {
+                match store.get(to) {
+                    Some(v) if !matches!(v.value, Value::List(_)) => return Err(wrong_type(to)),
+                    _ => {}
+                }
+            }
+            let (mut src_list, src_expires_at) = match store.get(from) {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(from)),
+                None => return Ok(None),
+            };
+            if src_list.is_empty() {
+                return Ok(None);
+            }
+            let popped = if from_left { src_list.remove(0) } else { src_list.pop().expect("non-empty") };
+            if from == to {
+                if to_left {
+                    src_list.insert(0, popped.clone());
+                } else {
+                    src_list.push(popped.clone());
+                }
+                store.insert(
+                    from.to_string(),
+                    StoredValue { expires_at_ms: src_expires_at, value: Value::List(src_list) },
+                );
+                return Ok(Some(Bytes::from(popped)));
+            }
+            if src_list.is_empty() {
+                store.remove(from);
+            } else {
+                store.insert(
+                    from.to_string(),
+                    StoredValue { expires_at_ms: src_expires_at, value: Value::List(src_list) },
+                );
+            }
+            let (mut dst_list, dst_expires_at) = match store.get(to) {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(to)),
+                None => (Vec::new(), None),
+            };
+            if to_left {
+                dst_list.insert(0, popped.clone());
+            } else {
+                dst_list.push(popped.clone());
+            }
+            store.insert(to.to_string(), StoredValue { expires_at_ms: dst_expires_at, value: Value::List(dst_list) });
+            Ok(Some(Bytes::from(popped)))
+        })
+    }
+
+    async fn lpos(
+        &self,
+        key: &str,
+        element: &[u8],
+        rank: i64,
+        count: Option<usize>,
+        maxlen: usize,
+    ) -> Result<Vec<i64>, RustyAntError> {
+        let list = match self.load(key) {
+            Some(StoredValue { value: Value::List(l), .. }) => l,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        let wanted = count.map_or(1, |c| if c == 0 { usize::MAX } else { c });
+        Ok(scan_list_positions(&list, element, rank, wanted, maxlen))
     }
 
     async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError> {

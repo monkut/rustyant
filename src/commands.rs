@@ -180,6 +180,9 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "LREM" => handle_lrem(state, args).await,
         "LINSERT" => handle_linsert(state, args).await,
         "LTRIM" => handle_ltrim(state, args).await,
+        "LMOVE" => handle_lmove(state, args).await,
+        "RPOPLPUSH" => handle_rpoplpush(state, args).await,
+        "LPOS" => handle_lpos(state, args).await,
         // Sets
         "SADD" => handle_sadd(state, args).await,
         "SREM" => handle_srem(state, args).await,
@@ -807,6 +810,83 @@ async fn handle_pushx(state: &State, args: Vec<Bytes>, left: bool) -> Result<Res
     let values: Vec<Bytes> = args.into_iter().skip(1).collect();
     let len = state.storage.list_pushx(&key, values, left).await?;
     Ok(RespReply::Integer(len))
+}
+
+fn parse_side(arg: &Bytes, label: &str) -> Result<bool, RustyAntError> {
+    match arg_as_str(arg)?.to_ascii_uppercase().as_str() {
+        "LEFT" => Ok(true),
+        "RIGHT" => Ok(false),
+        other => Err(RustyAntError::Parse(format!("{label} must be LEFT or RIGHT, got {other}"))),
+    }
+}
+
+async fn handle_lmove(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LMOVE", args.len() == 4)?;
+    let from = arg_as_str(&args[0])?;
+    let to = arg_as_str(&args[1])?;
+    let from_left = parse_side(&args[2], "LMOVE source side")?;
+    let to_left = parse_side(&args[3], "LMOVE destination side")?;
+    let moved = state.storage.list_move(from, to, from_left, to_left).await?;
+    Ok(moved.map_or(RespReply::Nil, |b| RespReply::BulkString(Some(b))))
+}
+
+async fn handle_rpoplpush(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("RPOPLPUSH", args.len() == 2)?;
+    let from = arg_as_str(&args[0])?;
+    let to = arg_as_str(&args[1])?;
+    // RPOPLPUSH = LMOVE src dst RIGHT LEFT.
+    let moved = state.storage.list_move(from, to, false, true).await?;
+    Ok(moved.map_or(RespReply::Nil, |b| RespReply::BulkString(Some(b))))
+}
+
+async fn handle_lpos(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LPOS", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let element = args[1].clone();
+    let mut rank: i64 = 1;
+    let mut count: Option<usize> = None;
+    let mut maxlen: usize = 0;
+    let mut i = 2;
+    while i < args.len() {
+        let opt = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match opt.as_str() {
+            "RANK" => {
+                let v = args.get(i + 1).ok_or_else(|| RustyAntError::Parse("RANK requires a value".into()))?;
+                rank = parse_i64(v, "RANK")?;
+                if rank == 0 {
+                    return Err(RustyAntError::Parse("RANK can't be zero".into()));
+                }
+                i += 2;
+            }
+            "COUNT" => {
+                let v = args.get(i + 1).ok_or_else(|| RustyAntError::Parse("COUNT requires a value".into()))?;
+                let n = parse_i64(v, "COUNT")?;
+                if n < 0 {
+                    return Err(RustyAntError::Parse("COUNT can't be negative".into()));
+                }
+                count = Some(usize::try_from(n).unwrap_or(0));
+                i += 2;
+            }
+            "MAXLEN" => {
+                let v = args.get(i + 1).ok_or_else(|| RustyAntError::Parse("MAXLEN requires a value".into()))?;
+                let n = parse_i64(v, "MAXLEN")?;
+                if n < 0 {
+                    return Err(RustyAntError::Parse("MAXLEN can't be negative".into()));
+                }
+                maxlen = usize::try_from(n).unwrap_or(0);
+                i += 2;
+            }
+            other => return Err(RustyAntError::Parse(format!("unsupported LPOS option: {other}"))),
+        }
+    }
+    let hits = state.storage.lpos(key, &element, rank, count, maxlen).await?;
+    // Without COUNT: first match as integer, or nil when none found.
+    // With COUNT: always an array (possibly empty).
+    if count.is_some() {
+        Ok(RespReply::Array(hits.into_iter().map(RespReply::Integer).collect()))
+    } else {
+        Ok(hits.into_iter().next().map_or(RespReply::Nil, RespReply::Integer))
+    }
 }
 
 async fn handle_smismember(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
