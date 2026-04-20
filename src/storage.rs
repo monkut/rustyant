@@ -174,6 +174,119 @@ fn count_zset_by_score(map: &BTreeMap<String, f64>, min: ScoreBound, max: ScoreB
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
+/// Time-seeded xorshift — good enough for Redis `SPOP` / `SRANDMEMBER`, which
+/// only require "random-ish" sampling, not cryptographic randomness.
+fn pseudo_rand_u64() -> u64 {
+    let nanos: u64 =
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let mut x = nanos ^ 0x2545_F491_4F6C_DD1D_u64;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x
+}
+
+/// Translate `start` / `stop` into absolute indices for `LTRIM`. Returns
+/// `None` when the resulting slice would be empty — Redis drops the key
+/// entirely in that case, unlike `LRANGE` which only returns an empty reply.
+/// The pair is `(keep_start, keep_stop_exclusive)`.
+fn resolve_trim_range(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let len_i = i64::try_from(len).unwrap_or(i64::MAX);
+    let s = if start < 0 { (len_i + start).max(0) } else { start };
+    let e = if stop < 0 { len_i + stop } else { stop.min(len_i - 1) };
+    if s >= len_i || e < 0 || s > e {
+        return None;
+    }
+    Some((usize::try_from(s).unwrap_or(0), usize::try_from(e).unwrap_or(0) + 1))
+}
+
+/// Sequentially load every key as a `Set`. Missing keys contribute an empty
+/// set (Redis semantics for `SINTER`/`SUNION`/`SDIFF`); any key that exists
+/// with a non-set type bubbles up a `WRONGTYPE` error.
+async fn load_sets_seq<S: Storage + ?Sized>(
+    storage: &S,
+    keys: &[String],
+) -> Result<Vec<BTreeSet<String>>, RustyAntError> {
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        let members = storage.smembers(k).await?;
+        out.push(members.into_iter().collect());
+    }
+    Ok(out)
+}
+
+/// Intersection of `sets` — members present in every set. An empty input or
+/// any empty set collapses the result to empty.
+fn set_intersection(sets: Vec<BTreeSet<String>>) -> Vec<String> {
+    let mut iter = sets.into_iter();
+    let Some(first) = iter.next() else {
+        return Vec::new();
+    };
+    iter.fold(first, |acc, s| acc.intersection(&s).cloned().collect()).into_iter().collect()
+}
+
+/// Union of all members across `sets`.
+fn set_union(sets: Vec<BTreeSet<String>>) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for s in sets {
+        out.extend(s);
+    }
+    out.into_iter().collect()
+}
+
+/// Members in the first set that are absent from every subsequent set.
+fn set_difference(sets: Vec<BTreeSet<String>>) -> Vec<String> {
+    let mut iter = sets.into_iter();
+    let Some(first) = iter.next() else {
+        return Vec::new();
+    };
+    let mut remaining = first;
+    for s in iter {
+        remaining = remaining.difference(&s).cloned().collect();
+    }
+    remaining.into_iter().collect()
+}
+
+/// Pick up to `count` unique members from `set` via pseudo-random rotation.
+/// Used by `SPOP` (which mutates the caller's copy afterwards) and by the
+/// positive-count branch of `SRANDMEMBER`.
+fn pick_random_unique(set: &BTreeSet<String>, count: usize) -> Vec<String> {
+    if set.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    let ordered: Vec<&String> = set.iter().collect();
+    let take = count.min(ordered.len());
+    let start = usize::try_from(pseudo_rand_u64() % (ordered.len() as u64)).unwrap_or(0);
+    (0..take).map(|i| ordered[(start + i) % ordered.len()].clone()).collect()
+}
+
+/// `SRANDMEMBER` sampler: `count` is the absolute length wanted, and
+/// `allow_duplicates` flips between Redis's positive-count (unique) and
+/// negative-count (with repetition) semantics.
+fn pick_random(set: &BTreeSet<String>, count: i64, allow_duplicates: bool) -> Vec<String> {
+    if set.is_empty() || count <= 0 {
+        return Vec::new();
+    }
+    let count_usize = usize::try_from(count).unwrap_or(0);
+    let ordered: Vec<&String> = set.iter().collect();
+    if !allow_duplicates {
+        return pick_random_unique(set, count_usize);
+    }
+    let mut rng = pseudo_rand_u64();
+    (0..count_usize)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let idx = usize::try_from(rng % (ordered.len() as u64)).unwrap_or(0);
+            ordered[idx].clone()
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // S3 optimistic-locking primitives.
 //
@@ -276,18 +389,27 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError>;
 
     async fn list_push(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError>;
+    async fn list_pushx(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError>;
     async fn list_pop(&self, key: &str, count: usize, left: bool) -> Result<Vec<Bytes>, RustyAntError>;
     async fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Bytes>, RustyAntError>;
     async fn llen(&self, key: &str) -> Result<i64, RustyAntError>;
     async fn lindex(&self, key: &str, index: i64) -> Result<Option<Bytes>, RustyAntError>;
     async fn lset(&self, key: &str, index: i64, value: Bytes) -> Result<(), RustyAntError>;
     async fn lrem(&self, key: &str, count: i64, value: Bytes) -> Result<i64, RustyAntError>;
+    async fn linsert(&self, key: &str, before: bool, pivot: Bytes, value: Bytes) -> Result<i64, RustyAntError>;
+    async fn ltrim(&self, key: &str, start: i64, stop: i64) -> Result<(), RustyAntError>;
 
     async fn sadd(&self, key: &str, members: Vec<String>) -> Result<i64, RustyAntError>;
     async fn srem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
     async fn smembers(&self, key: &str) -> Result<Vec<String>, RustyAntError>;
     async fn sismember(&self, key: &str, member: &str) -> Result<bool, RustyAntError>;
+    async fn smismember(&self, key: &str, members: &[String]) -> Result<Vec<bool>, RustyAntError>;
     async fn scard(&self, key: &str) -> Result<i64, RustyAntError>;
+    async fn sinter(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError>;
+    async fn sunion(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError>;
+    async fn sdiff(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError>;
+    async fn spop(&self, key: &str, count: usize) -> Result<Vec<String>, RustyAntError>;
+    async fn srandmember(&self, key: &str, count: i64, allow_duplicates: bool) -> Result<Vec<String>, RustyAntError>;
 
     async fn zadd(&self, key: &str, pairs: Vec<(f64, String)>) -> Result<i64, RustyAntError>;
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
@@ -1010,6 +1132,67 @@ impl Storage for S3Storage {
         .await
     }
 
+    async fn linsert(&self, key: &str, before: bool, pivot: Bytes, value: Bytes) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let Some(pos) = list.iter().position(|v| v.as_slice() == pivot.as_ref()) else {
+                return Ok(CasAction::NoOp(-1));
+            };
+            let insert_at = if before { pos } else { pos + 1 };
+            list.insert(insert_at, value.to_vec());
+            let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+            let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+            Ok(CasAction::Write(new_entry, len))
+        })
+        .await
+    }
+
+    async fn ltrim(&self, key: &str, start: i64, stop: i64) -> Result<(), RustyAntError> {
+        self.cas(key, move |entry| {
+            let (list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(())),
+            };
+            let Some((s, e_excl)) = resolve_trim_range(list.len(), start, stop) else {
+                return Ok(CasAction::Delete(()));
+            };
+            let kept: Vec<Vec<u8>> = list[s..e_excl].to_vec();
+            if kept.is_empty() {
+                Ok(CasAction::Delete(()))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::List(kept) };
+                Ok(CasAction::Write(new_entry, ()))
+            }
+        })
+        .await
+    }
+
+    async fn list_pushx(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut list, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            for v in &values {
+                if left {
+                    list.insert(0, v.to_vec());
+                } else {
+                    list.push(v.to_vec());
+                }
+            }
+            let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+            let new_entry = StoredValue { expires_at_ms, value: Value::List(list) };
+            Ok(CasAction::Write(new_entry, len))
+        })
+        .await
+    }
+
     async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError> {
         let map = match self.load(key).await? {
             Some(StoredValue { value: Value::ZSet(m), .. }) => m,
@@ -1125,6 +1308,66 @@ impl Storage for S3Storage {
             }
         })
         .await
+    }
+
+    async fn smismember(&self, key: &str, members: &[String]) -> Result<Vec<bool>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(members.iter().map(|m| s.contains(m)).collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(members.iter().map(|_| false).collect()),
+        }
+    }
+
+    async fn sinter(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError> {
+        let sets = load_sets_seq(self, keys).await?;
+        Ok(set_intersection(sets))
+    }
+
+    async fn sunion(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError> {
+        let sets = load_sets_seq(self, keys).await?;
+        Ok(set_union(sets))
+    }
+
+    async fn sdiff(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError> {
+        let sets = load_sets_seq(self, keys).await?;
+        Ok(set_difference(sets))
+    }
+
+    async fn spop(&self, key: &str, count: usize) -> Result<Vec<String>, RustyAntError> {
+        if count == 0 {
+            // Validate type even on no-op count so a string key still errors.
+            match self.load(key).await? {
+                Some(StoredValue { value: Value::Set(_), .. }) | None => return Ok(Vec::new()),
+                Some(_) => return Err(wrong_type(key)),
+            }
+        }
+        self.cas(key, move |entry| {
+            let (mut set, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Set(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(Vec::new())),
+            };
+            let picked = pick_random_unique(&set, count);
+            for m in &picked {
+                set.remove(m);
+            }
+            if set.is_empty() {
+                Ok(CasAction::Delete(picked))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::Set(set) };
+                Ok(CasAction::Write(new_entry, picked))
+            }
+        })
+        .await
+    }
+
+    async fn srandmember(&self, key: &str, count: i64, allow_duplicates: bool) -> Result<Vec<String>, RustyAntError> {
+        let set = match self.load(key).await? {
+            Some(StoredValue { value: Value::Set(s), .. }) => s,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        Ok(pick_random(&set, count, allow_duplicates))
     }
 
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError> {
@@ -1749,6 +1992,72 @@ impl Storage for InMemoryStorage {
         Ok(removed)
     }
 
+    async fn linsert(&self, key: &str, before: bool, pivot: Bytes, value: Bytes) -> Result<i64, RustyAntError> {
+        let (mut list, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(0),
+        };
+        let Some(pos) = list.iter().position(|v| v.as_slice() == pivot.as_ref()) else {
+            return Ok(-1);
+        };
+        let insert_at = if before { pos } else { pos + 1 };
+        list.insert(insert_at, value.to_vec());
+        let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+        let entry = StoredValue { expires_at_ms, value: Value::List(list) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(len)
+    }
+
+    async fn ltrim(&self, key: &str, start: i64, stop: i64) -> Result<(), RustyAntError> {
+        let (list, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(()),
+        };
+        let Some((s, e_excl)) = resolve_trim_range(list.len(), start, stop) else {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+            return Ok(());
+        };
+        let kept: Vec<Vec<u8>> = list[s..e_excl].to_vec();
+        if kept.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::List(kept) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_pushx(&self, key: &str, values: Vec<Bytes>, left: bool) -> Result<i64, RustyAntError> {
+        let (mut list, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::List(l), expires_at_ms }) => (l, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(0),
+        };
+        for v in values {
+            if left {
+                list.insert(0, v.to_vec());
+            } else {
+                list.push(v.to_vec());
+            }
+        }
+        let len = i64::try_from(list.len()).unwrap_or(i64::MAX);
+        let entry = StoredValue { expires_at_ms, value: Value::List(list) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(len)
+    }
+
     async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError> {
         let map = match self.load(key) {
             Some(StoredValue { value: Value::ZSet(m), .. }) => m,
@@ -1845,6 +2154,64 @@ impl Storage for InMemoryStorage {
             });
         }
         Ok(removed)
+    }
+
+    async fn smismember(&self, key: &str, members: &[String]) -> Result<Vec<bool>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), .. }) => Ok(members.iter().map(|m| s.contains(m)).collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(members.iter().map(|_| false).collect()),
+        }
+    }
+
+    async fn sinter(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError> {
+        let sets = load_sets_seq(self, keys).await?;
+        Ok(set_intersection(sets))
+    }
+
+    async fn sunion(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError> {
+        let sets = load_sets_seq(self, keys).await?;
+        Ok(set_union(sets))
+    }
+
+    async fn sdiff(&self, keys: &[String]) -> Result<Vec<String>, RustyAntError> {
+        let sets = load_sets_seq(self, keys).await?;
+        Ok(set_difference(sets))
+    }
+
+    async fn spop(&self, key: &str, count: usize) -> Result<Vec<String>, RustyAntError> {
+        let (mut set, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), expires_at_ms }) => (s, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let picked = pick_random_unique(&set, count);
+        for m in &picked {
+            set.remove(m);
+        }
+        if set.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::Set(set) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(picked)
+    }
+
+    async fn srandmember(&self, key: &str, count: i64, allow_duplicates: bool) -> Result<Vec<String>, RustyAntError> {
+        let set = match self.load(key) {
+            Some(StoredValue { value: Value::Set(s), .. }) => s,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        Ok(pick_random(&set, count, allow_duplicates))
     }
 
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError> {

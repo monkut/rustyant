@@ -61,8 +61,8 @@ Implemented:
 | Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE` |
 | Strings | `GET`, `SET` (+ `EX` / `PX` options), `GETSET`, `GETDEL`, `SETNX`, `SETEX`, `MGET`, `MSET`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `TTL`, `INCR`, `INCRBY`, `DECR`, `DECRBY` |
 | Hashes | `HSET`, `HSETNX`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HSTRLEN`, `HMGET`, `HINCRBY` |
-| Lists | `LPUSH`, `RPUSH`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM` |
-| Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
+| Lists | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LINSERT`, `LTRIM` |
+| Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` (+ count), `SRANDMEMBER` (+ count) |
 | Sorted Sets | `ZADD`, `ZREM`, `ZINCRBY`, `ZRANGE`, `ZRANGEBYSCORE`, `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`, `ZRANK`, `ZREVRANK` |
 
 `KEYS` paginates through `ListObjectsV2` in full and filters by the wildmatch pattern — O(n) over the keyspace, safe at low cardinality, proportionally slower for larger buckets. `SCAN` delegates the page boundary to S3 via a continuation token, returning one `ListObjectsV2` page per call; `MATCH` is applied client-side, so the per-page yield may be smaller than `COUNT` when a pattern is narrow.
@@ -154,6 +154,6 @@ The `rustyant` and `rustyant-ws` binaries emit structured JSON logs via `tracing
 
 ## Status
 
-Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 123 Rust tests across 5 suites (18 lib units + 81 HTTP integration + 11 redis-py compat + 6 WebSocket E2E + 7 encoder) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 187 Rust tests across 5 suites (18 lib units + 145 HTTP integration + 11 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
 
 Not wired: no end-to-end test driving a real WebSocket connection against a deployed binary in AWS; the `s3_concurrent_incr_converges` CAS test is gated behind `RUSTYANT_S3_CAS=1` because floci doesn't enforce `If-Match` headers.

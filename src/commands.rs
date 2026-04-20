@@ -146,6 +146,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         // Lists
         "LPUSH" => handle_push(state, args, true).await,
         "RPUSH" => handle_push(state, args, false).await,
+        "LPUSHX" => handle_pushx(state, args, true).await,
+        "RPUSHX" => handle_pushx(state, args, false).await,
         "LPOP" => handle_pop(state, args, true).await,
         "RPOP" => handle_pop(state, args, false).await,
         "LRANGE" => handle_lrange(state, args).await,
@@ -153,12 +155,20 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "LINDEX" => handle_lindex(state, args).await,
         "LSET" => handle_lset(state, args).await,
         "LREM" => handle_lrem(state, args).await,
+        "LINSERT" => handle_linsert(state, args).await,
+        "LTRIM" => handle_ltrim(state, args).await,
         // Sets
         "SADD" => handle_sadd(state, args).await,
         "SREM" => handle_srem(state, args).await,
         "SMEMBERS" => handle_smembers(state, args).await,
         "SISMEMBER" => handle_sismember(state, args).await,
+        "SMISMEMBER" => handle_smismember(state, args).await,
         "SCARD" => handle_scard(state, args).await,
+        "SINTER" => handle_sinter(state, args).await,
+        "SUNION" => handle_sunion(state, args).await,
+        "SDIFF" => handle_sdiff(state, args).await,
+        "SPOP" => handle_spop(state, args).await,
+        "SRANDMEMBER" => handle_srandmember(state, args).await,
         // Sorted sets
         "ZADD" => handle_zadd(state, args).await,
         "ZREM" => handle_zrem(state, args).await,
@@ -676,6 +686,109 @@ async fn handle_lrem(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     let value = args[2].clone();
     let removed = state.storage.lrem(key, count, value).await?;
     Ok(RespReply::Integer(removed))
+}
+
+async fn handle_linsert(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LINSERT", args.len() == 4)?;
+    let key = arg_as_str(&args[0])?;
+    let before = match arg_as_str(&args[1])?.to_ascii_uppercase().as_str() {
+        "BEFORE" => true,
+        "AFTER" => false,
+        other => return Err(RustyAntError::Parse(format!("LINSERT direction must be BEFORE or AFTER, got {other}"))),
+    };
+    let pivot = args[2].clone();
+    let value = args[3].clone();
+    let new_len = state.storage.linsert(key, before, pivot, value).await?;
+    Ok(RespReply::Integer(new_len))
+}
+
+async fn handle_ltrim(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("LTRIM", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let start = parse_i64(&args[1], "start")?;
+    let stop = parse_i64(&args[2], "stop")?;
+    state.storage.ltrim(key, start, stop).await?;
+    Ok(RespReply::ok())
+}
+
+async fn handle_pushx(state: &State, args: Vec<Bytes>, left: bool) -> Result<RespReply, RustyAntError> {
+    let cmd = if left { "LPUSHX" } else { "RPUSHX" };
+    arity(cmd, args.len() >= 2)?;
+    let key = arg_as_string(&args[0])?;
+    let values: Vec<Bytes> = args.into_iter().skip(1).collect();
+    let len = state.storage.list_pushx(&key, values, left).await?;
+    Ok(RespReply::Integer(len))
+}
+
+async fn handle_smismember(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SMISMEMBER", args.len() >= 2)?;
+    let key = arg_as_str(&args[0])?;
+    let members: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let flags = state.storage.smismember(key, &members).await?;
+    Ok(RespReply::Array(flags.into_iter().map(|b| RespReply::Integer(i64::from(b))).collect()))
+}
+
+async fn handle_sinter(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SINTER", !args.is_empty())?;
+    let keys: Vec<String> = args.iter().map(arg_as_string).collect::<Result<_, _>>()?;
+    let members = state.storage.sinter(&keys).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_sunion(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SUNION", !args.is_empty())?;
+    let keys: Vec<String> = args.iter().map(arg_as_string).collect::<Result<_, _>>()?;
+    let members = state.storage.sunion(&keys).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_sdiff(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SDIFF", !args.is_empty())?;
+    let keys: Vec<String> = args.iter().map(arg_as_string).collect::<Result<_, _>>()?;
+    let members = state.storage.sdiff(&keys).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_spop(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SPOP", !args.is_empty() && args.len() <= 2)?;
+    let key = arg_as_str(&args[0])?;
+    if args.len() == 2 {
+        let count = parse_i64(&args[1], "count")?;
+        if count < 0 {
+            return Err(RustyAntError::Parse("count must be >= 0".into()));
+        }
+        let count_usize = usize::try_from(count).unwrap_or(0);
+        let popped = state.storage.spop(key, count_usize).await?;
+        Ok(RespReply::Array(
+            popped.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+        ))
+    } else {
+        let mut popped = state.storage.spop(key, 1).await?;
+        Ok(popped.pop().map_or(RespReply::Nil, |m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))))
+    }
+}
+
+async fn handle_srandmember(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SRANDMEMBER", !args.is_empty() && args.len() <= 2)?;
+    let key = arg_as_str(&args[0])?;
+    if args.len() == 2 {
+        let count = parse_i64(&args[1], "count")?;
+        let allow_duplicates = count < 0;
+        let abs_count = count.checked_abs().ok_or_else(|| RustyAntError::Parse("count overflow".into()))?;
+        let picked = state.storage.srandmember(key, abs_count, allow_duplicates).await?;
+        Ok(RespReply::Array(
+            picked.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+        ))
+    } else {
+        let mut picked = state.storage.srandmember(key, 1, false).await?;
+        Ok(picked.pop().map_or(RespReply::Nil, |m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))))
+    }
 }
 
 async fn handle_zrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
