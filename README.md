@@ -60,12 +60,14 @@ Implemented:
 | Server | `PING`, `ECHO`, `TIME`, `DBSIZE`, `FLUSHDB`, `FLUSHALL` |
 | Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE`, `RENAME`, `RENAMENX`, `RANDOMKEY`, `UNLINK`, `COPY` (+ `REPLACE` / `DB 0`) |
 | Strings | `GET`, `SET` (+ `EX` / `PX` options), `GETSET`, `GETDEL`, `GETRANGE`, `SETRANGE`, `SETNX`, `SETEX`, `MGET`, `MSET`, `MSETNX`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `PEXPIRE`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`, `GETBIT`, `SETBIT`, `BITCOUNT` (+ `BYTE` / `BIT`), `BITPOS` (+ `BYTE` / `BIT`), `BITOP` (`AND` / `OR` / `XOR` / `NOT`) |
-| Hashes | `HSET`, `HSETNX`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HSTRLEN`, `HMGET`, `HINCRBY` |
+| Hashes | `HSET`, `HSETNX`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HSTRLEN`, `HMGET`, `HINCRBY`, `HSCAN` (+ `MATCH` / `COUNT`) |
 | Lists | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LINSERT`, `LTRIM` |
-| Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` (+ count), `SRANDMEMBER` (+ count) |
-| Sorted Sets | `ZADD`, `ZREM`, `ZINCRBY`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZPOPMIN` (+ count), `ZPOPMAX` (+ count), `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`, `ZRANK`, `ZREVRANK` |
+| Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` (+ count), `SRANDMEMBER` (+ count), `SSCAN` (+ `MATCH` / `COUNT`) |
+| Sorted Sets | `ZADD`, `ZREM`, `ZINCRBY`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZPOPMIN` (+ count), `ZPOPMAX` (+ count), `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`, `ZRANK`, `ZREVRANK`, `ZSCAN` (+ `MATCH` / `COUNT`) |
 
 `KEYS` paginates through `ListObjectsV2` in full and filters by the wildmatch pattern — O(n) over the keyspace, safe at low cardinality, proportionally slower for larger buckets. `SCAN` delegates the page boundary to S3 via a continuation token, returning one `ListObjectsV2` page per call; `MATCH` is applied client-side, so the per-page yield may be smaller than `COUNT` when a pattern is narrow.
+
+`HSCAN` / `SSCAN` / `ZSCAN` paginate inside a single collection. The cursor is an integer offset into the caller's iteration and `0` means "start / done", matching Redis. Because each collection is one S3 object, every call loads the full value — pagination is a client-side ergonomic, not a server-side cost saving. `MATCH` is applied after the batch is sliced (Redis semantics), so a narrow pattern can yield fewer than `COUNT` items per page.
 
 `DBSIZE` and `RANDOMKEY` walk the same `ListObjectsV2` pagination: O(n) on the S3 backend, instant on the in-memory backend. Recently-expired keys that haven't been GC'd yet still count toward `DBSIZE`, matching Redis's lazy-expiry semantics. `FLUSHDB` and `FLUSHALL` are aliases here — rustyant exposes one logical namespace — and batch-delete a page (up to 1000 objects) per `DeleteObjects` call. The optional `ASYNC` / `SYNC` modifier is accepted but ignored: the flush is always synchronous over S3. `UNLINK` shares the synchronous `DEL` path; rustyant has no background freer thread.
 
@@ -158,6 +160,6 @@ The `rustyant` and `rustyant-ws` binaries emit structured JSON logs via `tracing
 
 ## Status
 
-Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 275 Rust tests across 5 suites (18 lib units + 231 HTTP integration + 13 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 287 Rust tests across 5 suites (18 lib units + 242 HTTP integration + 14 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
 
 Not wired: no end-to-end test driving a real WebSocket connection against a deployed binary in AWS; the `s3_concurrent_incr_converges` CAS test is gated behind `RUSTYANT_S3_CAS=1` because floci doesn't enforce `If-Match` headers.
