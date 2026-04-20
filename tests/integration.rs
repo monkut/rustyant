@@ -732,6 +732,54 @@ async fn zcard_counts_members() {
     call(&state, &[b"ZCARD", b"z"]).await.expect_integer(3);
 }
 
+#[tokio::test]
+async fn zrank_returns_ascending_index() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZRANK", b"z", b"a"]).await.expect_integer(0);
+    call(&state, &[b"ZRANK", b"z", b"b"]).await.expect_integer(1);
+    call(&state, &[b"ZRANK", b"z", b"c"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn zrevrank_returns_descending_index() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZREVRANK", b"z", b"a"]).await.expect_integer(2);
+    call(&state, &[b"ZREVRANK", b"z", b"b"]).await.expect_integer(1);
+    call(&state, &[b"ZREVRANK", b"z", b"c"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zrank_ties_break_lexicographically() {
+    // Equal scores: ascending tie-break is member-asc, descending flips it.
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"b", b"1", b"a", b"1", b"c"]).await;
+    call(&state, &[b"ZRANK", b"z", b"a"]).await.expect_integer(0);
+    call(&state, &[b"ZRANK", b"z", b"b"]).await.expect_integer(1);
+    call(&state, &[b"ZRANK", b"z", b"c"]).await.expect_integer(2);
+    call(&state, &[b"ZREVRANK", b"z", b"a"]).await.expect_integer(2);
+    call(&state, &[b"ZREVRANK", b"z", b"c"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zrank_on_missing_member_or_key_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"ZRANK", b"ghost", b"m"]).await.expect_nil();
+    call(&state, &[b"ZREVRANK", b"ghost", b"m"]).await.expect_nil();
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"ZRANK", b"z", b"missing"]).await.expect_nil();
+    call(&state, &[b"ZREVRANK", b"z", b"missing"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn zrank_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZRANK", b"k", b"m"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZREVRANK", b"k", b"m"]).await.expect_error_prefix("ERR");
+}
+
 // ---------------------------------------------------------------------------
 // Additional mutating commands (HINCRBY, SREM, ZREM, ZINCRBY)
 // ---------------------------------------------------------------------------

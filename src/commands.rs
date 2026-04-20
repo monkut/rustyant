@@ -167,6 +167,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZRANGEBYSCORE" => handle_zrangebyscore(state, args).await,
         "ZSCORE" => handle_zscore(state, args).await,
         "ZCARD" => handle_zcard(state, args).await,
+        "ZRANK" => handle_zrank(state, args, false).await,
+        "ZREVRANK" => handle_zrank(state, args, true).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
     }
 }
@@ -522,6 +524,16 @@ async fn handle_zcard(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
     arity("ZCARD", args.len() == 1)?;
     let n = state.storage.zcard(arg_as_str(&args[0])?).await?;
     Ok(RespReply::Integer(n))
+}
+
+async fn handle_zrank(state: &State, args: Vec<Bytes>, reverse: bool) -> Result<RespReply, RustyAntError> {
+    let cmd = if reverse { "ZREVRANK" } else { "ZRANK" };
+    arity(cmd, args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let member = arg_as_str(&args[1])?;
+    let rank =
+        if reverse { state.storage.zrevrank(key, member).await? } else { state.storage.zrank(key, member).await? };
+    Ok(rank.map_or(RespReply::Nil, RespReply::Integer))
 }
 
 // ---- String multi-key + NX/EX + GETSET + PERSIST --------------------------
