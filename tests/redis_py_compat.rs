@@ -387,6 +387,37 @@ print('ok')
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_py_bit_ops() {
+    // Drive every new bit-op surface through redis-py so any encoding
+    // mismatch in GETBIT / SETBIT / BITCOUNT / BITPOS / BITOP shows up.
+    run_redis_py_script(
+        r"
+import redis
+r = redis.Redis(host='127.0.0.1', port={port}, socket_timeout=5)
+# SETBIT auto-creates and zero-pads; previous value reported.
+assert r.setbit('k', 7, 1) == 0
+assert r.setbit('k', 7, 1) == 1
+assert r.getbit('k', 7) == 1
+assert r.getbit('k', 0) == 0
+assert r.getbit('k', 100) == 0
+r.set('s', 'foobar')
+assert r.bitcount('s') == 26
+assert r.bitcount('s', 0, 0) == 4
+r.set('a', b'\xff\xff')
+r.set('b', b'\x0f')
+assert r.bitop('AND', 'dst', 'a', 'b') == 2
+assert r.get('dst') == b'\x0f\x00'
+assert r.bitop('NOT', 'inv', 'b') == 1
+assert r.get('inv') == b'\xf0'
+r.set('z', b'\xff\xf0')
+assert r.bitpos('z', 0) == 12
+print('ok')
+",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_py_pipeline() {
     // redis-py's pipeline batches commands and reads replies in order.
     // This exercises the TCP streaming path with multiple frames in flight.

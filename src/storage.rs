@@ -610,6 +610,53 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// already present without `replace`, or `from == to`. On S3 the two
     /// objects aren't modified atomically, same caveat as `RENAME`.
     async fn copy(&self, from: &str, to: &str, replace: bool) -> Result<bool, RustyAntError>;
+
+    /// Read a single bit (0 or 1) at the given offset. Bit 0 is the MSB of
+    /// byte 0, matching Redis's bit ordering. Out-of-range or missing key
+    /// returns 0. Default impl reads the whole string and indexes locally.
+    async fn getbit(&self, key: &str, offset: u64) -> Result<i64, RustyAntError> {
+        let Some(data) = self.get_string(key).await? else {
+            return Ok(0);
+        };
+        Ok(i64::from(bit_at(&data, offset)))
+    }
+
+    /// Set a single bit at `offset` to `value`, zero-padding the underlying
+    /// string if needed. Returns the previous bit value (0 or 1). Mutates
+    /// under CAS on the S3 backend.
+    async fn setbit(&self, key: &str, offset: u64, value: bool) -> Result<i64, RustyAntError>;
+}
+
+/// Read bit `offset` (Redis bit numbering: bit 0 = MSB of byte 0) from `data`.
+/// Returns 0 when the offset is beyond the string.
+pub fn bit_at(data: &[u8], offset: u64) -> u8 {
+    let byte_idx = offset / 8;
+    let Ok(byte_idx) = usize::try_from(byte_idx) else {
+        return 0;
+    };
+    if byte_idx >= data.len() {
+        return 0;
+    }
+    let bit_in_byte = 7 - (offset % 8) as u8;
+    (data[byte_idx] >> bit_in_byte) & 1
+}
+
+/// Mutate the bit at `offset` to `value` in `data`, zero-padding the buffer
+/// if `offset` lands past the current end. Returns the previous bit value.
+pub fn apply_setbit(data: &mut Vec<u8>, offset: u64, value: bool) -> u8 {
+    let byte_idx = usize::try_from(offset / 8).unwrap_or(usize::MAX);
+    if byte_idx >= data.len() {
+        data.resize(byte_idx + 1, 0);
+    }
+    let bit_in_byte = 7 - (offset % 8) as u8;
+    let mask: u8 = 1 << bit_in_byte;
+    let prev = (data[byte_idx] & mask) >> bit_in_byte;
+    if value {
+        data[byte_idx] |= mask;
+    } else {
+        data[byte_idx] &= !mask;
+    }
+    prev
 }
 
 // ---------------------------------------------------------------------------
@@ -1876,6 +1923,20 @@ impl Storage for S3Storage {
             Err(e) => Err(e),
         }
     }
+
+    async fn setbit(&self, key: &str, offset: u64, value: bool) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut data, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::String(d), expires_at_ms }) => (d.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (Vec::new(), None),
+            };
+            let prev = apply_setbit(&mut data, offset, value);
+            let new_entry = StoredValue { expires_at_ms, value: Value::String(data) };
+            Ok(CasAction::Write(new_entry, i64::from(prev)))
+        })
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2926,6 +2987,20 @@ impl Storage for InMemoryStorage {
             store.insert(to.to_string(), entry);
         });
         Ok(true)
+    }
+
+    async fn setbit(&self, key: &str, offset: u64, value: bool) -> Result<i64, RustyAntError> {
+        let (mut data, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::String(d), expires_at_ms }) => (d, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => (Vec::new(), None),
+        };
+        let prev = apply_setbit(&mut data, offset, value);
+        let entry = StoredValue { expires_at_ms, value: Value::String(data) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(i64::from(prev))
     }
 }
 

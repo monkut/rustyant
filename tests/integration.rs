@@ -2005,6 +2005,263 @@ async fn copy_unknown_option_errors() {
     call(&state, &[b"COPY", b"src", b"dst", b"NUKE"]).await.expect_error_prefix("ERR");
 }
 
+// ---------------------------------------------------------------------------
+// Bit ops on Strings: GETBIT / SETBIT / BITCOUNT / BITPOS / BITOP
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn getbit_on_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"GETBIT", b"k", b"0"]).await.expect_integer(0);
+    call(&state, &[b"GETBIT", b"k", b"100"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn getbit_reads_msb_first_within_byte() {
+    let state = test_state();
+    // 0x80 = 1000_0000 — bit 0 is set, rest cleared.
+    call(&state, &[b"SET", b"k", b"\x80"]).await;
+    call(&state, &[b"GETBIT", b"k", b"0"]).await.expect_integer(1);
+    call(&state, &[b"GETBIT", b"k", b"1"]).await.expect_integer(0);
+    call(&state, &[b"GETBIT", b"k", b"7"]).await.expect_integer(0);
+    // Past end → 0, no error.
+    call(&state, &[b"GETBIT", b"k", b"100"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn getbit_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"GETBIT", b"l", b"0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn setbit_creates_and_extends_string() {
+    let state = test_state();
+    // First SETBIT on a missing key creates the string and zero-pads.
+    call(&state, &[b"SETBIT", b"k", b"7", b"1"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"\x01");
+    call(&state, &[b"STRLEN", b"k"]).await.expect_integer(1);
+    // Setting bit 16 forces a 3-byte string with the new bit at MSB of byte 2.
+    call(&state, &[b"SETBIT", b"k", b"16", b"1"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"\x01\x00\x80");
+}
+
+#[tokio::test]
+async fn setbit_returns_previous_bit_value() {
+    let state = test_state();
+    call(&state, &[b"SETBIT", b"k", b"3", b"1"]).await.expect_integer(0);
+    // Setting the same bit again should report the previous value (1).
+    call(&state, &[b"SETBIT", b"k", b"3", b"1"]).await.expect_integer(1);
+    call(&state, &[b"SETBIT", b"k", b"3", b"0"]).await.expect_integer(1);
+    call(&state, &[b"SETBIT", b"k", b"3", b"0"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn setbit_rejects_invalid_bit_value() {
+    let state = test_state();
+    call(&state, &[b"SETBIT", b"k", b"0", b"2"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"SETBIT", b"k", b"0", b"-1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn setbit_negative_offset_errors() {
+    let state = test_state();
+    call(&state, &[b"SETBIT", b"k", b"-1", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn setbit_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"SETBIT", b"l", b"0", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn bitcount_whole_key_counts_set_bits() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"foobar"]).await;
+    // Real Redis reports 26 set bits in "foobar".
+    call(&state, &[b"BITCOUNT", b"k"]).await.expect_integer(26);
+}
+
+#[tokio::test]
+async fn bitcount_byte_range_inclusive() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"foobar"]).await;
+    // Bytes 0..=0 = "f" (0x66 = 0110_0110) = 4 set bits.
+    call(&state, &[b"BITCOUNT", b"k", b"0", b"0"]).await.expect_integer(4);
+    // Negative indices: last two bytes = "ar" — 3 + 4 = 7 set bits.
+    call(&state, &[b"BITCOUNT", b"k", b"-2", b"-1"]).await.expect_integer(7);
+}
+
+#[tokio::test]
+async fn bitcount_bit_range_unit() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"\xff\x00"]).await;
+    // First 8 bits are all 1.
+    call(&state, &[b"BITCOUNT", b"k", b"0", b"7", b"BIT"]).await.expect_integer(8);
+    // Bits 8..=15 are all 0.
+    call(&state, &[b"BITCOUNT", b"k", b"8", b"15", b"BIT"]).await.expect_integer(0);
+    // Bits 4..=11 straddle the boundary: 4 ones then 4 zeros.
+    call(&state, &[b"BITCOUNT", b"k", b"4", b"11", b"BIT"]).await.expect_integer(4);
+}
+
+#[tokio::test]
+async fn bitcount_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"BITCOUNT", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"BITCOUNT", b"missing", b"0", b"10"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn bitcount_empty_range_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"foo"]).await;
+    call(&state, &[b"BITCOUNT", b"k", b"5", b"10"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn bitcount_arity_errors() {
+    let state = test_state();
+    // Missing end argument when start is given.
+    call(&state, &[b"BITCOUNT", b"k", b"0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn bitpos_finds_first_set_bit() {
+    let state = test_state();
+    // 0x00 0x0f 0xff — first set bit is at index 12.
+    call(&state, &[b"SET", b"k", b"\x00\x0f\xff"]).await;
+    call(&state, &[b"BITPOS", b"k", b"1"]).await.expect_integer(12);
+}
+
+#[tokio::test]
+async fn bitpos_finds_first_clear_bit() {
+    let state = test_state();
+    // 0xff 0xf0 — first clear bit is at index 12.
+    call(&state, &[b"SET", b"k", b"\xff\xf0"]).await;
+    call(&state, &[b"BITPOS", b"k", b"0"]).await.expect_integer(12);
+}
+
+#[tokio::test]
+async fn bitpos_zero_on_all_ones_with_no_end_returns_past_end() {
+    let state = test_state();
+    // Three bytes all 1s — Redis returns the position one past the last bit
+    // (24) when no end is pinned, treating the trailing string as zero-padded.
+    call(&state, &[b"SET", b"k", b"\xff\xff\xff"]).await;
+    call(&state, &[b"BITPOS", b"k", b"0"]).await.expect_integer(24);
+}
+
+#[tokio::test]
+async fn bitpos_zero_with_explicit_end_returns_minus_one_when_not_found() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"\xff\xff\xff"]).await;
+    // With an explicit end the trailing-zeros fiction does NOT apply.
+    call(&state, &[b"BITPOS", b"k", b"0", b"0", b"-1"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn bitpos_one_on_all_zeros_returns_minus_one() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"\x00\x00"]).await;
+    call(&state, &[b"BITPOS", b"k", b"1"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn bitpos_with_byte_range() {
+    let state = test_state();
+    // First set bit is in byte 0; restricting to byte 1 onward should skip it.
+    call(&state, &[b"SET", b"k", b"\x80\x40"]).await;
+    call(&state, &[b"BITPOS", b"k", b"1", b"1"]).await.expect_integer(9);
+}
+
+#[tokio::test]
+async fn bitpos_with_bit_range_unit() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"\x80\x40"]).await;
+    // Search bit-range 5..=15 — first 1-bit is at index 9 (MSB of byte 1 is
+    // clear, the set bit is the second-MSB).
+    call(&state, &[b"BITPOS", b"k", b"1", b"5", b"15", b"BIT"]).await.expect_integer(9);
+}
+
+#[tokio::test]
+async fn bitpos_missing_key() {
+    let state = test_state();
+    // Missing / empty key: searching for 0 starts at position 0; for 1, -1.
+    call(&state, &[b"BITPOS", b"missing", b"0"]).await.expect_integer(0);
+    call(&state, &[b"BITPOS", b"missing", b"1"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn bitop_and_pads_shorter_with_zeros() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"\xff\xff"]).await;
+    call(&state, &[b"SET", b"b", b"\x0f"]).await;
+    // AND result is "\x0f\x00" (length 2, padded shorter with zeros).
+    call(&state, &[b"BITOP", b"AND", b"dst", b"a", b"b"]).await.expect_integer(2);
+    call(&state, &[b"GET", b"dst"]).await.expect_bulk(b"\x0f\x00");
+}
+
+#[tokio::test]
+async fn bitop_or_combines_sources() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"\xf0"]).await;
+    call(&state, &[b"SET", b"b", b"\x0f"]).await;
+    call(&state, &[b"BITOP", b"OR", b"dst", b"a", b"b"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"dst"]).await.expect_bulk(b"\xff");
+}
+
+#[tokio::test]
+async fn bitop_xor_three_sources() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"\xff"]).await;
+    call(&state, &[b"SET", b"b", b"\x0f"]).await;
+    call(&state, &[b"SET", b"c", b"\xf0"]).await;
+    // 0xff ^ 0x0f ^ 0xf0 = 0x00
+    call(&state, &[b"BITOP", b"XOR", b"dst", b"a", b"b", b"c"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"dst"]).await.expect_bulk(b"\x00");
+}
+
+#[tokio::test]
+async fn bitop_not_inverts_single_source() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"\x0f\x55"]).await;
+    call(&state, &[b"BITOP", b"NOT", b"dst", b"a"]).await.expect_integer(2);
+    call(&state, &[b"GET", b"dst"]).await.expect_bulk(b"\xf0\xaa");
+}
+
+#[tokio::test]
+async fn bitop_not_rejects_multiple_sources() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"\x0f"]).await;
+    call(&state, &[b"SET", b"b", b"\xf0"]).await;
+    call(&state, &[b"BITOP", b"NOT", b"dst", b"a", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn bitop_unknown_operation_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"v"]).await;
+    call(&state, &[b"BITOP", b"NUKE", b"dst", b"a"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn bitop_missing_sources_yield_empty_dest_and_delete() {
+    let state = test_state();
+    // Pre-existing dest should be removed when the result collapses to empty.
+    call(&state, &[b"SET", b"dst", b"old"]).await;
+    call(&state, &[b"BITOP", b"AND", b"dst", b"missing1", b"missing2"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"dst"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn bitop_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"BITOP", b"OR", b"dst", b"l"]).await.expect_error_prefix("ERR");
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {
