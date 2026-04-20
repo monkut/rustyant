@@ -101,6 +101,19 @@ fn resolve_range(len: i64, start: i64, stop: i64) -> Option<(usize, usize)> {
     Some((usize::try_from(s).unwrap_or(0), usize::try_from(e).unwrap_or(0)))
 }
 
+/// 0-based ascending rank of `member` in a zset: sort by (score asc, member
+/// asc for tied scores) — the Redis canonical ordering — and return the
+/// member's index, or `None` if absent.
+fn asc_rank_of(map: &BTreeMap<String, f64>, member: &str) -> Option<i64> {
+    if !map.contains_key(member) {
+        return None;
+    }
+    let mut sorted: Vec<(&str, f64)> = map.iter().map(|(m, s)| (m.as_str(), *s)).collect();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(b.0)));
+    let pos = sorted.iter().position(|(m, _)| *m == member)?;
+    Some(i64::try_from(pos).unwrap_or(i64::MAX))
+}
+
 fn wrong_type(key: &str) -> RustyAntError {
     RustyAntError::WrongType { key: key.to_string() }
 }
@@ -276,6 +289,8 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError>;
     async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError>;
     async fn zcard(&self, key: &str) -> Result<i64, RustyAntError>;
+    async fn zrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError>;
+    async fn zrevrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError>;
 
     /// Return every key matching `pattern` (Redis-style glob: `*`, `?`).
     /// On S3 this fans out to repeated `ListObjectsV2` calls until the
@@ -831,6 +846,25 @@ impl Storage for S3Storage {
             Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(i64::try_from(m.len()).unwrap_or(i64::MAX)),
             Some(_) => Err(wrong_type(key)),
             None => Ok(0),
+        }
+    }
+
+    async fn zrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(asc_rank_of(&m, member)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
+        }
+    }
+
+    async fn zrevrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                let len = i64::try_from(m.len()).unwrap_or(i64::MAX);
+                Ok(asc_rank_of(&m, member).map(|r| len - 1 - r))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
         }
     }
 
@@ -1527,6 +1561,25 @@ impl Storage for InMemoryStorage {
             Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(i64::try_from(m.len()).unwrap_or(i64::MAX)),
             Some(_) => Err(wrong_type(key)),
             None => Ok(0),
+        }
+    }
+
+    async fn zrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(asc_rank_of(&m, member)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
+        }
+    }
+
+    async fn zrevrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                let len = i64::try_from(m.len()).unwrap_or(i64::MAX);
+                Ok(asc_rank_of(&m, member).map(|r| len - 1 - r))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
         }
     }
 
