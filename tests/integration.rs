@@ -780,6 +780,61 @@ async fn zrank_on_wrong_type_errors() {
     call(&state, &[b"ZREVRANK", b"k", b"m"]).await.expect_error_prefix("ERR");
 }
 
+#[tokio::test]
+async fn zcount_counts_inclusive_range() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    call(&state, &[b"ZCOUNT", b"z", b"2", b"3"]).await.expect_integer(2);
+    call(&state, &[b"ZCOUNT", b"z", b"1", b"4"]).await.expect_integer(4);
+    call(&state, &[b"ZCOUNT", b"z", b"-inf", b"+inf"]).await.expect_integer(4);
+}
+
+#[tokio::test]
+async fn zcount_honors_exclusive_bounds() {
+    // "(N" = exclusive; Redis ZRANGEBYSCORE / ZCOUNT share this syntax.
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZCOUNT", b"z", b"(1", b"3"]).await.expect_integer(2);
+    call(&state, &[b"ZCOUNT", b"z", b"1", b"(3"]).await.expect_integer(2);
+    call(&state, &[b"ZCOUNT", b"z", b"(1", b"(3"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn zcount_on_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"ZCOUNT", b"ghost", b"-inf", b"+inf"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zcount_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZCOUNT", b"k", b"0", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zmscore_returns_scores_or_nil_per_member() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2.5", b"b"]).await;
+    let raw = call(&state, &[b"ZMSCORE", b"z", b"a", b"missing", b"b"]).await.raw;
+    // Array of 3: bulk "1", nil, bulk "2.5"
+    assert_eq!(&raw, b"*3\r\n$1\r\n1\r\n$-1\r\n$3\r\n2.5\r\n");
+}
+
+#[tokio::test]
+async fn zmscore_on_missing_key_returns_all_nils() {
+    let state = test_state();
+    let raw = call(&state, &[b"ZMSCORE", b"ghost", b"a", b"b"]).await.raw;
+    assert_eq!(&raw, b"*2\r\n$-1\r\n$-1\r\n");
+}
+
+#[tokio::test]
+async fn zmscore_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZMSCORE", b"k", b"m"]).await.expect_error_prefix("ERR");
+}
+
 // ---------------------------------------------------------------------------
 // Additional mutating commands (HINCRBY, SREM, ZREM, ZINCRBY)
 // ---------------------------------------------------------------------------
