@@ -7,7 +7,7 @@ use crate::error::RustyAntError;
 use crate::metrics;
 use crate::resp::RespReply;
 use crate::state::State;
-use crate::storage::{ScoreBound, TtlResult, now_ms};
+use crate::storage::{ScoreBound, TtlResult, bit_at, now_ms};
 
 /// Coarse classification of a dispatch result, emitted as a structured log
 /// field so `CloudWatch` queries can count/alert by outcome without string
@@ -107,6 +107,12 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         // freer thread, so it folds into the same synchronous DEL path.
         "DEL" | "UNLINK" => handle_del(state, args).await,
         "COPY" => handle_copy(state, args).await,
+        // Bit ops on Strings
+        "GETBIT" => handle_getbit(state, args).await,
+        "SETBIT" => handle_setbit(state, args).await,
+        "BITCOUNT" => handle_bitcount(state, args).await,
+        "BITPOS" => handle_bitpos(state, args).await,
+        "BITOP" => handle_bitop(state, args).await,
         // Strings
         "GET" => handle_get(state, args).await,
         "GETSET" => handle_getset(state, args).await,
@@ -1119,6 +1125,234 @@ async fn handle_randomkey(state: &State, args: Vec<Bytes>) -> Result<RespReply, 
         .random_key()
         .await?
         .map_or(RespReply::Nil, |k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))))
+}
+
+// ---- Bit ops on Strings ---------------------------------------------------
+
+fn parse_bit_offset(arg: &Bytes) -> Result<u64, RustyAntError> {
+    let n = parse_i64(arg, "offset")?;
+    u64::try_from(n).map_err(|_| RustyAntError::Parse("offset must be >= 0".into()))
+}
+
+async fn handle_getbit(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("GETBIT", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let offset = parse_bit_offset(&args[1])?;
+    let v = state.storage.getbit(key, offset).await?;
+    Ok(RespReply::Integer(v))
+}
+
+async fn handle_setbit(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SETBIT", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let offset = parse_bit_offset(&args[1])?;
+    let bit = match parse_i64(&args[2], "value")? {
+        0 => false,
+        1 => true,
+        _ => return Err(RustyAntError::Parse("bit value must be 0 or 1".into())),
+    };
+    let prev = state.storage.setbit(key, offset, bit).await?;
+    Ok(RespReply::Integer(prev))
+}
+
+/// Resolve a Redis-style inclusive byte/bit range against `len_units`,
+/// returning `(start, end_inclusive)` clamped into bounds. `None` means
+/// the requested range collapses to empty (e.g. start past end).
+fn resolve_inclusive_range(start: i64, end: i64, len_units: usize) -> Option<(usize, usize)> {
+    if len_units == 0 {
+        return None;
+    }
+    let len_i = i64::try_from(len_units).unwrap_or(i64::MAX);
+    let s = if start < 0 { (len_i + start).max(0) } else { start };
+    let e = if end < 0 { len_i + end } else { end.min(len_i - 1) };
+    if s >= len_i || e < 0 || s > e {
+        return None;
+    }
+    Some((usize::try_from(s).unwrap_or(0), usize::try_from(e).unwrap_or(0)))
+}
+
+/// Parse the optional trailing `BYTE` / `BIT` keyword on `BITCOUNT` / `BITPOS`.
+/// Defaults to byte-wise when omitted, matching Redis.
+fn parse_range_unit(arg: Option<&Bytes>) -> Result<bool, RustyAntError> {
+    let Some(arg) = arg else { return Ok(false) };
+    match arg_as_str(arg)?.to_ascii_uppercase().as_str() {
+        "BYTE" => Ok(false),
+        "BIT" => Ok(true),
+        other => Err(RustyAntError::Parse(format!("range unit must be BYTE or BIT, got {other}"))),
+    }
+}
+
+/// Count set bits across `data[start..=end]` (byte indices, both inclusive).
+fn count_bits_byte_range(data: &[u8], start: usize, end: usize) -> i64 {
+    let total: u32 = data[start..=end].iter().map(|b| b.count_ones()).sum();
+    i64::from(total)
+}
+
+/// Count set bits across the bit range `[start..=end]` (bit indices, both
+/// inclusive). Walks bit by bit at the boundaries; the fully-covered
+/// interior bytes are summed via `count_ones` for speed.
+fn count_bits_bit_range(data: &[u8], start: u64, end: u64) -> i64 {
+    let mut count: i64 = 0;
+    for bit in start..=end {
+        count += i64::from(bit_at(data, bit));
+    }
+    count
+}
+
+async fn handle_bitcount(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() || args.len() == 2 || args.len() > 4 {
+        return Err(RustyAntError::WrongArity { command: "BITCOUNT".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let Some(data) = state.storage.get_string(key).await? else {
+        return Ok(RespReply::Integer(0));
+    };
+    if args.len() == 1 {
+        let total: u32 = data.iter().map(|b| b.count_ones()).sum();
+        return Ok(RespReply::Integer(i64::from(total)));
+    }
+    let start = parse_i64(&args[1], "start")?;
+    let end = parse_i64(&args[2], "end")?;
+    let in_bits = parse_range_unit(args.get(3))?;
+    let len_units = if in_bits { data.len().saturating_mul(8) } else { data.len() };
+    let Some((s, e)) = resolve_inclusive_range(start, end, len_units) else {
+        return Ok(RespReply::Integer(0));
+    };
+    let count =
+        if in_bits { count_bits_bit_range(&data, s as u64, e as u64) } else { count_bits_byte_range(&data, s, e) };
+    Ok(RespReply::Integer(count))
+}
+
+/// Find the first bit `target` (0 or 1) in `data[start_bit..=end_bit]`,
+/// returning the absolute bit index, or `None` if not found.
+fn find_first_bit(data: &[u8], target: u8, start_bit: u64, end_bit: u64) -> Option<u64> {
+    (start_bit..=end_bit).find(|&bit| bit_at(data, bit) == target)
+}
+
+async fn handle_bitpos(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    // BITPOS key bit [start [end [BYTE|BIT]]]
+    if args.len() < 2 || args.len() > 5 {
+        return Err(RustyAntError::WrongArity { command: "BITPOS".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let target = match parse_i64(&args[1], "bit")? {
+        0 => 0u8,
+        1 => 1u8,
+        _ => return Err(RustyAntError::Parse("bit must be 0 or 1".into())),
+    };
+    let data = state.storage.get_string(key).await?.unwrap_or_default();
+    if data.is_empty() {
+        // Empty / missing key: an all-zeros search lands at bit 0; an
+        // all-ones search has nothing to find.
+        return Ok(RespReply::Integer(if target == 0 { 0 } else { -1 }));
+    }
+    let total_bits = u64::try_from(data.len()).unwrap_or(u64::MAX).saturating_mul(8);
+    let end_explicit = args.len() >= 4;
+    let in_bits = parse_range_unit(args.get(4))?;
+
+    // Resolve byte- or bit-based range against the right unit count.
+    let (start_bit, end_bit) = if args.len() >= 3 {
+        let start = parse_i64(&args[2], "start")?;
+        let end_unit = if end_explicit { parse_i64(&args[3], "end")? } else { i64::MAX };
+        let len_units = if in_bits { data.len().saturating_mul(8) } else { data.len() };
+        let Some((s, e)) = resolve_inclusive_range(start, end_unit, len_units) else {
+            return Ok(RespReply::Integer(-1));
+        };
+        if in_bits { (s as u64, e as u64) } else { ((s as u64) * 8, ((e as u64) + 1) * 8 - 1) }
+    } else {
+        (0u64, total_bits - 1)
+    };
+
+    if let Some(pos) = find_first_bit(&data, target, start_bit, end_bit) {
+        return Ok(RespReply::Integer(i64::try_from(pos).unwrap_or(i64::MAX)));
+    }
+    // Asymmetry in Redis: when looking for a 0 bit and the user did NOT pin
+    // an explicit end, the trailing bits are treated as "infinite zeros" —
+    // return the position just past the end of the string. With an explicit
+    // end (or when looking for a 1), -1 is the right answer.
+    if target == 0 && !end_explicit {
+        return Ok(RespReply::Integer(i64::try_from(total_bits).unwrap_or(i64::MAX)));
+    }
+    Ok(RespReply::Integer(-1))
+}
+
+#[derive(Debug, Copy, Clone)]
+enum BitOp {
+    And,
+    Or,
+    Xor,
+    Not,
+}
+
+impl BitOp {
+    fn parse(s: &str) -> Result<Self, RustyAntError> {
+        match s.to_ascii_uppercase().as_str() {
+            "AND" => Ok(Self::And),
+            "OR" => Ok(Self::Or),
+            "XOR" => Ok(Self::Xor),
+            "NOT" => Ok(Self::Not),
+            other => Err(RustyAntError::Parse(format!("BITOP operation must be AND/OR/XOR/NOT, got {other}"))),
+        }
+    }
+}
+
+/// Combine `sources` byte-wise under `op`. AND/OR/XOR pad missing key bytes
+/// to zero up to the longest source's length; NOT inverts a single source.
+fn apply_bitop(op: BitOp, sources: &[Vec<u8>]) -> Vec<u8> {
+    if matches!(op, BitOp::Not) {
+        return sources.first().map(|s| s.iter().map(|b| !b).collect()).unwrap_or_default();
+    }
+    let max_len = sources.iter().map(Vec::len).max().unwrap_or(0);
+    let init = match op {
+        BitOp::And => 0xFFu8,
+        _ => 0x00u8,
+    };
+    let mut out = vec![init; max_len];
+    let mut first = true;
+    for src in sources {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let b = src.get(i).copied().unwrap_or(0);
+            if first {
+                *slot = b;
+            } else {
+                match op {
+                    BitOp::And => *slot &= b,
+                    BitOp::Or => *slot |= b,
+                    BitOp::Xor => *slot ^= b,
+                    BitOp::Not => unreachable!(),
+                }
+            }
+        }
+        first = false;
+    }
+    out
+}
+
+async fn handle_bitop(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "BITOP".into() });
+    }
+    let op = BitOp::parse(arg_as_str(&args[0])?)?;
+    let dest = arg_as_string(&args[1])?;
+    let src_keys: Vec<String> = args.iter().skip(2).map(arg_as_string).collect::<Result<_, _>>()?;
+    if matches!(op, BitOp::Not) && src_keys.len() != 1 {
+        return Err(RustyAntError::Parse("BITOP NOT takes exactly one source key".into()));
+    }
+    let mut sources: Vec<Vec<u8>> = Vec::with_capacity(src_keys.len());
+    for k in &src_keys {
+        let bytes = state.storage.get_string(k).await?.map_or_else(Vec::new, |b| b.to_vec());
+        sources.push(bytes);
+    }
+    let result = apply_bitop(op, &sources);
+    let len = i64::try_from(result.len()).unwrap_or(i64::MAX);
+    if result.is_empty() {
+        // Mirror Redis: empty result removes the destination instead of
+        // creating an empty-string entry.
+        state.storage.delete(&dest).await?;
+    } else {
+        state.storage.set_string(&dest, Bytes::from(result), None).await?;
+    }
+    Ok(RespReply::Integer(len))
 }
 
 async fn handle_copy(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
