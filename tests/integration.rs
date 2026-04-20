@@ -1203,6 +1203,299 @@ async fn type_returns_none_after_expiry() {
     call(&state, &[b"TYPE", b"k"]).await.expect_simple("none");
 }
 
+// ---------------------------------------------------------------------------
+// LINSERT / LTRIM / LPUSHX / RPUSHX
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn linsert_before_and_after_pivot() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c"]).await;
+    call(&state, &[b"LINSERT", b"l", b"BEFORE", b"b", b"X"]).await.expect_integer(4);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[0].as_ref(), b"a");
+    assert_eq!(items[1].as_ref(), b"X");
+    assert_eq!(items[2].as_ref(), b"b");
+    call(&state, &[b"LINSERT", b"l", b"AFTER", b"b", b"Y"]).await.expect_integer(5);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[3].as_ref(), b"Y");
+    // Lowercase direction still accepted (case-insensitive match).
+    call(&state, &[b"LINSERT", b"l", b"before", b"a", b"Z"]).await.expect_integer(6);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"0"]).await.into_bulk_array();
+    assert_eq!(items[0].as_ref(), b"Z");
+}
+
+#[tokio::test]
+async fn linsert_missing_pivot_returns_minus_one() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b"]).await;
+    call(&state, &[b"LINSERT", b"l", b"BEFORE", b"missing", b"X"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn linsert_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"LINSERT", b"missing", b"BEFORE", b"p", b"v"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn linsert_invalid_direction_errors() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a"]).await;
+    call(&state, &[b"LINSERT", b"l", b"AROUND", b"a", b"X"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn linsert_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"LINSERT", b"k", b"BEFORE", b"p", b"x"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn ltrim_keeps_inclusive_range() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c", b"d", b"e"]).await;
+    call(&state, &[b"LTRIM", b"l", b"1", b"3"]).await.expect_simple("OK");
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0].as_ref(), b"b");
+    assert_eq!(items[2].as_ref(), b"d");
+}
+
+#[tokio::test]
+async fn ltrim_negative_indices() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c", b"d"]).await;
+    // Keep last two elements.
+    call(&state, &[b"LTRIM", b"l", b"-2", b"-1"]).await.expect_simple("OK");
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].as_ref(), b"c");
+    assert_eq!(items[1].as_ref(), b"d");
+}
+
+#[tokio::test]
+async fn ltrim_empty_range_deletes_key() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"l", b"a", b"b", b"c"]).await;
+    // start > stop after normalization → resulting list is empty.
+    call(&state, &[b"LTRIM", b"l", b"5", b"10"]).await.expect_simple("OK");
+    call(&state, &[b"EXISTS", b"l"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn ltrim_on_missing_key_is_noop_ok() {
+    let state = test_state();
+    call(&state, &[b"LTRIM", b"missing", b"0", b"0"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn ltrim_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"LTRIM", b"k", b"0", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn lpushx_only_when_key_exists() {
+    let state = test_state();
+    call(&state, &[b"LPUSHX", b"missing", b"a"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"RPUSH", b"l", b"a"]).await;
+    call(&state, &[b"LPUSHX", b"l", b"b", b"c"]).await.expect_integer(3);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    // LPUSHX b c → inserts b then c at head → final: c, b, a
+    assert_eq!(items[0].as_ref(), b"c");
+    assert_eq!(items[1].as_ref(), b"b");
+    assert_eq!(items[2].as_ref(), b"a");
+}
+
+#[tokio::test]
+async fn rpushx_only_when_key_exists() {
+    let state = test_state();
+    call(&state, &[b"RPUSHX", b"missing", b"a"]).await.expect_integer(0);
+    call(&state, &[b"RPUSH", b"l", b"a"]).await;
+    call(&state, &[b"RPUSHX", b"l", b"b", b"c"]).await.expect_integer(3);
+    let items = call(&state, &[b"LRANGE", b"l", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(items[0].as_ref(), b"a");
+    assert_eq!(items[2].as_ref(), b"c");
+}
+
+#[tokio::test]
+async fn pushx_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"LPUSHX", b"k", b"x"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"RPUSHX", b"k", b"x"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
+// SINTER / SUNION / SDIFF / SMISMEMBER / SPOP / SRANDMEMBER
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sinter_returns_common_members() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"a", b"x", b"y", b"z"]).await;
+    call(&state, &[b"SADD", b"b", b"y", b"z", b"w"]).await;
+    call(&state, &[b"SADD", b"c", b"z", b"y", b"q"]).await;
+    let mut members = bulks_to_strs(&call(&state, &[b"SINTER", b"a", b"b", b"c"]).await.into_bulk_array());
+    members.sort();
+    assert_eq!(members, vec!["y".to_string(), "z".to_string()]);
+}
+
+#[tokio::test]
+async fn sinter_with_missing_key_returns_empty() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"a", b"x", b"y"]).await;
+    let members = call(&state, &[b"SINTER", b"a", b"missing"]).await.into_bulk_array();
+    assert!(members.is_empty());
+}
+
+#[tokio::test]
+async fn sunion_combines_sets() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"a", b"x", b"y"]).await;
+    call(&state, &[b"SADD", b"b", b"y", b"z"]).await;
+    let mut members = bulks_to_strs(&call(&state, &[b"SUNION", b"a", b"b"]).await.into_bulk_array());
+    members.sort();
+    assert_eq!(members, vec!["x".to_string(), "y".to_string(), "z".to_string()]);
+}
+
+#[tokio::test]
+async fn sdiff_returns_first_minus_rest() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"a", b"x", b"y", b"z"]).await;
+    call(&state, &[b"SADD", b"b", b"y"]).await;
+    call(&state, &[b"SADD", b"c", b"z"]).await;
+    let mut members = bulks_to_strs(&call(&state, &[b"SDIFF", b"a", b"b", b"c"]).await.into_bulk_array());
+    members.sort();
+    assert_eq!(members, vec!["x".to_string()]);
+}
+
+#[tokio::test]
+async fn sinter_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"x"]).await;
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"SINTER", b"s", b"k"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn smismember_reports_per_member_presence() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"x", b"y"]).await;
+    // Reply shape is an array of RESP integers (:0 / :1). The bulk-array
+    // helper only decodes bulk strings, so check the raw RESP encoding here
+    // and the storage contract below.
+    let reply = call(&state, &[b"SMISMEMBER", b"s", b"x", b"y", b"z"]).await;
+    assert_eq!(reply.raw, b"*3\r\n:1\r\n:1\r\n:0\r\n");
+    let got = state.storage.smismember("s", &["x".into(), "y".into(), "z".into()]).await.expect("smismember");
+    assert_eq!(got, vec![true, true, false]);
+}
+
+#[tokio::test]
+async fn smismember_missing_key_returns_all_zero() {
+    let state = test_state();
+    let got = state.storage.smismember("missing", &["x".into(), "y".into()]).await.expect("smismember");
+    assert_eq!(got, vec![false, false]);
+}
+
+#[tokio::test]
+async fn smismember_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"SMISMEMBER", b"k", b"x"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn spop_single_removes_and_returns_member() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"only"]).await;
+    call(&state, &[b"SPOP", b"s"]).await.expect_bulk(b"only");
+    call(&state, &[b"EXISTS", b"s"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn spop_count_returns_array_and_removes() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"a", b"b", b"c", b"d"]).await;
+    let popped = call(&state, &[b"SPOP", b"s", b"3"]).await.into_bulk_array();
+    assert_eq!(popped.len(), 3);
+    call(&state, &[b"SCARD", b"s"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn spop_missing_key_returns_nil_or_empty_array() {
+    let state = test_state();
+    call(&state, &[b"SPOP", b"missing"]).await.expect_nil();
+    let arr = call(&state, &[b"SPOP", b"missing", b"3"]).await.into_bulk_array();
+    assert!(arr.is_empty());
+}
+
+#[tokio::test]
+async fn spop_count_zero_is_noop() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"a", b"b"]).await;
+    let arr = call(&state, &[b"SPOP", b"s", b"0"]).await.into_bulk_array();
+    assert!(arr.is_empty());
+    call(&state, &[b"SCARD", b"s"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn spop_negative_count_errors() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"a"]).await;
+    call(&state, &[b"SPOP", b"s", b"-1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn srandmember_single_returns_member_without_removing() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"only"]).await;
+    call(&state, &[b"SRANDMEMBER", b"s"]).await.expect_bulk(b"only");
+    call(&state, &[b"SCARD", b"s"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn srandmember_missing_key_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"SRANDMEMBER", b"missing"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn srandmember_positive_count_returns_unique() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"a", b"b", b"c"]).await;
+    // Positive count 5 ≥ cardinality 3 → all 3 members, no duplicates.
+    let picked = call(&state, &[b"SRANDMEMBER", b"s", b"5"]).await.into_bulk_array();
+    assert_eq!(picked.len(), 3);
+    let mut unique: Vec<&[u8]> = picked.iter().map(AsRef::as_ref).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 3);
+}
+
+#[tokio::test]
+async fn srandmember_negative_count_allows_duplicates() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"only"]).await;
+    // Negative count 5 against a 1-member set → 5 repeats of "only".
+    let picked = call(&state, &[b"SRANDMEMBER", b"s", b"-5"]).await.into_bulk_array();
+    assert_eq!(picked.len(), 5);
+    for b in &picked {
+        assert_eq!(b.as_ref(), b"only");
+    }
+}
+
+#[tokio::test]
+async fn srandmember_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"SRANDMEMBER", b"k"]).await.expect_error_prefix("ERR");
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {
