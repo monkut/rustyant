@@ -215,6 +215,7 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError>;
     async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError>;
     async fn getset(&self, key: &str, value: Bytes) -> Result<Option<Bytes>, RustyAntError>;
+    async fn get_and_delete(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError>;
     async fn persist(&self, key: &str) -> Result<bool, RustyAntError>;
 
@@ -811,6 +812,17 @@ impl Storage for S3Storage {
             // Redis: GETSET clears any existing TTL (matches SET semantics).
             let new_entry = StoredValue { expires_at_ms: None, value: Value::String(value.to_vec()) };
             Ok(CasAction::Write(new_entry, old))
+        })
+        .await
+    }
+
+    async fn get_and_delete(&self, key: &str) -> Result<Option<Bytes>, RustyAntError> {
+        self.cas(key, move |entry| match entry {
+            None => Ok(CasAction::NoOp(None)),
+            Some(StoredValue { value: Value::String(data), .. }) => {
+                Ok(CasAction::Delete(Some(Bytes::from(data.clone()))))
+            }
+            Some(_) => Err(wrong_type(key)),
         })
         .await
     }
@@ -1447,6 +1459,17 @@ impl Storage for InMemoryStorage {
             store.insert(key.to_string(), entry);
         });
         Ok(old)
+    }
+
+    async fn get_and_delete(&self, key: &str) -> Result<Option<Bytes>, RustyAntError> {
+        match self.load(key) {
+            None => Ok(None),
+            Some(StoredValue { value: Value::String(data), .. }) => {
+                self.with_entry_mut(|store| store.remove(key));
+                Ok(Some(Bytes::from(data)))
+            }
+            Some(_) => Err(wrong_type(key)),
+        }
     }
 
     async fn persist(&self, key: &str) -> Result<bool, RustyAntError> {
