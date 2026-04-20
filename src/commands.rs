@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tracing::info;
@@ -98,6 +98,15 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
 
     match cmd.as_str() {
         "PING" => Ok(RespReply::SimpleString("PONG".into())),
+        "ECHO" => handle_echo(&args),
+        "TIME" => handle_time(&args),
+        "DBSIZE" => handle_dbsize(state, args).await,
+        "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
+        "RANDOMKEY" => handle_randomkey(state, args).await,
+        // UNLINK is Redis's lazy-delete variant; rustyant has no background
+        // freer thread, so it folds into the same synchronous DEL path.
+        "DEL" | "UNLINK" => handle_del(state, args).await,
+        "COPY" => handle_copy(state, args).await,
         // Strings
         "GET" => handle_get(state, args).await,
         "GETSET" => handle_getset(state, args).await,
@@ -112,7 +121,6 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "MGET" => handle_mget(state, args).await,
         "MSET" => handle_mset(state, args).await,
         "MSETNX" => handle_msetnx(state, args).await,
-        "DEL" => handle_del(state, args).await,
         "EXISTS" => handle_exists(state, args).await,
         "EXPIRE" => handle_expire(state, args).await,
         "EXPIREAT" => handle_expireat(state, args).await,
@@ -1062,4 +1070,84 @@ async fn handle_zpop(state: &State, args: Vec<Bytes>, from_max: bool) -> Result<
         flat.push(RespReply::BulkString(Some(Bytes::from(format_score(s).into_bytes()))));
     }
     Ok(RespReply::Array(flat))
+}
+
+// ---- Server / keyspace housekeeping ---------------------------------------
+
+fn handle_echo(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("ECHO", args.len() == 1)?;
+    Ok(RespReply::BulkString(Some(args[0].clone())))
+}
+
+fn handle_time(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("TIME", args.is_empty())?;
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs().to_string();
+    let micros = dur.subsec_micros().to_string();
+    Ok(RespReply::Array(vec![
+        RespReply::BulkString(Some(Bytes::from(secs.into_bytes()))),
+        RespReply::BulkString(Some(Bytes::from(micros.into_bytes()))),
+    ]))
+}
+
+async fn handle_dbsize(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("DBSIZE", args.is_empty())?;
+    let n = state.storage.dbsize().await?;
+    Ok(RespReply::Integer(n))
+}
+
+async fn handle_flushall(state: &State, args: Vec<Bytes>, cmd: &str) -> Result<RespReply, RustyAntError> {
+    // Accept the optional ASYNC / SYNC modifier (Redis 4+) but ignore it —
+    // rustyant's flush is always synchronous over S3.
+    if args.len() > 1 {
+        return Err(RustyAntError::WrongArity { command: cmd.to_string() });
+    }
+    if let Some(mode) = args.first() {
+        match arg_as_str(mode)?.to_ascii_uppercase().as_str() {
+            "ASYNC" | "SYNC" => {}
+            other => return Err(RustyAntError::Parse(format!("unsupported {cmd} option: {other}"))),
+        }
+    }
+    state.storage.flushall().await?;
+    Ok(RespReply::ok())
+}
+
+async fn handle_randomkey(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("RANDOMKEY", args.is_empty())?;
+    Ok(state
+        .storage
+        .random_key()
+        .await?
+        .map_or(RespReply::Nil, |k| RespReply::BulkString(Some(Bytes::from(k.into_bytes())))))
+}
+
+async fn handle_copy(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity { command: "COPY".into() });
+    }
+    let from = arg_as_str(&args[0])?;
+    let to = arg_as_str(&args[1])?;
+    let mut replace = false;
+    let mut i = 2;
+    while i < args.len() {
+        let opt = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match opt.as_str() {
+            "REPLACE" => {
+                replace = true;
+                i += 1;
+            }
+            "DB" => {
+                // Single-DB rustyant — only DB 0 is acceptable.
+                let v = args.get(i + 1).ok_or_else(|| RustyAntError::Parse("DB requires a value".into()))?;
+                let db = parse_i64(v, "DB")?;
+                if db != 0 {
+                    return Err(RustyAntError::Parse("DB must be 0 — rustyant exposes a single namespace".into()));
+                }
+                i += 2;
+            }
+            other => return Err(RustyAntError::Parse(format!("unsupported COPY option: {other}"))),
+        }
+    }
+    let copied = state.storage.copy(from, to, replace).await?;
+    Ok(RespReply::Integer(i64::from(copied)))
 }

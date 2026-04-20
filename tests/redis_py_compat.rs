@@ -355,6 +355,38 @@ print('ok')
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_py_server_housekeeping() {
+    // Cover the new server / keyspace housekeeping commands through redis-py
+    // so any encoding mismatch in ECHO / TIME / DBSIZE / FLUSHDB / RANDOMKEY /
+    // UNLINK / COPY surfaces against the real client's parser.
+    run_redis_py_script(
+        r"
+import redis
+r = redis.Redis(host='127.0.0.1', port={port}, socket_timeout=5)
+assert r.echo('ping me') == b'ping me'
+secs, micros = r.time()
+assert isinstance(secs, int) and secs > 1_700_000_000
+assert isinstance(micros, int) and 0 <= micros < 1_000_000
+r.set('a', '1'); r.set('b', '2')
+assert r.dbsize() == 2
+key = r.randomkey()
+assert key in (b'a', b'b')
+assert r.unlink('a', 'b', 'missing') == 2
+assert r.dbsize() == 0
+r.set('src', 'v')
+assert r.copy('src', 'dst') is True
+assert r.get('dst') == b'v'
+assert r.copy('src', 'dst') is False
+assert r.copy('src', 'dst', replace=True) is True
+r.flushdb()
+assert r.dbsize() == 0
+print('ok')
+",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_py_pipeline() {
     // redis-py's pipeline batches commands and reads replies in order.
     // This exercises the TCP streaming path with multiple frames in flight.
