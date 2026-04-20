@@ -61,7 +61,7 @@ Implemented:
 | Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE`, `RENAME`, `RENAMENX`, `RANDOMKEY`, `UNLINK`, `COPY` (+ `REPLACE` / `DB 0`) |
 | Strings | `GET`, `SET` (+ `EX` / `PX` options), `GETSET`, `GETDEL`, `GETRANGE`, `SETRANGE`, `SETNX`, `SETEX`, `MGET`, `MSET`, `MSETNX`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `PEXPIRE`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`, `GETBIT`, `SETBIT`, `BITCOUNT` (+ `BYTE` / `BIT`), `BITPOS` (+ `BYTE` / `BIT`), `BITOP` (`AND` / `OR` / `XOR` / `NOT`) |
 | Hashes | `HSET`, `HSETNX`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HSTRLEN`, `HMGET`, `HINCRBY`, `HSCAN` (+ `MATCH` / `COUNT`) |
-| Lists | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LINSERT`, `LTRIM` |
+| Lists | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LINSERT`, `LTRIM`, `LMOVE`, `RPOPLPUSH`, `LPOS` (+ `RANK` / `COUNT` / `MAXLEN`) |
 | Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` (+ count), `SRANDMEMBER` (+ count), `SSCAN` (+ `MATCH` / `COUNT`) |
 | Sorted Sets | `ZADD`, `ZREM`, `ZINCRBY`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZPOPMIN` (+ count), `ZPOPMAX` (+ count), `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`, `ZRANK`, `ZREVRANK`, `ZSCAN` (+ `MATCH` / `COUNT`) |
 
@@ -76,6 +76,8 @@ Not implemented (PRs welcome): pub/sub, transactions, scripting, streams, geo.
 `MSET` is **not atomic across keys** — a failure partway through leaves earlier keys set. Real Redis is atomic here; rustyant's S3 backing makes the all-or-none semantic expensive, and the fire-and-forget variant is fine for most workloads. `MSETNX`, `RENAME` / `RENAMENX`, and `COPY` are similarly best-effort on the S3 backend: the in-memory path is fully atomic under its `Mutex`, but on S3 a concurrent writer landing between the existence check and the write can leak past the `NX` guard. `RENAMENX` and `COPY` (without `REPLACE`) use `If-None-Match: *` on the destination to shrink that window, so the failure mode is "operation reports 0 / error" rather than data loss.
 
 Bit operations follow Redis's bit numbering: bit 0 is the most significant bit of byte 0. `SETBIT` zero-pads the underlying string to fit the requested offset and runs under the same CAS as other read-modify-write commands. `BITPOS` keeps Redis's asymmetric "infinite trailing zeros" behavior — when searching for a 0 bit without an explicit end, an all-ones string returns `strlen * 8` rather than `-1`; pinning an explicit end suppresses that fiction. `BITOP` reads each source sequentially, pads shorter sources to the longest with zero bytes, and stores the result; an empty result removes the destination instead of writing an empty-string entry.
+
+`LMOVE` / `RPOPLPUSH` are fully atomic when source and destination are the same key (single CAS). Cross-key moves pop from source first, then push to destination — same best-effort guarantee as `RENAME` / `COPY` on the S3 backend. A type-mismatch on the destination is detected before the pop so the source stays intact; a concurrent writer swapping the destination's type between the check and the push can still surface an error after the element has been removed from source. `LPOS` follows Redis semantics: without `COUNT` the reply is the first matching index (`nil` when absent), with `COUNT` it is always an array. `RANK` may be negative (tail→head search) but not zero; `MAXLEN 0` scans the whole list.
 
 ### Concurrency
 
@@ -160,6 +162,6 @@ The `rustyant` and `rustyant-ws` binaries emit structured JSON logs via `tracing
 
 ## Status
 
-Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 287 Rust tests across 5 suites (18 lib units + 242 HTTP integration + 14 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 309 Rust tests across 5 suites (18 lib units + 264 HTTP integration + 14 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
 
 Not wired: no end-to-end test driving a real WebSocket connection against a deployed binary in AWS; the `s3_concurrent_incr_converges` CAS test is gated behind `RUSTYANT_S3_CAS=1` because floci doesn't enforce `If-Match` headers.
