@@ -216,6 +216,8 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError>;
     async fn getset(&self, key: &str, value: Bytes) -> Result<Option<Bytes>, RustyAntError>;
     async fn get_and_delete(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
+    async fn strlen(&self, key: &str) -> Result<i64, RustyAntError>;
+    async fn append(&self, key: &str, value: Bytes) -> Result<i64, RustyAntError>;
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError>;
     async fn persist(&self, key: &str) -> Result<bool, RustyAntError>;
 
@@ -823,6 +825,29 @@ impl Storage for S3Storage {
                 Ok(CasAction::Delete(Some(Bytes::from(data.clone()))))
             }
             Some(_) => Err(wrong_type(key)),
+        })
+        .await
+    }
+
+    async fn strlen(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::String(data), .. }) => Ok(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn append(&self, key: &str, value: Bytes) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut data, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::String(d), expires_at_ms }) => (d.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (Vec::new(), None),
+            };
+            data.extend_from_slice(&value);
+            let len = i64::try_from(data.len()).unwrap_or(i64::MAX);
+            let new_entry = StoredValue { expires_at_ms, value: Value::String(data) };
+            Ok(CasAction::Write(new_entry, len))
         })
         .await
     }
@@ -1470,6 +1495,29 @@ impl Storage for InMemoryStorage {
             }
             Some(_) => Err(wrong_type(key)),
         }
+    }
+
+    async fn strlen(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::String(data), .. }) => Ok(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn append(&self, key: &str, value: Bytes) -> Result<i64, RustyAntError> {
+        let (mut data, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::String(d), expires_at_ms }) => (d, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => (Vec::new(), None),
+        };
+        data.extend_from_slice(&value);
+        let len = i64::try_from(data.len()).unwrap_or(i64::MAX);
+        let entry = StoredValue { expires_at_ms, value: Value::String(data) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(len)
     }
 
     async fn persist(&self, key: &str) -> Result<bool, RustyAntError> {

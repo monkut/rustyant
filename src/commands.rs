@@ -102,6 +102,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "GET" => handle_get(state, args).await,
         "GETSET" => handle_getset(state, args).await,
         "GETDEL" => handle_getdel(state, args).await,
+        "STRLEN" => handle_strlen(state, args).await,
+        "APPEND" => handle_append(state, args).await,
         "SET" => handle_set(state, args).await,
         "SETNX" => handle_setnx(state, args).await,
         "SETEX" => handle_setex(state, args).await,
@@ -520,6 +522,20 @@ async fn handle_getdel(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
     let key = arg_as_str(&args[0])?;
     let old = state.storage.get_and_delete(key).await?;
     Ok(old.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(v))))
+}
+
+async fn handle_strlen(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("STRLEN", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    let len = state.storage.strlen(key).await?;
+    Ok(RespReply::Integer(len))
+}
+
+async fn handle_append(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("APPEND", args.len() == 2)?;
+    let key = arg_as_str(&args[0])?;
+    let len = state.storage.append(key, args[1].clone()).await?;
+    Ok(RespReply::Integer(len))
 }
 
 async fn handle_persist(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
