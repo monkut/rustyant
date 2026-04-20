@@ -1496,6 +1496,300 @@ async fn srandmember_on_wrong_type_errors() {
     call(&state, &[b"SRANDMEMBER", b"k"]).await.expect_error_prefix("ERR");
 }
 
+// ---------------------------------------------------------------------------
+// PEXPIRE / PTTL / RENAME / RENAMENX
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pexpire_sets_millisecond_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"PEXPIRE", b"k", b"60000"]).await.expect_integer(1);
+    let reply = call(&state, &[b"PTTL", b"k"]).await;
+    // 60 seconds in ms ≈ 60000; allow some drift below for test latency.
+    let pttl_raw = String::from_utf8_lossy(&reply.raw).into_owned();
+    let ms: i64 = pttl_raw.trim_start_matches(':').trim_end().parse().expect("pttl");
+    assert!((0..=60_000).contains(&ms), "pttl out of band: {ms}");
+}
+
+#[tokio::test]
+async fn pexpire_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"PEXPIRE", b"missing", b"1000"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn pttl_returns_minus_two_for_missing_key() {
+    let state = test_state();
+    call(&state, &[b"PTTL", b"missing"]).await.expect_integer(-2);
+}
+
+#[tokio::test]
+async fn pttl_returns_minus_one_without_expiry() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"PTTL", b"k"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn rename_moves_value_and_deletes_source() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"v"]).await;
+    call(&state, &[b"RENAME", b"a", b"b"]).await.expect_simple("OK");
+    call(&state, &[b"EXISTS", b"a"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"b"]).await.expect_bulk(b"v");
+}
+
+#[tokio::test]
+async fn rename_overwrites_destination() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"new"]).await;
+    call(&state, &[b"SET", b"b", b"old"]).await;
+    call(&state, &[b"RENAME", b"a", b"b"]).await.expect_simple("OK");
+    call(&state, &[b"GET", b"b"]).await.expect_bulk(b"new");
+    call(&state, &[b"EXISTS", b"a"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn rename_missing_source_errors() {
+    let state = test_state();
+    call(&state, &[b"RENAME", b"missing", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn rename_to_self_is_noop() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"v"]).await;
+    call(&state, &[b"RENAME", b"a", b"a"]).await.expect_simple("OK");
+    call(&state, &[b"GET", b"a"]).await.expect_bulk(b"v");
+}
+
+#[tokio::test]
+async fn renamenx_moves_when_dest_absent() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"v"]).await;
+    call(&state, &[b"RENAMENX", b"a", b"b"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"b"]).await.expect_bulk(b"v");
+}
+
+#[tokio::test]
+async fn renamenx_refuses_when_dest_present() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"v1"]).await;
+    call(&state, &[b"SET", b"b", b"v2"]).await;
+    call(&state, &[b"RENAMENX", b"a", b"b"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"a"]).await.expect_bulk(b"v1");
+    call(&state, &[b"GET", b"b"]).await.expect_bulk(b"v2");
+}
+
+#[tokio::test]
+async fn renamenx_missing_source_errors() {
+    let state = test_state();
+    call(&state, &[b"RENAMENX", b"missing", b"b"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
+// INCRBYFLOAT / GETRANGE / SETRANGE / MSETNX
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn incrbyfloat_creates_from_zero() {
+    let state = test_state();
+    call(&state, &[b"INCRBYFLOAT", b"k", b"3.14"]).await.expect_bulk(b"3.14");
+    call(&state, &[b"INCRBYFLOAT", b"k", b"0.86"]).await.expect_bulk(b"4");
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"4");
+}
+
+#[tokio::test]
+async fn incrbyfloat_on_non_numeric_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"abc"]).await;
+    call(&state, &[b"INCRBYFLOAT", b"k", b"1.0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn incrbyfloat_preserves_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"1", b"EX", b"60"]).await;
+    call(&state, &[b"INCRBYFLOAT", b"k", b"0.5"]).await.expect_bulk(b"1.5");
+    let reply = call(&state, &[b"TTL", b"k"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).into_owned();
+    let ttl: i64 = raw.trim_start_matches(':').trim_end().parse().expect("ttl");
+    assert!(ttl > 0, "ttl should be preserved, got {ttl}");
+}
+
+#[tokio::test]
+async fn getrange_basic_and_negative_indices() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"Hello World"]).await;
+    call(&state, &[b"GETRANGE", b"k", b"0", b"4"]).await.expect_bulk(b"Hello");
+    call(&state, &[b"GETRANGE", b"k", b"6", b"10"]).await.expect_bulk(b"World");
+    call(&state, &[b"GETRANGE", b"k", b"-5", b"-1"]).await.expect_bulk(b"World");
+    call(&state, &[b"GETRANGE", b"k", b"0", b"-1"]).await.expect_bulk(b"Hello World");
+}
+
+#[tokio::test]
+async fn getrange_out_of_bounds_returns_empty() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"abc"]).await;
+    call(&state, &[b"GETRANGE", b"k", b"10", b"20"]).await.expect_bulk(b"");
+    call(&state, &[b"GETRANGE", b"missing", b"0", b"5"]).await.expect_bulk(b"");
+}
+
+#[tokio::test]
+async fn setrange_pads_and_overwrites() {
+    let state = test_state();
+    call(&state, &[b"SETRANGE", b"k", b"5", b"Hello"]).await.expect_integer(10);
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"\0\0\0\0\0Hello");
+    call(&state, &[b"SETRANGE", b"k", b"0", b"World"]).await.expect_integer(10);
+    // Overwriting the leading NULs with "World" leaves "WorldHello" — no
+    // padding between the new prefix and the old trailing "Hello".
+    call(&state, &[b"GET", b"k"]).await.expect_bulk(b"WorldHello");
+}
+
+#[tokio::test]
+async fn setrange_empty_value_on_missing_is_noop() {
+    let state = test_state();
+    call(&state, &[b"SETRANGE", b"missing", b"0", b""]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"missing"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn setrange_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"SETRANGE", b"l", b"0", b"v"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn msetnx_all_or_nothing() {
+    let state = test_state();
+    call(&state, &[b"MSETNX", b"a", b"1", b"b", b"2"]).await.expect_integer(1);
+    call(&state, &[b"GET", b"a"]).await.expect_bulk(b"1");
+    call(&state, &[b"GET", b"b"]).await.expect_bulk(b"2");
+    // One existing key → entire MSETNX fails.
+    call(&state, &[b"MSETNX", b"c", b"3", b"b", b"4"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"c"]).await.expect_integer(0);
+    call(&state, &[b"GET", b"b"]).await.expect_bulk(b"2");
+}
+
+// ---------------------------------------------------------------------------
+// ZREVRANGE / ZREVRANGEBYSCORE / ZREMRANGEBYRANK / ZREMRANGEBYSCORE / ZPOP*
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn zrevrange_returns_descending_slice() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    let m = call(&state, &[b"ZREVRANGE", b"z", b"0", b"1"]).await.into_bulk_array();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0].as_ref(), b"d");
+    assert_eq!(m[1].as_ref(), b"c");
+    let full = call(&state, &[b"ZREVRANGE", b"z", b"0", b"-1"]).await.into_bulk_array();
+    let names: Vec<&[u8]> = full.iter().map(AsRef::as_ref).collect();
+    assert_eq!(names, vec![&b"d"[..], &b"c"[..], &b"b"[..], &b"a"[..]]);
+}
+
+#[tokio::test]
+async fn zrevrangebyscore_descending_arg_order() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    // Redis semantics: max before min.
+    let m = call(&state, &[b"ZREVRANGEBYSCORE", b"z", b"3", b"1"]).await.into_bulk_array();
+    assert_eq!(m.len(), 3);
+    assert_eq!(m[0].as_ref(), b"c");
+    assert_eq!(m[2].as_ref(), b"a");
+    let m = call(&state, &[b"ZREVRANGEBYSCORE", b"z", b"(3", b"1"]).await.into_bulk_array();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0].as_ref(), b"b");
+}
+
+#[tokio::test]
+async fn zremrangebyrank_removes_inclusive_window() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    call(&state, &[b"ZREMRANGEBYRANK", b"z", b"0", b"1"]).await.expect_integer(2);
+    let remaining = call(&state, &[b"ZRANGE", b"z", b"0", b"-1"]).await.into_bulk_array();
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(remaining[0].as_ref(), b"c");
+    assert_eq!(remaining[1].as_ref(), b"d");
+}
+
+#[tokio::test]
+async fn zremrangebyrank_empties_and_deletes_key() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b"]).await;
+    call(&state, &[b"ZREMRANGEBYRANK", b"z", b"0", b"-1"]).await.expect_integer(2);
+    call(&state, &[b"EXISTS", b"z"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zremrangebyscore_removes_by_score_range() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    call(&state, &[b"ZREMRANGEBYSCORE", b"z", b"(1", b"3"]).await.expect_integer(2);
+    let remaining = call(&state, &[b"ZRANGE", b"z", b"0", b"-1"]).await.into_bulk_array();
+    let names: Vec<&[u8]> = remaining.iter().map(AsRef::as_ref).collect();
+    assert_eq!(names, vec![&b"a"[..], &b"d"[..]]);
+}
+
+#[tokio::test]
+async fn zpopmin_returns_lowest_score_with_score() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let r = call(&state, &[b"ZPOPMIN", b"z"]).await.into_bulk_array();
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].as_ref(), b"a");
+    assert_eq!(r[1].as_ref(), b"1");
+    call(&state, &[b"ZCARD", b"z"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn zpopmax_returns_highest_score_with_score() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let r = call(&state, &[b"ZPOPMAX", b"z"]).await.into_bulk_array();
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].as_ref(), b"c");
+    assert_eq!(r[1].as_ref(), b"3");
+}
+
+#[tokio::test]
+async fn zpop_count_flattens_pairs() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let r = call(&state, &[b"ZPOPMIN", b"z", b"2"]).await.into_bulk_array();
+    // Flat RESP array: member, score, member, score.
+    assert_eq!(r.len(), 4);
+    assert_eq!(r[0].as_ref(), b"a");
+    assert_eq!(r[1].as_ref(), b"1");
+    assert_eq!(r[2].as_ref(), b"b");
+    assert_eq!(r[3].as_ref(), b"2");
+}
+
+#[tokio::test]
+async fn zpop_empties_and_deletes_key() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"ZPOPMIN", b"z"]).await;
+    call(&state, &[b"EXISTS", b"z"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zpop_missing_key_returns_empty_array() {
+    let state = test_state();
+    let r = call(&state, &[b"ZPOPMIN", b"missing"]).await.into_bulk_array();
+    assert!(r.is_empty());
+}
+
+#[tokio::test]
+async fn zpop_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZPOPMIN", b"k"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZPOPMAX", b"k"]).await.expect_error_prefix("ERR");
+}
+
 // Use RespReply publicly to check the crate re-export surface compiles.
 #[test]
 fn reply_encode_simple_works_from_tests() {

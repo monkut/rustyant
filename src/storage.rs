@@ -159,12 +159,73 @@ fn remove_list_occurrences(list: &mut Vec<Vec<u8>>, target: &[u8], count: i64) -
     removed
 }
 
+/// Sort a `ZSet` by (score asc, member asc) — the canonical Redis ordering.
+fn sorted_zset(map: BTreeMap<String, f64>) -> Vec<(String, f64)> {
+    let mut sorted: Vec<(String, f64)> = map.into_iter().collect();
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    sorted
+}
+
+/// Pull the f64 numeric representation out of a string-typed entry,
+/// preserving any existing TTL. Used by `INCRBYFLOAT`.
+fn parse_string_as_f64(entry: Option<&StoredValue>, key: &str) -> Result<(f64, Option<i64>), RustyAntError> {
+    match entry {
+        Some(StoredValue { value: Value::String(data), expires_at_ms }) => {
+            let s = std::str::from_utf8(data).map_err(|_| RustyAntError::Parse("value is not a float".into()))?;
+            let n: f64 = s.parse().map_err(|_| RustyAntError::Parse("value is not a float".into()))?;
+            Ok((n, *expires_at_ms))
+        }
+        Some(_) => Err(wrong_type(key)),
+        None => Ok((0.0, None)),
+    }
+}
+
+/// Render a finite float the way Redis renders `INCRBYFLOAT` output: integer
+/// values come back without a decimal, others via shortest round-trip.
+fn format_float(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 9.007_199_254_740_992e15 {
+        #[allow(clippy::cast_possible_truncation)] // fract==0 && range checked
+        let as_int = v as i64;
+        return as_int.to_string();
+    }
+    format!("{v}")
+}
+
+/// Redis `GETRANGE` substring: inclusive end, negative indices relative to
+/// end, out-of-range collapses to empty. Operates on raw bytes, not UTF-8.
+fn slice_string_range(data: &[u8], start: i64, end: i64) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let len = i64::try_from(data.len()).unwrap_or(i64::MAX);
+    let s = if start < 0 { (len + start).max(0) } else { start };
+    let e = if end < 0 { len + end } else { end.min(len - 1) };
+    if s >= len || e < 0 || s > e {
+        return Vec::new();
+    }
+    let su = usize::try_from(s).unwrap_or(0);
+    let eu = usize::try_from(e).unwrap_or(0);
+    data[su..=eu].to_vec()
+}
+
+/// Redis `SETRANGE` in-place overwrite: pad with zero bytes out to `offset`
+/// if the existing string is shorter, then splat `value` starting at `offset`,
+/// extending the buffer if the write runs past the end.
+fn apply_setrange(data: &mut Vec<u8>, offset: usize, value: &[u8]) {
+    if data.len() < offset {
+        data.resize(offset, 0);
+    }
+    let end = offset + value.len();
+    if data.len() < end {
+        data.resize(end, 0);
+    }
+    data[offset..end].copy_from_slice(value);
+}
+
 /// Sort a `ZSet` by (score asc, member asc), then filter by the min/max
 /// bounds. Shared between `S3Storage` and `InMemoryStorage`.
 fn filter_zset_by_score(map: BTreeMap<String, f64>, min: ScoreBound, max: ScoreBound) -> Vec<String> {
-    let mut sorted: Vec<(String, f64)> = map.into_iter().collect();
-    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
-    sorted.into_iter().filter(|(_, s)| min.ge_min(*s) && max.le_max(*s)).map(|(m, _)| m).collect()
+    sorted_zset(map).into_iter().filter(|(_, s)| min.ge_min(*s) && max.le_max(*s)).map(|(m, _)| m).collect()
 }
 
 /// Number of members whose score falls within `[min, max]` (inclusive/
@@ -172,6 +233,84 @@ fn filter_zset_by_score(map: BTreeMap<String, f64>, min: ScoreBound, max: ScoreB
 fn count_zset_by_score(map: &BTreeMap<String, f64>, min: ScoreBound, max: ScoreBound) -> i64 {
     let n = map.values().filter(|s| min.ge_min(**s) && max.le_max(**s)).count();
     i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// `ZREVRANGE` slice: sort ascending, reverse, then apply the rank window.
+fn slice_zset_reversed(map: BTreeMap<String, f64>, start: i64, stop: i64) -> Vec<String> {
+    let mut sorted = sorted_zset(map);
+    sorted.reverse();
+    let len = i64::try_from(sorted.len()).unwrap_or(i64::MAX);
+    let Some((s, e)) = resolve_range(len, start, stop) else {
+        return Vec::new();
+    };
+    sorted[s..=e].iter().map(|(m, _)| m.clone()).collect()
+}
+
+/// Split a zset into (kept, `removed_count`) based on an ascending rank range
+/// — drives `ZREMRANGEBYRANK`.
+fn partition_zset_by_rank(map: BTreeMap<String, f64>, start: i64, stop: i64) -> (BTreeMap<String, f64>, usize) {
+    let sorted = sorted_zset(map);
+    let len = i64::try_from(sorted.len()).unwrap_or(i64::MAX);
+    let Some((s, e)) = resolve_range(len, start, stop) else {
+        return (sorted.into_iter().collect(), 0);
+    };
+    let mut kept = BTreeMap::new();
+    let mut removed = 0usize;
+    for (i, (m, score)) in sorted.into_iter().enumerate() {
+        if i >= s && i <= e {
+            removed += 1;
+        } else {
+            kept.insert(m, score);
+        }
+    }
+    (kept, removed)
+}
+
+/// Split a zset into (kept, `removed_count`) based on a score range — drives
+/// `ZREMRANGEBYSCORE`.
+fn partition_zset_by_score(
+    map: BTreeMap<String, f64>,
+    min: ScoreBound,
+    max: ScoreBound,
+) -> (BTreeMap<String, f64>, usize) {
+    let mut kept = BTreeMap::new();
+    let mut removed = 0usize;
+    for (m, score) in map {
+        if min.ge_min(score) && max.le_max(score) {
+            removed += 1;
+        } else {
+            kept.insert(m, score);
+        }
+    }
+    (kept, removed)
+}
+
+/// Take up to `count` members from one end of a zset. `from_max=true` pops
+/// the highest-ranked (descending score, then lex desc within a tie);
+/// otherwise pops from the bottom.
+fn pop_zset_edge(
+    map: BTreeMap<String, f64>,
+    count: usize,
+    from_max: bool,
+) -> (BTreeMap<String, f64>, Vec<(String, f64)>) {
+    if count == 0 || map.is_empty() {
+        return (map, Vec::new());
+    }
+    let mut sorted = sorted_zset(map);
+    if from_max {
+        sorted.reverse();
+    }
+    let take = count.min(sorted.len());
+    let mut popped: Vec<(String, f64)> = Vec::with_capacity(take);
+    let mut kept = BTreeMap::new();
+    for (i, (m, score)) in sorted.into_iter().enumerate() {
+        if i < take {
+            popped.push((m, score));
+        } else {
+            kept.insert(m, score);
+        }
+    }
+    (kept, popped)
 }
 
 /// Time-seeded xorshift — good enough for Redis `SPOP` / `SRANDMEMBER`, which
@@ -352,7 +491,13 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn strlen(&self, key: &str) -> Result<i64, RustyAntError>;
     async fn append(&self, key: &str, value: Bytes) -> Result<i64, RustyAntError>;
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError>;
+    async fn incr_by_float(&self, key: &str, delta: f64) -> Result<f64, RustyAntError>;
+    async fn getrange(&self, key: &str, start: i64, end: i64) -> Result<Bytes, RustyAntError>;
+    async fn setrange(&self, key: &str, offset: usize, value: Bytes) -> Result<i64, RustyAntError>;
+    async fn msetnx(&self, pairs: Vec<(String, Bytes)>) -> Result<bool, RustyAntError>;
     async fn persist(&self, key: &str) -> Result<bool, RustyAntError>;
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RustyAntError>;
+    async fn renamenx(&self, from: &str, to: &str) -> Result<bool, RustyAntError>;
 
     /// Default: sequential `get_string` per key. Impls may override with a
     /// batched S3 request.
@@ -415,7 +560,14 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
     async fn zincr_by(&self, key: &str, member: &str, delta: f64) -> Result<f64, RustyAntError>;
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError>;
+    async fn zrevrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError>;
     async fn zrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<Vec<String>, RustyAntError>;
+    async fn zrevrangebyscore(&self, key: &str, max: ScoreBound, min: ScoreBound)
+    -> Result<Vec<String>, RustyAntError>;
+    async fn zremrangebyrank(&self, key: &str, start: i64, stop: i64) -> Result<i64, RustyAntError>;
+    async fn zremrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError>;
+    async fn zpopmin(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError>;
+    async fn zpopmax(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError>;
     async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError>;
     async fn zcard(&self, key: &str) -> Result<i64, RustyAntError>;
     async fn zrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError>;
@@ -566,6 +718,33 @@ impl S3Storage {
                 }
             }
         }
+    }
+
+    /// Shared `ZPOPMIN` / `ZPOPMAX` implementation. `from_max=true` pops the
+    /// highest-ranked members; otherwise pops from the bottom.
+    async fn zpop_impl(&self, key: &str, count: usize, from_max: bool) -> Result<Vec<(String, f64)>, RustyAntError> {
+        if count == 0 {
+            // Type-check even for a no-op count so a string key still errors.
+            match self.load(key).await? {
+                Some(StoredValue { value: Value::ZSet(_), .. }) | None => return Ok(Vec::new()),
+                Some(_) => return Err(wrong_type(key)),
+            }
+        }
+        self.cas(key, move |entry| {
+            let (map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(Vec::new())),
+            };
+            let (kept, popped) = pop_zset_edge(map, count, from_max);
+            if kept.is_empty() {
+                Ok(CasAction::Delete(popped))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
+                Ok(CasAction::Write(new_entry, popped))
+            }
+        })
+        .await
     }
 
     /// Read-modify-write helper: runs `modify` against the latest entry,
@@ -1065,6 +1244,64 @@ impl Storage for S3Storage {
         .await
     }
 
+    async fn incr_by_float(&self, key: &str, delta: f64) -> Result<f64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (current, expires_at_ms) = parse_string_as_f64(entry, key)?;
+            let new_val = current + delta;
+            if new_val.is_nan() || new_val.is_infinite() {
+                return Err(RustyAntError::Parse("increment would produce NaN or infinity".into()));
+            }
+            let rendered = format_float(new_val).into_bytes();
+            let new_entry = StoredValue { expires_at_ms, value: Value::String(rendered) };
+            Ok(CasAction::Write(new_entry, new_val))
+        })
+        .await
+    }
+
+    async fn getrange(&self, key: &str, start: i64, end: i64) -> Result<Bytes, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::String(d), .. }) => Ok(Bytes::from(slice_string_range(&d, start, end))),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Bytes::new()),
+        }
+    }
+
+    async fn setrange(&self, key: &str, offset: usize, value: Bytes) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut data, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::String(d), expires_at_ms }) => (d.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (Vec::new(), None),
+            };
+            // SETRANGE with empty value on missing key is a no-op — Redis
+            // does not create the key in that corner case.
+            if value.is_empty() && data.is_empty() {
+                return Ok(CasAction::NoOp(0));
+            }
+            apply_setrange(&mut data, offset, &value);
+            let len = i64::try_from(data.len()).unwrap_or(i64::MAX);
+            let new_entry = StoredValue { expires_at_ms, value: Value::String(data) };
+            Ok(CasAction::Write(new_entry, len))
+        })
+        .await
+    }
+
+    async fn msetnx(&self, pairs: Vec<(String, Bytes)>) -> Result<bool, RustyAntError> {
+        // Best-effort atomicity — scan first, abort if any key exists, then
+        // sequentially write. A concurrent setter landing between the scan
+        // and the writes can leak past the NX guard; Redis's all-or-nothing
+        // version is expensive to emulate over S3 and unused in practice.
+        for (k, _) in &pairs {
+            if self.load(k).await?.is_some() {
+                return Ok(false);
+            }
+        }
+        for (k, v) in pairs {
+            self.set_string(&k, v, None).await?;
+        }
+        Ok(true)
+    }
+
     async fn persist(&self, key: &str) -> Result<bool, RustyAntError> {
         self.cas(key, move |entry| match entry {
             Some(existing) if existing.expires_at_ms.is_some() => {
@@ -1412,6 +1649,116 @@ impl Storage for S3Storage {
             Ok(CasAction::Write(new_entry, new_score))
         })
         .await
+    }
+
+    async fn zrevrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError> {
+        let map = match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => m,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        Ok(slice_zset_reversed(map, start, stop))
+    }
+
+    async fn zrevrangebyscore(
+        &self,
+        key: &str,
+        max: ScoreBound,
+        min: ScoreBound,
+    ) -> Result<Vec<String>, RustyAntError> {
+        let map = match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => m,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        let mut members = filter_zset_by_score(map, min, max);
+        members.reverse();
+        Ok(members)
+    }
+
+    async fn zremrangebyrank(&self, key: &str, start: i64, stop: i64) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let (kept, removed) = partition_zset_by_rank(map, start, stop);
+            let removed_i = i64::try_from(removed).unwrap_or(i64::MAX);
+            if kept.is_empty() {
+                Ok(CasAction::Delete(removed_i))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
+                Ok(CasAction::Write(new_entry, removed_i))
+            }
+        })
+        .await
+    }
+
+    async fn zremrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let (kept, removed) = partition_zset_by_score(map, min, max);
+            let removed_i = i64::try_from(removed).unwrap_or(i64::MAX);
+            if kept.is_empty() {
+                Ok(CasAction::Delete(removed_i))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
+                Ok(CasAction::Write(new_entry, removed_i))
+            }
+        })
+        .await
+    }
+
+    async fn zpopmin(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError> {
+        self.zpop_impl(key, count, false).await
+    }
+
+    async fn zpopmax(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError> {
+        self.zpop_impl(key, count, true).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RustyAntError> {
+        let Some(entry) = self.load(from).await? else {
+            return Err(RustyAntError::Parse("no such key".into()));
+        };
+        if from == to {
+            return Ok(());
+        }
+        // Match the destination's current etag (if present) to avoid stomping
+        // on a concurrent writer; create-only otherwise. Two-object ops aren't
+        // atomic over S3, but either half can still fail safely.
+        let cond =
+            self.load_with_etag(to).await?.map_or(CasCondition::CreateOnly, |(_, etag)| CasCondition::IfMatch(etag));
+        self.save_cas(to, &entry, cond).await?;
+        self.delete_raw(from).await?;
+        Ok(())
+    }
+
+    async fn renamenx(&self, from: &str, to: &str) -> Result<bool, RustyAntError> {
+        let Some(entry) = self.load(from).await? else {
+            return Err(RustyAntError::Parse("no such key".into()));
+        };
+        if from == to {
+            return Ok(false);
+        }
+        if self.load(to).await?.is_some() {
+            return Ok(false);
+        }
+        // CreateOnly guards against a racing writer populating the destination
+        // between the existence check and this write.
+        match self.save_cas(to, &entry, CasCondition::CreateOnly).await {
+            Ok(()) => {
+                self.delete_raw(from).await?;
+                Ok(true)
+            }
+            Err(RustyAntError::Contention) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1918,6 +2265,65 @@ impl Storage for InMemoryStorage {
         Ok(len)
     }
 
+    async fn incr_by_float(&self, key: &str, delta: f64) -> Result<f64, RustyAntError> {
+        let loaded = self.load(key);
+        let (current, expires_at_ms) = parse_string_as_f64(loaded.as_ref(), key)?;
+        let new_val = current + delta;
+        if new_val.is_nan() || new_val.is_infinite() {
+            return Err(RustyAntError::Parse("increment would produce NaN or infinity".into()));
+        }
+        let rendered = format_float(new_val).into_bytes();
+        let entry = StoredValue { expires_at_ms, value: Value::String(rendered) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(new_val)
+    }
+
+    async fn getrange(&self, key: &str, start: i64, end: i64) -> Result<Bytes, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::String(d), .. }) => Ok(Bytes::from(slice_string_range(&d, start, end))),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Bytes::new()),
+        }
+    }
+
+    async fn setrange(&self, key: &str, offset: usize, value: Bytes) -> Result<i64, RustyAntError> {
+        let (mut data, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::String(d), expires_at_ms }) => (d, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => (Vec::new(), None),
+        };
+        if value.is_empty() && data.is_empty() {
+            return Ok(0);
+        }
+        apply_setrange(&mut data, offset, &value);
+        let len = i64::try_from(data.len()).unwrap_or(i64::MAX);
+        let entry = StoredValue { expires_at_ms, value: Value::String(data) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(len)
+    }
+
+    async fn msetnx(&self, pairs: Vec<(String, Bytes)>) -> Result<bool, RustyAntError> {
+        // Single-lock check-and-set so the `NX` guard is genuinely atomic here,
+        // unlike the S3 backend which can only approximate it.
+        Ok(self.with_entry_mut(|map| {
+            for (k, _) in &pairs {
+                if let Some(v) = map.get(k) {
+                    if !is_expired(v) {
+                        return false;
+                    }
+                }
+            }
+            for (k, v) in pairs {
+                map.insert(k, StoredValue { expires_at_ms: None, value: Value::String(v.to_vec()) });
+            }
+            true
+        }))
+    }
+
     async fn persist(&self, key: &str) -> Result<bool, RustyAntError> {
         // Evict expired keys first so we don't "persist" a zombie.
         if self.load(key).is_none() {
@@ -1934,6 +2340,37 @@ impl Storage for InMemoryStorage {
                 false
             }
         }))
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RustyAntError> {
+        let Some(entry) = self.load(from) else {
+            return Err(RustyAntError::Parse("no such key".into()));
+        };
+        if from == to {
+            return Ok(());
+        }
+        self.with_entry_mut(|map| {
+            map.remove(from);
+            map.insert(to.to_string(), entry);
+        });
+        Ok(())
+    }
+
+    async fn renamenx(&self, from: &str, to: &str) -> Result<bool, RustyAntError> {
+        let Some(entry) = self.load(from) else {
+            return Err(RustyAntError::Parse("no such key".into()));
+        };
+        if from == to {
+            return Ok(false);
+        }
+        if self.load(to).is_some() {
+            return Ok(false);
+        }
+        self.with_entry_mut(|map| {
+            map.remove(from);
+            map.insert(to.to_string(), entry);
+        });
+        Ok(true)
     }
 
     async fn lindex(&self, key: &str, index: i64) -> Result<Option<Bytes>, RustyAntError> {
@@ -2256,6 +2693,106 @@ impl Storage for InMemoryStorage {
             store.insert(key.to_string(), entry);
         });
         Ok(new_score)
+    }
+
+    async fn zrevrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError> {
+        let map = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => m,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        Ok(slice_zset_reversed(map, start, stop))
+    }
+
+    async fn zrevrangebyscore(
+        &self,
+        key: &str,
+        max: ScoreBound,
+        min: ScoreBound,
+    ) -> Result<Vec<String>, RustyAntError> {
+        let map = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => m,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        let mut members = filter_zset_by_score(map, min, max);
+        members.reverse();
+        Ok(members)
+    }
+
+    async fn zremrangebyrank(&self, key: &str, start: i64, stop: i64) -> Result<i64, RustyAntError> {
+        let (map, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(0),
+        };
+        let (kept, removed) = partition_zset_by_rank(map, start, stop);
+        let removed_i = i64::try_from(removed).unwrap_or(i64::MAX);
+        if kept.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(removed_i)
+    }
+
+    async fn zremrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError> {
+        let (map, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(0),
+        };
+        let (kept, removed) = partition_zset_by_score(map, min, max);
+        let removed_i = i64::try_from(removed).unwrap_or(i64::MAX);
+        if kept.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(removed_i)
+    }
+
+    async fn zpopmin(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError> {
+        self.zpop_inmem(key, count, false)
+    }
+
+    async fn zpopmax(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError> {
+        self.zpop_inmem(key, count, true)
+    }
+}
+
+impl InMemoryStorage {
+    fn zpop_inmem(&self, key: &str, count: usize, from_max: bool) -> Result<Vec<(String, f64)>, RustyAntError> {
+        let (map, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let (kept, popped) = pop_zset_edge(map, count, from_max);
+        if kept.is_empty() {
+            self.with_entry_mut(|store| {
+                store.remove(key);
+            });
+        } else {
+            let entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
+            self.with_entry_mut(|store| {
+                store.insert(key.to_string(), entry);
+            });
+        }
+        Ok(popped)
     }
 }
 
