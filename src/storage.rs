@@ -243,6 +243,7 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     }
 
     async fn hset(&self, key: &str, pairs: Vec<(String, Bytes)>) -> Result<i64, RustyAntError>;
+    async fn hsetnx(&self, key: &str, field: &str, value: Bytes) -> Result<bool, RustyAntError>;
     async fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, RustyAntError>;
     async fn hdel(&self, key: &str, fields: &[String]) -> Result<i64, RustyAntError>;
     async fn hgetall(&self, key: &str) -> Result<Vec<(String, Bytes)>, RustyAntError>;
@@ -250,6 +251,7 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn hkeys(&self, key: &str) -> Result<Vec<String>, RustyAntError>;
     async fn hvals(&self, key: &str) -> Result<Vec<Bytes>, RustyAntError>;
     async fn hexists(&self, key: &str, field: &str) -> Result<bool, RustyAntError>;
+    async fn hstrlen(&self, key: &str, field: &str) -> Result<i64, RustyAntError>;
     async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError>;
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError>;
 
@@ -558,6 +560,24 @@ impl Storage for S3Storage {
         .await
     }
 
+    async fn hsetnx(&self, key: &str, field: &str, value: Bytes) -> Result<bool, RustyAntError> {
+        let field = field.to_string();
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            if map.contains_key(&field) {
+                return Ok(CasAction::NoOp(false));
+            }
+            map.insert(field.clone(), value.to_vec());
+            let new_entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
+            Ok(CasAction::Write(new_entry, true))
+        })
+        .await
+    }
+
     async fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, RustyAntError> {
         match self.load(key).await? {
             Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.get(field).map(|v| Bytes::from(v.clone()))),
@@ -743,6 +763,16 @@ impl Storage for S3Storage {
             Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.contains_key(field)),
             Some(_) => Err(wrong_type(key)),
             None => Ok(false),
+        }
+    }
+
+    async fn hstrlen(&self, key: &str, field: &str) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => {
+                Ok(m.get(field).map_or(0, |v| i64::try_from(v.len()).unwrap_or(i64::MAX)))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
         }
     }
 
@@ -1224,6 +1254,23 @@ impl Storage for InMemoryStorage {
         Ok(new_fields)
     }
 
+    async fn hsetnx(&self, key: &str, field: &str, value: Bytes) -> Result<bool, RustyAntError> {
+        let (mut map, expires_at_ms) = match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m, expires_at_ms),
+            Some(_) => return Err(wrong_type(key)),
+            None => (BTreeMap::new(), None),
+        };
+        if map.contains_key(field) {
+            return Ok(false);
+        }
+        map.insert(field.to_string(), value.to_vec());
+        let entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
+        self.with_entry_mut(|store| {
+            store.insert(key.to_string(), entry);
+        });
+        Ok(true)
+    }
+
     async fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, RustyAntError> {
         match self.load(key) {
             Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.get(field).map(|v| Bytes::from(v.clone()))),
@@ -1412,6 +1459,16 @@ impl Storage for InMemoryStorage {
             Some(StoredValue { value: Value::Hash(m), .. }) => Ok(m.contains_key(field)),
             Some(_) => Err(wrong_type(key)),
             None => Ok(false),
+        }
+    }
+
+    async fn hstrlen(&self, key: &str, field: &str) -> Result<i64, RustyAntError> {
+        match self.load(key) {
+            Some(StoredValue { value: Value::Hash(m), .. }) => {
+                Ok(m.get(field).map_or(0, |v| i64::try_from(v.len()).unwrap_or(i64::MAX)))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
         }
     }
 

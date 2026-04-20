@@ -632,6 +632,41 @@ async fn hexists_returns_0_or_1() {
 }
 
 #[tokio::test]
+async fn hsetnx_sets_only_when_field_absent() {
+    let state = test_state();
+    call(&state, &[b"HSETNX", b"h", b"name", b"alice"]).await.expect_integer(1);
+    call(&state, &[b"HGET", b"h", b"name"]).await.expect_bulk(b"alice");
+    // Second HSETNX on the same field is a no-op.
+    call(&state, &[b"HSETNX", b"h", b"name", b"bob"]).await.expect_integer(0);
+    call(&state, &[b"HGET", b"h", b"name"]).await.expect_bulk(b"alice");
+}
+
+#[tokio::test]
+async fn hsetnx_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"HSETNX", b"k", b"f", b"x"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn hstrlen_returns_field_byte_length() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"name", b"alice"]).await;
+    call(&state, &[b"HSTRLEN", b"h", b"name"]).await.expect_integer(5);
+    // Missing field: 0.
+    call(&state, &[b"HSTRLEN", b"h", b"ghost"]).await.expect_integer(0);
+    // Missing key: 0.
+    call(&state, &[b"HSTRLEN", b"nope", b"f"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn hstrlen_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"HSTRLEN", b"k", b"f"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn hmget_returns_nil_for_missing_fields() {
     let state = test_state();
     call(&state, &[b"HSET", b"h", b"a", b"1", b"c", b"3"]).await;

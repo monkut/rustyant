@@ -60,7 +60,7 @@ Implemented:
 | Server | `PING` |
 | Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE` |
 | Strings | `GET`, `SET` (+ `EX` / `PX` options), `GETSET`, `GETDEL`, `SETNX`, `SETEX`, `MGET`, `MSET`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `TTL`, `INCR`, `INCRBY`, `DECR`, `DECRBY` |
-| Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HMGET`, `HINCRBY` |
+| Hashes | `HSET`, `HSETNX`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HSTRLEN`, `HMGET`, `HINCRBY` |
 | Lists | `LPUSH`, `RPUSH`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM` |
 | Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
 | Sorted Sets | `ZADD`, `ZREM`, `ZINCRBY`, `ZRANGE`, `ZRANGEBYSCORE`, `ZSCORE`, `ZCARD` |

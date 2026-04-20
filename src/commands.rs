@@ -132,6 +132,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         }
         // Hashes
         "HSET" => handle_hset(state, args).await,
+        "HSETNX" => handle_hsetnx(state, args).await,
         "HGET" => handle_hget(state, args).await,
         "HDEL" => handle_hdel(state, args).await,
         "HGETALL" => handle_hgetall(state, args).await,
@@ -139,6 +140,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HKEYS" => handle_hkeys(state, args).await,
         "HVALS" => handle_hvals(state, args).await,
         "HEXISTS" => handle_hexists(state, args).await,
+        "HSTRLEN" => handle_hstrlen(state, args).await,
         "HMGET" => handle_hmget(state, args).await,
         "HINCRBY" => handle_hincrby(state, args).await,
         // Lists
@@ -455,6 +457,20 @@ async fn handle_hexists(state: &State, args: Vec<Bytes>) -> Result<RespReply, Ru
     arity("HEXISTS", args.len() == 2)?;
     let present = state.storage.hexists(arg_as_str(&args[0])?, arg_as_str(&args[1])?).await?;
     Ok(RespReply::Integer(i64::from(present)))
+}
+
+async fn handle_hsetnx(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HSETNX", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let field = arg_as_str(&args[1])?;
+    let set = state.storage.hsetnx(key, field, args[2].clone()).await?;
+    Ok(RespReply::Integer(i64::from(set)))
+}
+
+async fn handle_hstrlen(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HSTRLEN", args.len() == 2)?;
+    let len = state.storage.hstrlen(arg_as_str(&args[0])?, arg_as_str(&args[1])?).await?;
+    Ok(RespReply::Integer(len))
 }
 
 async fn handle_hmget(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
