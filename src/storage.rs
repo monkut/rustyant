@@ -34,6 +34,30 @@ pub enum TtlResult {
     Ms(i64),
 }
 
+/// TTL mutation requested by a `GETEX`.
+///
+/// `Leave` is the option-less call (pure GET), `SetExpireAtMs` is any of
+/// `EX`/`PX`/`EXAT`/`PXAT` (pre-resolved to an absolute unix-time in ms by
+/// the handler), and `Persist` clears any existing expiry.
+#[derive(Debug, Copy, Clone)]
+pub enum GetExOp {
+    Leave,
+    SetExpireAtMs(i64),
+    Persist,
+}
+
+/// Keyspace summary for `INFO keyspace`.
+///
+/// `keys_with_expire` is reported as `0` by the default trait impl —
+/// computing it exactly over S3 would require a GET per object, which the
+/// keyspace page doesn't justify. A backend that can answer cheaply may
+/// override [`Storage::keyspace_stats`].
+#[derive(Debug, Clone, Copy)]
+pub struct KeyspaceStats {
+    pub total_keys: i64,
+    pub keys_with_expire: i64,
+}
+
 /// Score-bound for `ZRANGEBYSCORE` matching Redis's syntax: bare number is
 /// inclusive, `(N` is exclusive, `+inf` / `-inf` are the extremes.
 #[derive(Debug, Clone, Copy)]
@@ -478,11 +502,18 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn exists(&self, key: &str) -> Result<bool, RustyAntError>;
     async fn expire_at(&self, key: &str, expires_at_ms: i64) -> Result<bool, RustyAntError>;
     async fn ttl_ms(&self, key: &str) -> Result<TtlResult, RustyAntError>;
+    /// Absolute expiry — like [`Self::ttl_ms`] but returns the stored epoch-ms
+    /// instead of a delta from "now". Drives `EXPIRETIME` / `PEXPIRETIME`.
+    async fn expire_time_ms(&self, key: &str) -> Result<TtlResult, RustyAntError>;
     /// Redis `TYPE` — returns the value-kind tag (`"string"`, `"hash"`,
     /// `"list"`, `"set"`, `"zset"`) or `None` when the key is missing/expired.
     async fn kind(&self, key: &str) -> Result<Option<&'static str>, RustyAntError>;
 
     async fn get_string(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
+    /// `GETEX`: return the string value (`None` when missing / wrong type is an
+    /// error) and atomically adjust its TTL per `op` in the same read-modify-
+    /// write. Same CAS window as every other string mutation on the S3 backend.
+    async fn get_string_with_ttl(&self, key: &str, op: GetExOp) -> Result<Option<Bytes>, RustyAntError>;
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError>;
     async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError>;
     async fn getset(&self, key: &str, value: Bytes) -> Result<Option<Bytes>, RustyAntError>;
@@ -651,6 +682,14 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// not yet been GC'd are still counted, matching Redis's lazy-expiry
     /// behavior.
     async fn dbsize(&self) -> Result<i64, RustyAntError>;
+
+    /// Counts for `INFO keyspace`. Default routes through [`Self::dbsize`] and
+    /// reports `keys_with_expire = 0` — the in-memory backend overrides this
+    /// with an exact count, but S3 would need a GET per object, which the
+    /// keyspace page doesn't justify.
+    async fn keyspace_stats(&self) -> Result<KeyspaceStats, RustyAntError> {
+        Ok(KeyspaceStats { total_keys: self.dbsize().await?, keys_with_expire: 0 })
+    }
 
     /// Wipe every key in the namespace. Drives both `FLUSHDB` and `FLUSHALL`
     /// — rustyant has only one logical database, so the two commands collapse
@@ -1017,12 +1056,40 @@ impl Storage for S3Storage {
         Ok(v.expires_at_ms.map_or(TtlResult::NoExpire, |exp| TtlResult::Ms((exp - now_ms()).max(0))))
     }
 
+    async fn expire_time_ms(&self, key: &str) -> Result<TtlResult, RustyAntError> {
+        let Some(v) = self.load(key).await? else {
+            return Ok(TtlResult::NoKey);
+        };
+        Ok(v.expires_at_ms.map_or(TtlResult::NoExpire, TtlResult::Ms))
+    }
+
     async fn get_string(&self, key: &str) -> Result<Option<Bytes>, RustyAntError> {
         match self.load(key).await? {
             Some(StoredValue { value: Value::String(data), .. }) => Ok(Some(Bytes::from(data))),
             Some(_) => Err(wrong_type(key)),
             None => Ok(None),
         }
+    }
+
+    async fn get_string_with_ttl(&self, key: &str, op: GetExOp) -> Result<Option<Bytes>, RustyAntError> {
+        if matches!(op, GetExOp::Leave) {
+            return self.get_string(key).await;
+        }
+        self.cas(key, move |entry| {
+            let (data, _old_expires_at) = match entry {
+                Some(StoredValue { value: Value::String(d), expires_at_ms }) => (d.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(None)),
+            };
+            let new_expires_at = match op {
+                GetExOp::Leave => unreachable!("leave handled above"),
+                GetExOp::SetExpireAtMs(t) => Some(t),
+                GetExOp::Persist => None,
+            };
+            let new_entry = StoredValue { expires_at_ms: new_expires_at, value: Value::String(data.clone()) };
+            Ok(CasAction::Write(new_entry, Some(Bytes::from(data))))
+        })
+        .await
     }
 
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError> {
