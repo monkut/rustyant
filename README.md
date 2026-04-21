@@ -57,7 +57,7 @@ Implemented:
 
 | Group | Commands |
 |---|---|
-| Server | `PING`, `ECHO`, `TIME`, `INFO` (+ section filter), `COMMAND` (`COUNT` / `LIST` / `INFO`), `DBSIZE`, `FLUSHDB`, `FLUSHALL` |
+| Server | `PING`, `ECHO`, `TIME`, `INFO` (+ section filter), `COMMAND` (`COUNT` / `LIST` / `INFO`), `HELLO` (+ `AUTH` / `SETNAME`), `CLIENT` (`SETINFO` / `SETNAME` / `GETNAME` / `ID` / `INFO` / `LIST` / `NO-EVICT` / `REPLY` / `TRACKING` / `PAUSE` / `UNPAUSE`), `RESET`, `DBSIZE`, `FLUSHDB`, `FLUSHALL` |
 | Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE`, `RENAME`, `RENAMENX`, `RANDOMKEY`, `UNLINK`, `COPY` (+ `REPLACE` / `DB 0`), `EXPIRETIME`, `PEXPIRETIME` |
 | Strings | `GET`, `GETEX` (+ `EX` / `PX` / `EXAT` / `PXAT` / `PERSIST`), `SET` (+ `EX` / `PX`), `GETSET`, `GETDEL`, `GETRANGE`, `SETRANGE`, `SETNX`, `SETEX`, `MGET`, `MSET`, `MSETNX`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `PEXPIRE`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`, `GETBIT`, `SETBIT`, `BITCOUNT` (+ `BYTE` / `BIT`), `BITPOS` (+ `BYTE` / `BIT`), `BITOP` (`AND` / `OR` / `XOR` / `NOT`) |
 | Hashes | `HSET`, `HSETNX`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HSTRLEN`, `HMGET`, `HINCRBY`, `HSCAN` (+ `MATCH` / `COUNT`) |
@@ -82,6 +82,8 @@ Bit operations follow Redis's bit numbering: bit 0 is the most significant bit o
 `INFO` emits `# Server`, `# Clients`, `# Stats`, and `# Keyspace` sections. `uptime_in_seconds` is measured from the container's cold start, so it resets on every Lambda cold boot rather than tracking a long-lived server process. `connected_clients` is a fixed `1` and `total_commands_processed` is a fixed `0` — there is no cross-invocation counter to report. `# Keyspace` uses `keyspace_stats`, which counts every live S3 object; `expires` is always `0` on the S3 backend because computing it exactly would require a GET per key (future backends can override). `COMMAND INFO` / `COMMAND LIST` / `COMMAND COUNT` return the classic 6-tuple metadata (`name`, `arity`, `flags`, `first_key`, `last_key`, `step`) for every implemented command; `COMMAND DOCS` and `COMMAND GETKEYS` are not implemented.
 
 `GETEX` resolves `EX` / `PX` / `EXAT` / `PXAT` to an absolute epoch-ms on the handler side, then runs one CAS against the key — so a concurrent writer can't race the expiry change with a write. `PERSIST` clears any existing TTL. `EXPIRETIME` / `PEXPIRETIME` return the absolute expiry (seconds / ms); `-1` for no TTL, `-2` for missing keys, matching Redis.
+
+`HELLO` accepts protover `2` and returns the standard info map (`server`, `version`, `proto`, `id`, `mode`, `role`, `modules`); protover `3` returns `-NOPROTO` so clients fall back to RESP2 cleanly. `AUTH` and `SETNAME` are accepted syntactically but ignored — rustyant has no auth backend and no per-connection client tracking. `CLIENT` subcommands are stubbed quietly (`+OK` for `SETINFO` / `SETNAME` / connection-config variants; fixed-value replies for `ID` / `GETNAME` / `INFO` / `LIST`) so redis-py's connection setup doesn't log "unknown command" on every connect. `RESET` returns `+RESET` with no state to clear.
 
 ### Concurrency
 
@@ -172,6 +174,6 @@ The `rustyant` and `rustyant-ws` binaries emit structured JSON logs via `tracing
 
 ## Status
 
-Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`, server introspection via `INFO` and `COMMAND`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 336 Rust tests across 5 suites (18 lib units + 291 HTTP integration + 14 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`, server introspection via `INFO` / `COMMAND` / `HELLO` / `CLIENT`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 351 Rust tests across 5 suites (18 lib units + 306 HTTP integration + 14 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
 
 Not wired: no end-to-end test driving a real WebSocket connection against a deployed binary in AWS; the `s3_concurrent_incr_converges` CAS test is gated behind `RUSTYANT_S3_CAS=1` because floci doesn't enforce `If-Match` headers.

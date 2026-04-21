@@ -102,6 +102,9 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "TIME" => handle_time(&args),
         "INFO" => handle_info(state, args).await,
         "COMMAND" => handle_command(&args),
+        "HELLO" => handle_hello(&args),
+        "CLIENT" => handle_client(&args),
+        "RESET" => Ok(RespReply::SimpleString("RESET".into())),
         "DBSIZE" => handle_dbsize(state, args).await,
         "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
         "RANDOMKEY" => handle_randomkey(state, args).await,
@@ -1646,6 +1649,107 @@ async fn handle_copy(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
 }
 
 // ---------------------------------------------------------------------------
+// Connection handshake — HELLO / CLIENT / RESET.
+//
+// redis-py issues these on every connection (HELLO for protocol negotiation,
+// CLIENT SETINFO to register library metadata). Returning `unknown command`
+// forces redis-py into error-and-retry paths and clutters production logs;
+// accepting them quietly is the friendlier default.
+// ---------------------------------------------------------------------------
+
+/// Redis `HELLO` — protocol handshake.
+///
+/// `HELLO [protover] [AUTH user password] [SETNAME name]`. rustyant only
+/// speaks RESP2: `protover=2` (or omitted) succeeds with the info map;
+/// `protover=3` returns `-NOPROTO` so the client falls back cleanly. AUTH
+/// and SETNAME are accepted syntactically but ignored — rustyant has no
+/// auth model and no per-connection client tracking (Lambda is one-shot).
+fn handle_hello(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    let mut i = 0;
+    if let Some(first) = args.first() {
+        // First positional arg, if present, must be the protover — anything
+        // else (AUTH/SETNAME with no protover) is a syntax error per Redis.
+        let proto_str = arg_as_str(first)?;
+        let proto: i64 = proto_str.parse().map_err(|_| {
+            RustyAntError::Parse(format!("Protocol version is not an integer or out of range: {proto_str}"))
+        })?;
+        if proto != 2 {
+            return Err(RustyAntError::Parse(
+                "NOPROTO unsupported protocol version — rustyant speaks RESP2 only".into(),
+            ));
+        }
+        i += 1;
+    }
+    while i < args.len() {
+        let opt = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match opt.as_str() {
+            "AUTH" => {
+                // AUTH requires two more args (user, password). Consume them
+                // without validating — rustyant has no auth backend.
+                if args.len() < i + 3 {
+                    return Err(RustyAntError::Parse("AUTH requires username and password".into()));
+                }
+                i += 3;
+            }
+            "SETNAME" => {
+                if args.len() < i + 2 {
+                    return Err(RustyAntError::Parse("SETNAME requires a value".into()));
+                }
+                i += 2;
+            }
+            other => return Err(RustyAntError::Parse(format!("unsupported HELLO option: {other}"))),
+        }
+    }
+    Ok(hello_info_reply())
+}
+
+/// Flat key/value array describing the server, returned to a successful
+/// `HELLO [2]`. Matches the shape Redis itself emits for RESP2.
+fn hello_info_reply() -> RespReply {
+    let bulk = |s: &str| RespReply::BulkString(Some(Bytes::copy_from_slice(s.as_bytes())));
+    RespReply::Array(vec![
+        bulk("server"),
+        bulk("rustyant"),
+        bulk("version"),
+        bulk(env!("CARGO_PKG_VERSION")),
+        bulk("proto"),
+        RespReply::Integer(2),
+        bulk("id"),
+        RespReply::Integer(1),
+        bulk("mode"),
+        bulk("standalone"),
+        bulk("role"),
+        bulk("master"),
+        bulk("modules"),
+        RespReply::Array(Vec::new()),
+    ])
+}
+
+/// Redis `CLIENT` — per-connection configuration.
+///
+/// rustyant has no persistent connection state (Lambda), so every subcommand
+/// returns a sensible canned reply. The subcommands that clients actually
+/// call on connect (SETINFO, SETNAME, ID, GETNAME) are accepted quietly;
+/// the rest return `+OK` too, with an explicit error only for genuinely
+/// unknown subcommand names.
+fn handle_client(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "CLIENT".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    match sub.as_str() {
+        "SETINFO" | "SETNAME" | "NO-EVICT" | "NO-TOUCH" | "REPLY" | "UNPAUSE" | "PAUSE" | "TRACKING"
+        | "TRACKINGINFO" => Ok(RespReply::ok()),
+        "ID" => Ok(RespReply::Integer(1)),
+        "GETNAME" => Ok(RespReply::BulkString(Some(Bytes::new()))),
+        // INFO and LIST report the single "connection" rustyant ever has
+        // (Lambda is one-shot). redis-py and redis-cli both parse this line.
+        "INFO" | "LIST" => {
+            Ok(RespReply::BulkString(Some(Bytes::from_static(b"id=1 addr=lambda name= age=0 idle=0 flags=N db=0\r\n"))))
+        }
+        other => Err(RustyAntError::Parse(format!("unsupported CLIENT subcommand: {other}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // COMMAND — minimal server introspection for redis-py's discovery path.
 // Scope is `COUNT` / `LIST` / `INFO`; `DOCS` and `GETKEYS` are out of scope
 // because redis-py does not require them.
@@ -1667,6 +1771,9 @@ const COMMAND_META: &[CommandMeta] = &[
     ("time", 1, &["fast", "loading", "stale"], 0, 0, 0),
     ("info", -1, &["loading", "stale"], 0, 0, 0),
     ("command", -1, &["loading", "stale"], 0, 0, 0),
+    ("hello", -1, &["fast", "loading", "stale"], 0, 0, 0),
+    ("client", -2, &["admin", "noscript"], 0, 0, 0),
+    ("reset", 1, &["fast", "loading", "stale"], 0, 0, 0),
     ("dbsize", 1, &["readonly", "fast"], 0, 0, 0),
     ("flushdb", -1, &["write"], 0, 0, 0),
     ("flushall", -1, &["write"], 0, 0, 0),

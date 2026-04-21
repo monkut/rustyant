@@ -28,7 +28,6 @@ use bytes::{Bytes, BytesMut};
 use redis_protocol::resp2::decode::decode_bytes_mut;
 use redis_protocol::resp2::types::BytesFrame;
 use rustyant::commands;
-use rustyant::resp::RespReply;
 use rustyant::state::State;
 use rustyant::test_support::floci_state;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,7 +69,7 @@ async fn serve_connection(state: State, stream: TcpStream) {
             let Some(argv) = frame_to_argv(parsed) else {
                 return;
             };
-            let reply = dispatch_with_stubs(&state, argv).await;
+            let reply = commands::dispatch(&state, argv).await;
             let Ok(encoded) = reply.encode() else {
                 return;
             };
@@ -102,28 +101,6 @@ fn frame_to_argv(frame: BytesFrame) -> Option<Vec<Bytes>> {
         }
         _ => None,
     }
-}
-
-/// redis-py issues a few bookkeeping commands on connection setup that
-/// rustyant doesn't implement: `HELLO` for protocol negotiation and
-/// `CLIENT SETINFO` to register client library metadata. Neither is a real
-/// rustyant concern, but returning our generic `-ERR unknown command` on
-/// them makes the redis-py `Retry`-on-connect logic noisy. Stub them here in
-/// the test harness only; production dispatch is untouched.
-async fn dispatch_with_stubs(state: &State, argv: Vec<Bytes>) -> RespReply {
-    if let Some(first) = argv.first() {
-        if first.eq_ignore_ascii_case(b"HELLO") {
-            // Returning an error lets redis-py fall back to RESP2 without
-            // erroring up to the caller. This matches what a pre-HELLO
-            // Redis server (< 6.0) returns.
-            return RespReply::err("ERR unknown command 'HELLO'");
-        }
-        if first.eq_ignore_ascii_case(b"CLIENT") {
-            // CLIENT SETINFO / CLIENT GETNAME etc. — just return OK.
-            return RespReply::ok();
-        }
-    }
-    commands::dispatch(state, argv).await
 }
 
 // ---------------------------------------------------------------------------

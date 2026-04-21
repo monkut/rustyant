@@ -2918,3 +2918,124 @@ async fn command_bare_returns_full_metadata_array() {
     // Outer array starts with `*N\r\n` where N == total count (>100).
     assert!(s.starts_with('*'), "expected array:\n{s}");
 }
+
+// ---------------------------------------------------------------------------
+// HELLO / CLIENT / RESET
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hello_without_protover_returns_info_map() {
+    let state = test_state();
+    let reply = call(&state, &[b"HELLO"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with("*14\r\n"), "expected 14-element array:\n{s}");
+    assert!(s.contains("$8\r\nrustyant\r\n"), "server name missing:\n{s}");
+    assert!(s.contains("$5\r\nproto\r\n"), "proto field missing:\n{s}");
+    assert!(s.contains(":2\r\n"), "proto version 2 missing:\n{s}");
+}
+
+#[tokio::test]
+async fn hello_protover_2_succeeds() {
+    let state = test_state();
+    let reply = call(&state, &[b"HELLO", b"2"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with("*14\r\n"));
+}
+
+#[tokio::test]
+async fn hello_protover_3_returns_noproto() {
+    let state = test_state();
+    let reply = call(&state, &[b"HELLO", b"3"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with('-'), "expected error reply:\n{s}");
+    assert!(s.contains("NOPROTO"), "expected NOPROTO marker:\n{s}");
+}
+
+#[tokio::test]
+async fn hello_auth_and_setname_are_accepted_and_ignored() {
+    let state = test_state();
+    // Both AUTH and SETNAME present -> rustyant accepts the syntax and returns
+    // the info map. The auth credentials are ignored (no auth backend).
+    let reply = call(&state, &[b"HELLO", b"2", b"AUTH", b"user", b"pass", b"SETNAME", b"redis-py"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with("*14\r\n"), "expected info map:\n{s}");
+}
+
+#[tokio::test]
+async fn hello_invalid_protover_errors() {
+    let state = test_state();
+    call(&state, &[b"HELLO", b"not-a-number"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn hello_auth_missing_args_errors() {
+    let state = test_state();
+    // AUTH with no username/password -> syntax error.
+    call(&state, &[b"HELLO", b"2", b"AUTH"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"HELLO", b"2", b"AUTH", b"user"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn client_setinfo_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"CLIENT", b"SETINFO", b"lib-name", b"redis-py"]).await.expect_simple("OK");
+    call(&state, &[b"CLIENT", b"SETINFO", b"lib-ver", b"5.0.0"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn client_setname_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"CLIENT", b"SETNAME", b"my-client"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn client_id_returns_integer() {
+    let state = test_state();
+    call(&state, &[b"CLIENT", b"ID"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn client_getname_returns_empty_bulk() {
+    let state = test_state();
+    // rustyant has no per-connection state, so name is always empty.
+    let reply = call(&state, &[b"CLIENT", b"GETNAME"]).await;
+    // Empty bulk is `$0\r\n\r\n`.
+    assert_eq!(reply.raw, b"$0\r\n\r\n", "got {:?}", String::from_utf8_lossy(&reply.raw));
+}
+
+#[tokio::test]
+async fn client_info_returns_summary_line() {
+    let state = test_state();
+    let reply = call(&state, &[b"CLIENT", b"INFO"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with('$'), "expected bulk string:\n{s}");
+    assert!(s.contains("id=1"), "expected id field:\n{s}");
+}
+
+#[tokio::test]
+async fn client_unknown_subcommand_errors() {
+    let state = test_state();
+    call(&state, &[b"CLIENT", b"KILL", b"127.0.0.1:6379"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn client_requires_a_subcommand() {
+    let state = test_state();
+    call(&state, &[b"CLIENT"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn reset_returns_simple_string() {
+    let state = test_state();
+    call(&state, &[b"RESET"]).await.expect_simple("RESET");
+}
+
+#[tokio::test]
+async fn command_info_hello_client_reset_are_registered() {
+    let state = test_state();
+    for name in [b"HELLO".as_ref(), b"CLIENT".as_ref(), b"RESET".as_ref()] {
+        let reply = call(&state, &[b"COMMAND", b"INFO", name]).await;
+        let s = String::from_utf8_lossy(&reply.raw);
+        assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
+    }
+}
