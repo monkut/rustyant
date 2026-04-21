@@ -3285,3 +3285,153 @@ async fn transaction_stubs_registered_in_command_meta() {
         assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// SUBSCRIBE / PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE / PUBLISH / PUBSUB
+// Pub/sub-stub policy: the subscribe/unsubscribe surface errors explicitly
+// (no long-lived push channel on stateless Lambda); PUBLISH returns :0
+// (honest zero-subscribers count); PUBSUB CHANNELS/NUMSUB/NUMPAT return
+// honest empty/zero replies.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subscribe_returns_explicit_not_supported_error() {
+    let state = test_state();
+    let reply = call(&state, &[b"SUBSCRIBE", b"ch1"]).await;
+    reply.expect_error_prefix("ERR");
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("not supported"), "expected not-supported error, got {s:?}");
+}
+
+#[tokio::test]
+async fn subscribe_multiple_channels_errors() {
+    let state = test_state();
+    call(&state, &[b"SUBSCRIBE", b"a", b"b", b"c"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn subscribe_without_channels_is_arity_error() {
+    let state = test_state();
+    call(&state, &[b"SUBSCRIBE"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn psubscribe_returns_explicit_not_supported_error() {
+    let state = test_state();
+    let reply = call(&state, &[b"PSUBSCRIBE", b"news.*"]).await;
+    reply.expect_error_prefix("ERR");
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("not supported"), "expected not-supported error, got {s:?}");
+}
+
+#[tokio::test]
+async fn psubscribe_without_patterns_is_arity_error() {
+    let state = test_state();
+    call(&state, &[b"PSUBSCRIBE"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn unsubscribe_with_or_without_args_errors() {
+    let state = test_state();
+    call(&state, &[b"UNSUBSCRIBE"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"UNSUBSCRIBE", b"ch1"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"UNSUBSCRIBE", b"ch1", b"ch2"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn punsubscribe_with_or_without_args_errors() {
+    let state = test_state();
+    call(&state, &[b"PUNSUBSCRIBE"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"PUNSUBSCRIBE", b"news.*"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn publish_returns_zero_subscribers() {
+    let state = test_state();
+    call(&state, &[b"PUBLISH", b"ch1", b"hello"]).await.expect_integer(0);
+    call(&state, &[b"PUBLISH", b"other", b"world"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn publish_arity_errors() {
+    let state = test_state();
+    call(&state, &[b"PUBLISH"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"PUBLISH", b"ch1"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"PUBLISH", b"ch1", b"msg", b"extra"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn pubsub_channels_returns_empty_array() {
+    let state = test_state();
+    let reply = call(&state, &[b"PUBSUB", b"CHANNELS"]).await;
+    assert_eq!(reply.raw, b"*0\r\n", "got {:?}", String::from_utf8_lossy(&reply.raw));
+}
+
+#[tokio::test]
+async fn pubsub_channels_with_pattern_returns_empty_array() {
+    let state = test_state();
+    let reply = call(&state, &[b"PUBSUB", b"CHANNELS", b"news.*"]).await;
+    assert_eq!(reply.raw, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn pubsub_channels_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"PUBSUB", b"CHANNELS", b"a", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn pubsub_numsub_without_channels_returns_empty_array() {
+    let state = test_state();
+    let reply = call(&state, &[b"PUBSUB", b"NUMSUB"]).await;
+    assert_eq!(reply.raw, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn pubsub_numsub_returns_channel_zero_pairs() {
+    let state = test_state();
+    let reply = call(&state, &[b"PUBSUB", b"NUMSUB", b"ch1", b"ch2"]).await;
+    let expected = b"*4\r\n$3\r\nch1\r\n:0\r\n$3\r\nch2\r\n:0\r\n";
+    assert_eq!(reply.raw, expected, "got {:?}", String::from_utf8_lossy(&reply.raw));
+}
+
+#[tokio::test]
+async fn pubsub_numpat_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"PUBSUB", b"NUMPAT"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn pubsub_numpat_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"PUBSUB", b"NUMPAT", b"extra"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn pubsub_unknown_subcommand_errors() {
+    let state = test_state();
+    call(&state, &[b"PUBSUB", b"OVERLORD"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn pubsub_without_subcommand_is_arity_error() {
+    let state = test_state();
+    call(&state, &[b"PUBSUB"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn pubsub_stubs_registered_in_command_meta() {
+    let state = test_state();
+    for name in [
+        b"SUBSCRIBE".as_ref(),
+        b"PSUBSCRIBE".as_ref(),
+        b"UNSUBSCRIBE".as_ref(),
+        b"PUNSUBSCRIBE".as_ref(),
+        b"PUBLISH".as_ref(),
+        b"PUBSUB".as_ref(),
+    ] {
+        let reply = call(&state, &[b"COMMAND", b"INFO", name]).await;
+        let s = String::from_utf8_lossy(&reply.raw);
+        assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
+    }
+}
