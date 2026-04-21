@@ -124,6 +124,11 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         }
         "LATENCY" => handle_latency(&args),
         "DEBUG" => handle_debug(&args).await,
+        "MULTI" => handle_multi(&args),
+        "EXEC" => handle_exec(&args),
+        "DISCARD" => handle_discard(&args),
+        "WATCH" => handle_watch(&args),
+        "UNWATCH" => handle_unwatch(&args),
         "DBSIZE" => handle_dbsize(state, args).await,
         "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
         "RANDOMKEY" => handle_randomkey(state, args).await,
@@ -1871,6 +1876,60 @@ async fn handle_debug(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
 }
 
 // ---------------------------------------------------------------------------
+// MULTI / EXEC / DISCARD / WATCH / UNWATCH — transaction surface.
+//
+// rustyant runs one command per HTTP request and holds no connection-level
+// state between requests, so MULTI / EXEC queueing and WATCH's optimistic
+// CAS cannot be honored. The policy (carried over from AUTH/LATENCY/DEBUG)
+// is "error explicitly where a lie would hide real misbehavior":
+//
+//   - MULTI     → explicit error. Accepting it silently and then failing at
+//                 EXEC would break any client expecting atomic batching.
+//   - EXEC      → Redis's standard `EXEC without MULTI` error, since MULTI
+//                 can never have succeeded.
+//   - DISCARD   → Redis's standard `DISCARD without MULTI` error, same
+//                 reasoning as EXEC.
+//   - WATCH     → explicit error. Returning +OK would claim optimistic CAS
+//                 semantics we cannot provide.
+//   - UNWATCH   → +OK. "Clear watched keys" is a no-op when none exist; no
+//                 contract is violated by quietly succeeding.
+// ---------------------------------------------------------------------------
+
+fn handle_multi(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("MULTI", args.is_empty())?;
+    Err(RustyAntError::Parse(
+        "MULTI/EXEC transactions are not supported on rustyant (stateless HTTP/Lambda — no cross-request state for command queueing)".into(),
+    ))
+}
+
+fn handle_exec(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("EXEC", args.is_empty())?;
+    Err(RustyAntError::Parse("EXEC without MULTI".into()))
+}
+
+fn handle_discard(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("DISCARD", args.is_empty())?;
+    Err(RustyAntError::Parse("DISCARD without MULTI".into()))
+}
+
+fn handle_watch(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    // Redis requires at least one key; enforce arity before rejecting so a
+    // malformed `WATCH` still surfaces as a clearer "wrong arity" error.
+    arity("WATCH", !args.is_empty())?;
+    Err(RustyAntError::Parse(
+        "WATCH is not supported on rustyant (no connection-level state to tie a WATCH to a subsequent EXEC)".into(),
+    ))
+}
+
+fn handle_unwatch(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("UNWATCH", args.is_empty())?;
+    // No watched keys can ever exist (WATCH errors out), so "clear all
+    // watched keys" is a trivially-successful no-op. Matches Redis's
+    // behavior when UNWATCH is called outside a transaction.
+    Ok(RespReply::ok())
+}
+
+// ---------------------------------------------------------------------------
 // COMMAND — minimal server introspection for redis-py's discovery path.
 // Scope is `COUNT` / `LIST` / `INFO`; `DOCS` and `GETKEYS` are out of scope
 // because redis-py does not require them.
@@ -1903,6 +1962,13 @@ const COMMAND_META: &[CommandMeta] = &[
     ("lastsave", 1, &["readonly", "fast", "admin"], 0, 0, 0),
     ("latency", -2, &["admin", "noscript", "loading", "stale"], 0, 0, 0),
     ("debug", -2, &["admin", "noscript"], 0, 0, 0),
+    // Transaction surface — stubs that error (MULTI/EXEC/DISCARD/WATCH) or
+    // no-op quietly (UNWATCH); see `handle_multi` et al. for rationale.
+    ("multi", 1, &["noscript", "loading", "stale", "fast"], 0, 0, 0),
+    ("exec", 1, &["noscript", "loading", "stale", "skip_monitor", "skip_slowlog"], 0, 0, 0),
+    ("discard", 1, &["noscript", "loading", "stale", "fast"], 0, 0, 0),
+    ("watch", -2, &["noscript", "loading", "stale", "fast"], 1, -1, 1),
+    ("unwatch", 1, &["noscript", "loading", "stale", "fast"], 0, 0, 0),
     ("dbsize", 1, &["readonly", "fast"], 0, 0, 0),
     ("flushdb", -1, &["write"], 0, 0, 0),
     ("flushall", -1, &["write"], 0, 0, 0),
