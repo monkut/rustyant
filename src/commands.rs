@@ -129,6 +129,12 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "DISCARD" => handle_discard(&args),
         "WATCH" => handle_watch(&args),
         "UNWATCH" => handle_unwatch(&args),
+        "SUBSCRIBE" => handle_subscribe(&args),
+        "PSUBSCRIBE" => handle_psubscribe(&args),
+        "UNSUBSCRIBE" => handle_unsubscribe(&args),
+        "PUNSUBSCRIBE" => handle_punsubscribe(&args),
+        "PUBLISH" => handle_publish(&args),
+        "PUBSUB" => handle_pubsub(&args),
         "DBSIZE" => handle_dbsize(state, args).await,
         "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
         "RANDOMKEY" => handle_randomkey(state, args).await,
@@ -1930,6 +1936,96 @@ fn handle_unwatch(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
 }
 
 // ---------------------------------------------------------------------------
+// SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBLISH / PUBSUB
+//
+// Pub/sub needs two things rustyant cannot offer: a long-lived push channel
+// to each subscriber, and a cross-connection broker. HTTP-over-Lambda has
+// neither — every request is a one-shot invocation with no peer to push
+// server-initiated frames to. Following the same policy as MULTI/WATCH:
+//
+//   - SUBSCRIBE / PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE → explicit error.
+//     These commands only make sense inside a subscribed session; returning
+//     a +OK shape would fool client libraries into entering push-read mode
+//     on a connection that will never deliver a message.
+//   - PUBLISH → `:0`. Real Redis returns the number of clients that received
+//     the message; rustyant has zero subscribers by construction, so `:0` is
+//     literally correct and matches what Redis returns on an idle server.
+//   - PUBSUB CHANNELS → empty array. No active channels exist.
+//   - PUBSUB NUMSUB → `(channel, :0)` pairs for each requested channel.
+//   - PUBSUB NUMPAT → `:0`. No pattern subscriptions exist.
+// ---------------------------------------------------------------------------
+
+fn handle_subscribe(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("SUBSCRIBE", !args.is_empty())?;
+    Err(RustyAntError::Parse(
+        "SUBSCRIBE is not supported on rustyant (stateless HTTP/Lambda — no long-lived push channel to a subscriber)"
+            .into(),
+    ))
+}
+
+fn handle_psubscribe(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("PSUBSCRIBE", !args.is_empty())?;
+    Err(RustyAntError::Parse(
+        "PSUBSCRIBE is not supported on rustyant (stateless HTTP/Lambda — no long-lived push channel to a subscriber)"
+            .into(),
+    ))
+}
+
+fn handle_unsubscribe(_args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    // Redis allows UNSUBSCRIBE with zero args ("unsubscribe from all"), so
+    // no arity check — but we still error because the command only makes
+    // sense inside a subscribed session we never enter.
+    Err(RustyAntError::Parse(
+        "UNSUBSCRIBE is not supported on rustyant (subscribe surface is stubbed; see SUBSCRIBE)".into(),
+    ))
+}
+
+fn handle_punsubscribe(_args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    Err(RustyAntError::Parse(
+        "PUNSUBSCRIBE is not supported on rustyant (subscribe surface is stubbed; see PSUBSCRIBE)".into(),
+    ))
+}
+
+fn handle_publish(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("PUBLISH", args.len() == 2)?;
+    // Zero subscribers received the message. Honest on a no-pubsub substrate
+    // — and matches what Redis returns on an idle server with no one
+    // subscribed to the channel.
+    Ok(RespReply::Integer(0))
+}
+
+fn handle_pubsub(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "PUBSUB".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    match sub.as_str() {
+        "CHANNELS" => {
+            // Optional pattern argument; ignored because there are no
+            // channels to filter.
+            if args.len() > 2 {
+                return Err(RustyAntError::WrongArity { command: "PUBSUB CHANNELS".into() });
+            }
+            Ok(RespReply::Array(Vec::new()))
+        }
+        "NUMSUB" => {
+            // Redis returns `(channel, count)` pairs in the order requested.
+            // All counts are 0 here.
+            let pairs = args[1..]
+                .iter()
+                .flat_map(|name| [RespReply::BulkString(Some(Bytes::copy_from_slice(name))), RespReply::Integer(0)])
+                .collect();
+            Ok(RespReply::Array(pairs))
+        }
+        "NUMPAT" => {
+            if args.len() != 1 {
+                return Err(RustyAntError::WrongArity { command: "PUBSUB NUMPAT".into() });
+            }
+            Ok(RespReply::Integer(0))
+        }
+        other => Err(RustyAntError::Parse(format!("unsupported PUBSUB subcommand: {other}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // COMMAND — minimal server introspection for redis-py's discovery path.
 // Scope is `COUNT` / `LIST` / `INFO`; `DOCS` and `GETKEYS` are out of scope
 // because redis-py does not require them.
@@ -1969,6 +2065,14 @@ const COMMAND_META: &[CommandMeta] = &[
     ("discard", 1, &["noscript", "loading", "stale", "fast"], 0, 0, 0),
     ("watch", -2, &["noscript", "loading", "stale", "fast"], 1, -1, 1),
     ("unwatch", 1, &["noscript", "loading", "stale", "fast"], 0, 0, 0),
+    // Pub/sub surface — SUBSCRIBE / PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE
+    // error explicitly; PUBLISH and PUBSUB report honest zeros/empties.
+    ("subscribe", -2, &["pubsub", "loading", "stale", "fast"], 0, 0, 0),
+    ("psubscribe", -2, &["pubsub", "loading", "stale", "fast"], 0, 0, 0),
+    ("unsubscribe", -1, &["pubsub", "loading", "stale", "fast"], 0, 0, 0),
+    ("punsubscribe", -1, &["pubsub", "loading", "stale", "fast"], 0, 0, 0),
+    ("publish", 3, &["pubsub", "loading", "stale", "fast"], 0, 0, 0),
+    ("pubsub", -2, &["pubsub", "admin", "loading", "stale"], 0, 0, 0),
     ("dbsize", 1, &["readonly", "fast"], 0, 0, 0),
     ("flushdb", -1, &["write"], 0, 0, 0),
     ("flushall", -1, &["write"], 0, 0, 0),
