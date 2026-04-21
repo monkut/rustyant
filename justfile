@@ -17,8 +17,15 @@ fix:
     cargo fmt --all
     cargo clippy --all-targets --all-features --fix --allow-dirty --allow-staged
 
-# Run tests (cargo-nextest, default profile)
-test:
+# Run tests (cargo-nextest, default profile). Auto-starts floci — every test
+# harness now requires RUSTYANT_FLOCI_URL, so `just test` brings it up first.
+test BUCKET="rustyant-dev": (floci-up) (floci-seed BUCKET)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+    export AWS_ENDPOINT_URL=http://localhost:4566
+    export RUSTYANT_FLOCI_URL=http://localhost:4566
+    export RUSTYANT_FLOCI_BUCKET={{BUCKET}}
     cargo nextest run --all-features
 
 # Run redis-py compatibility tests (requires python3 + the `redis` package).

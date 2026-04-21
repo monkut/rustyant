@@ -69,11 +69,11 @@ Implemented:
 
 `HSCAN` / `SSCAN` / `ZSCAN` paginate inside a single collection. The cursor is an integer offset into the caller's iteration and `0` means "start / done", matching Redis. Because each collection is one S3 object, every call loads the full value — pagination is a client-side ergonomic, not a server-side cost saving. `MATCH` is applied after the batch is sliced (Redis semantics), so a narrow pattern can yield fewer than `COUNT` items per page.
 
-`DBSIZE` and `RANDOMKEY` walk the same `ListObjectsV2` pagination: O(n) on the S3 backend, instant on the in-memory backend. Recently-expired keys that haven't been GC'd yet still count toward `DBSIZE`, matching Redis's lazy-expiry semantics. `FLUSHDB` and `FLUSHALL` are aliases here — rustyant exposes one logical namespace — and batch-delete a page (up to 1000 objects) per `DeleteObjects` call. The optional `ASYNC` / `SYNC` modifier is accepted but ignored: the flush is always synchronous over S3. `UNLINK` shares the synchronous `DEL` path; rustyant has no background freer thread.
+`DBSIZE` and `RANDOMKEY` walk `ListObjectsV2` pagination — O(n) in the number of live keys. Recently-expired keys that haven't been GC'd yet still count toward `DBSIZE`, matching Redis's lazy-expiry semantics. `FLUSHDB` and `FLUSHALL` are aliases here — rustyant exposes one logical namespace — and batch-delete a page (up to 1000 objects) per `DeleteObjects` call. The optional `ASYNC` / `SYNC` modifier is accepted but ignored: the flush is always synchronous over S3. `UNLINK` shares the synchronous `DEL` path; rustyant has no background freer thread.
 
 Not implemented (PRs welcome): pub/sub, transactions, scripting, streams, geo.
 
-`MSET` is **not atomic across keys** — a failure partway through leaves earlier keys set. Real Redis is atomic here; rustyant's S3 backing makes the all-or-none semantic expensive, and the fire-and-forget variant is fine for most workloads. `MSETNX`, `RENAME` / `RENAMENX`, and `COPY` are similarly best-effort on the S3 backend: the in-memory path is fully atomic under its `Mutex`, but on S3 a concurrent writer landing between the existence check and the write can leak past the `NX` guard. `RENAMENX` and `COPY` (without `REPLACE`) use `If-None-Match: *` on the destination to shrink that window, so the failure mode is "operation reports 0 / error" rather than data loss.
+`MSET` is **not atomic across keys** — a failure partway through leaves earlier keys set. Real Redis is atomic here; rustyant's S3 backing makes the all-or-none semantic expensive, and the fire-and-forget variant is fine for most workloads. `MSETNX`, `RENAME` / `RENAMENX`, and `COPY` are similarly best-effort: a concurrent writer landing between the existence check and the write can leak past the `NX` guard. `RENAMENX` and `COPY` (without `REPLACE`) use `If-None-Match: *` on the destination to shrink that window, so the failure mode is "operation reports 0 / error" rather than data loss.
 
 Bit operations follow Redis's bit numbering: bit 0 is the most significant bit of byte 0. `SETBIT` zero-pads the underlying string to fit the requested offset and runs under the same CAS as other read-modify-write commands. `BITPOS` keeps Redis's asymmetric "infinite trailing zeros" behavior — when searching for a 0 bit without an explicit end, an all-ones string returns `strlen * 8` rather than `-1`; pinning an explicit end suppresses that fiction. `BITOP` reads each source sequentially, pads shorter sources to the longest with zero bytes, and stores the result; an empty result removes the destination instead of writing an empty-string entry.
 
@@ -97,6 +97,8 @@ Known gaps:
 
 Each Redis key maps to one S3 object under `${KEY_PREFIX}${key}`. The object body is JSON with a tagged union discriminating string/hash/list/set/zset.
 
+**Storage is always S3-compatible — there is no in-memory mode.** Lambda instances are ephemeral, so an in-memory backend would lose data on every cold start. The `Storage` trait has exactly one production implementation (`S3Storage`). Integration tests run against [floci](https://github.com/floci-io/floci), a local S3 emulator — see `just floci-up` below.
+
 ## Local Development
 
 Rust: `1.85+` (edition `2024`), toolchain pinned via `rust-toolchain.toml`.
@@ -105,8 +107,10 @@ Rust: `1.85+` (edition `2024`), toolchain pinned via `rust-toolchain.toml`.
 rustup show               # install toolchain
 cargo fetch               # pull dependencies
 just check                # fmt + clippy
-just test                 # cargo-nextest
+just test                 # cargo-nextest — auto-starts floci
 ```
+
+`just test` brings up the floci emulator on `http://localhost:4566` (via `docker compose`), creates the test bucket, then runs the full suite. Requires `docker` and `aws` CLI.
 
 ### Environment
 
@@ -117,7 +121,7 @@ just test                 # cargo-nextest
 
 ### Local S3 (floci)
 
-Same pattern as the sibling [rustyhip](https://github.com/monkut/rustyhip) project — a docker-hosted S3 emulator ([floci](https://github.com/floci-io/floci)) on `http://localhost:4566`. Requires `docker` and the `aws` CLI. Storage is in-memory — restarting floci wipes buckets.
+Same pattern as the sibling [rustyhip](https://github.com/monkut/rustyhip) project — a docker-hosted S3 emulator ([floci](https://github.com/floci-io/floci)) on `http://localhost:4566`. Requires `docker` and the `aws` CLI. Floci runs in memory mode, so restarting the container wipes buckets.
 
 ```bash
 just floci-up               # start the emulator (container: rustyant-floci)
@@ -125,6 +129,8 @@ just floci-seed             # create the rustyant-dev bucket
 just rustyant-dev           # cargo lambda watch against floci on :9000
 just floci-down             # tear down
 ```
+
+`just test` invokes `floci-up` + `floci-seed` automatically, so in most workflows you only need these recipes when running the `cargo lambda watch` dev loop.
 
 All recipes take overridable parameters, e.g. `just floci-seed BUCKET=my-bucket` or `just rustyant-dev BUCKET=my-bucket KEY_PREFIX=tenant42/`.
 
