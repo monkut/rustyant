@@ -13,3 +13,9 @@ extend-ignore-re = [
 
 [default.extend-identifiers]
 # Add project-specific identifiers that look like typos here.
+
+[default.extend-words]
+# Redis option names — absolute-timestamp variants of EX/PX. Typos hears
+# "EXAT" as a misspelling of "EXACT".
+exat = "exat"
+EXAT = "EXAT"

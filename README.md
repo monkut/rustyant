@@ -57,9 +57,9 @@ Implemented:
 
 | Group | Commands |
 |---|---|
-| Server | `PING`, `ECHO`, `TIME`, `DBSIZE`, `FLUSHDB`, `FLUSHALL` |
-| Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE`, `RENAME`, `RENAMENX`, `RANDOMKEY`, `UNLINK`, `COPY` (+ `REPLACE` / `DB 0`) |
-| Strings | `GET`, `SET` (+ `EX` / `PX` options), `GETSET`, `GETDEL`, `GETRANGE`, `SETRANGE`, `SETNX`, `SETEX`, `MGET`, `MSET`, `MSETNX`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `PEXPIRE`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`, `GETBIT`, `SETBIT`, `BITCOUNT` (+ `BYTE` / `BIT`), `BITPOS` (+ `BYTE` / `BIT`), `BITOP` (`AND` / `OR` / `XOR` / `NOT`) |
+| Server | `PING`, `ECHO`, `TIME`, `INFO` (+ section filter), `COMMAND` (`COUNT` / `LIST` / `INFO`), `DBSIZE`, `FLUSHDB`, `FLUSHALL` |
+| Keyspace | `KEYS`, `SCAN` (+ `MATCH` / `COUNT` options), `TYPE`, `RENAME`, `RENAMENX`, `RANDOMKEY`, `UNLINK`, `COPY` (+ `REPLACE` / `DB 0`), `EXPIRETIME`, `PEXPIRETIME` |
+| Strings | `GET`, `GETEX` (+ `EX` / `PX` / `EXAT` / `PXAT` / `PERSIST`), `SET` (+ `EX` / `PX`), `GETSET`, `GETDEL`, `GETRANGE`, `SETRANGE`, `SETNX`, `SETEX`, `MGET`, `MSET`, `MSETNX`, `APPEND`, `STRLEN`, `DEL`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `PEXPIRE`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `DECR`, `DECRBY`, `GETBIT`, `SETBIT`, `BITCOUNT` (+ `BYTE` / `BIT`), `BITPOS` (+ `BYTE` / `BIT`), `BITOP` (`AND` / `OR` / `XOR` / `NOT`) |
 | Hashes | `HSET`, `HSETNX`, `HGET`, `HDEL`, `HGETALL`, `HLEN`, `HKEYS`, `HVALS`, `HEXISTS`, `HSTRLEN`, `HMGET`, `HINCRBY`, `HSCAN` (+ `MATCH` / `COUNT`) |
 | Lists | `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP` (+ count), `RPOP` (+ count), `LRANGE`, `LLEN`, `LINDEX`, `LSET`, `LREM`, `LINSERT`, `LTRIM`, `LMOVE`, `RPOPLPUSH`, `LPOS` (+ `RANK` / `COUNT` / `MAXLEN`) |
 | Sets | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` (+ count), `SRANDMEMBER` (+ count), `SSCAN` (+ `MATCH` / `COUNT`) |
@@ -78,6 +78,10 @@ Not implemented (PRs welcome): pub/sub, transactions, scripting, streams, geo.
 Bit operations follow Redis's bit numbering: bit 0 is the most significant bit of byte 0. `SETBIT` zero-pads the underlying string to fit the requested offset and runs under the same CAS as other read-modify-write commands. `BITPOS` keeps Redis's asymmetric "infinite trailing zeros" behavior — when searching for a 0 bit without an explicit end, an all-ones string returns `strlen * 8` rather than `-1`; pinning an explicit end suppresses that fiction. `BITOP` reads each source sequentially, pads shorter sources to the longest with zero bytes, and stores the result; an empty result removes the destination instead of writing an empty-string entry.
 
 `LMOVE` / `RPOPLPUSH` are fully atomic when source and destination are the same key (single CAS). Cross-key moves pop from source first, then push to destination — same best-effort guarantee as `RENAME` / `COPY` on the S3 backend. A type-mismatch on the destination is detected before the pop so the source stays intact; a concurrent writer swapping the destination's type between the check and the push can still surface an error after the element has been removed from source. `LPOS` follows Redis semantics: without `COUNT` the reply is the first matching index (`nil` when absent), with `COUNT` it is always an array. `RANK` may be negative (tail→head search) but not zero; `MAXLEN 0` scans the whole list.
+
+`INFO` emits `# Server`, `# Clients`, `# Stats`, and `# Keyspace` sections. `uptime_in_seconds` is measured from the container's cold start, so it resets on every Lambda cold boot rather than tracking a long-lived server process. `connected_clients` is a fixed `1` and `total_commands_processed` is a fixed `0` — there is no cross-invocation counter to report. `# Keyspace` uses `keyspace_stats`, which counts every live S3 object; `expires` is always `0` on the S3 backend because computing it exactly would require a GET per key (future backends can override). `COMMAND INFO` / `COMMAND LIST` / `COMMAND COUNT` return the classic 6-tuple metadata (`name`, `arity`, `flags`, `first_key`, `last_key`, `step`) for every implemented command; `COMMAND DOCS` and `COMMAND GETKEYS` are not implemented.
+
+`GETEX` resolves `EX` / `PX` / `EXAT` / `PXAT` to an absolute epoch-ms on the handler side, then runs one CAS against the key — so a concurrent writer can't race the expiry change with a write. `PERSIST` clears any existing TTL. `EXPIRETIME` / `PEXPIRETIME` return the absolute expiry (seconds / ms); `-1` for no TTL, `-2` for missing keys, matching Redis.
 
 ### Concurrency
 
@@ -168,6 +172,6 @@ The `rustyant` and `rustyant-ws` binaries emit structured JSON logs via `tracing
 
 ## Status
 
-Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 309 Rust tests across 5 suites (18 lib units + 264 HTTP integration + 14 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
+Working: RESP over HTTP and WebSocket, full string/hash/list/set/zset command dispatch plus `KEYS` / `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`, server introspection via `INFO` and `COMMAND`, S3-backed storage with per-key TTL and conditional-write CAS on every read-modify-write, 336 Rust tests across 5 suites (18 lib units + 291 HTTP integration + 14 redis-py compat + 6 WebSocket E2E + 7 floci/S3) and 13 Python client tests, structured logs and CloudWatch EMF metrics, CI on GitHub Actions with floci as a service container, SAM template validated in CI.
 
 Not wired: no end-to-end test driving a real WebSocket connection against a deployed binary in AWS; the `s3_concurrent_incr_converges` CAS test is gated behind `RUSTYANT_S3_CAS=1` because floci doesn't enforce `If-Match` headers.

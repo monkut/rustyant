@@ -2643,3 +2643,278 @@ fn reply_encode_simple_works_from_tests() {
     let enc = r.encode().expect("encode");
     assert_eq!(&enc[..], b"+OK\r\n");
 }
+
+// ---------------------------------------------------------------------------
+// EXPIRETIME / PEXPIRETIME
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn expiretime_missing_key_returns_minus_two() {
+    let state = test_state();
+    call(&state, &[b"EXPIRETIME", b"missing"]).await.expect_integer(-2);
+}
+
+#[tokio::test]
+async fn expiretime_no_expire_returns_minus_one() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"EXPIRETIME", b"k"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn expiretime_returns_absolute_unix_seconds() {
+    let state = test_state();
+    let target_sec = rustyant::storage::now_ms() / 1000 + 60;
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"EXPIREAT", b"k", target_sec.to_string().as_bytes()]).await;
+    let reply = call(&state, &[b"EXPIRETIME", b"k"]).await;
+    let got: i64 = String::from_utf8_lossy(&reply.raw).trim_start_matches(':').trim_end().parse().expect("int");
+    assert_eq!(got, target_sec, "EXPIRETIME should echo the absolute epoch-seconds we set");
+}
+
+#[tokio::test]
+async fn pexpiretime_returns_absolute_unix_milliseconds() {
+    let state = test_state();
+    let target_ms = rustyant::storage::now_ms() + 60_000;
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"PEXPIREAT", b"k", target_ms.to_string().as_bytes()]).await;
+    let reply = call(&state, &[b"PEXPIRETIME", b"k"]).await;
+    let got: i64 = String::from_utf8_lossy(&reply.raw).trim_start_matches(':').trim_end().parse().expect("int");
+    assert_eq!(got, target_ms);
+}
+
+#[tokio::test]
+async fn pexpiretime_missing_key_returns_minus_two() {
+    let state = test_state();
+    call(&state, &[b"PEXPIRETIME", b"missing"]).await.expect_integer(-2);
+}
+
+// ---------------------------------------------------------------------------
+// GETEX
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn getex_bare_returns_value_leaves_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v", b"EX", b"60"]).await;
+    call(&state, &[b"GETEX", b"k"]).await.expect_bulk(b"v");
+    // TTL untouched.
+    let reply = call(&state, &[b"TTL", b"k"]).await;
+    let n: i64 = String::from_utf8_lossy(&reply.raw).trim_start_matches(':').trim_end().parse().expect("int");
+    assert!((1..=60).contains(&n), "TTL changed: {n}");
+}
+
+#[tokio::test]
+async fn getex_missing_key_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"GETEX", b"missing"]).await.expect_nil();
+    // With an option too.
+    call(&state, &[b"GETEX", b"missing", b"EX", b"30"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn getex_ex_sets_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"GETEX", b"k", b"EX", b"120"]).await.expect_bulk(b"v");
+    let reply = call(&state, &[b"TTL", b"k"]).await;
+    let n: i64 = String::from_utf8_lossy(&reply.raw).trim_start_matches(':').trim_end().parse().expect("int");
+    assert!((1..=120).contains(&n), "unexpected TTL: {n}");
+}
+
+#[tokio::test]
+async fn getex_px_sets_ms_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"GETEX", b"k", b"PX", b"90000"]).await.expect_bulk(b"v");
+    let reply = call(&state, &[b"PTTL", b"k"]).await;
+    let n: i64 = String::from_utf8_lossy(&reply.raw).trim_start_matches(':').trim_end().parse().expect("int");
+    assert!((1..=90_000).contains(&n), "unexpected PTTL: {n}");
+}
+
+#[tokio::test]
+async fn getex_exat_sets_absolute_expiry() {
+    let state = test_state();
+    let target_sec = rustyant::storage::now_ms() / 1000 + 120;
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"GETEX", b"k", b"EXAT", target_sec.to_string().as_bytes()]).await.expect_bulk(b"v");
+    call(&state, &[b"EXPIRETIME", b"k"]).await.expect_integer(target_sec);
+}
+
+#[tokio::test]
+async fn getex_pxat_sets_absolute_ms_expiry() {
+    let state = test_state();
+    let target_ms = rustyant::storage::now_ms() + 120_000;
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"GETEX", b"k", b"PXAT", target_ms.to_string().as_bytes()]).await.expect_bulk(b"v");
+    call(&state, &[b"PEXPIRETIME", b"k"]).await.expect_integer(target_ms);
+}
+
+#[tokio::test]
+async fn getex_persist_clears_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v", b"EX", b"60"]).await;
+    call(&state, &[b"GETEX", b"k", b"PERSIST"]).await.expect_bulk(b"v");
+    call(&state, &[b"TTL", b"k"]).await.expect_integer(-1);
+}
+
+#[tokio::test]
+async fn getex_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"GETEX", b"l"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"GETEX", b"l", b"EX", b"10"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn getex_rejects_multiple_options() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"GETEX", b"k", b"EX", b"10", b"PX", b"500"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn getex_unknown_option_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"GETEX", b"k", b"FOO", b"1"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
+// INFO
+// ---------------------------------------------------------------------------
+
+fn info_as_string(reply: &DecodedReply) -> String {
+    // Strip the bulk-string header `$N\r\n` and trailing `\r\n`.
+    let raw = String::from_utf8_lossy(&reply.raw);
+    let body = raw.split_once("\r\n").map_or(&raw[..], |(_, rest)| rest);
+    body.trim_end_matches("\r\n").to_string()
+}
+
+#[tokio::test]
+async fn info_returns_all_sections_by_default() {
+    let state = test_state();
+    let reply = call(&state, &[b"INFO"]).await;
+    let body = info_as_string(&reply);
+    for header in ["# Server", "# Clients", "# Stats", "# Keyspace"] {
+        assert!(body.contains(header), "missing section {header:?} in:\n{body}");
+    }
+}
+
+#[tokio::test]
+async fn info_server_reports_uptime_and_versions() {
+    let state = test_state();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let body = info_as_string(&call(&state, &[b"INFO", b"server"]).await);
+    assert!(body.contains("# Server"));
+    assert!(body.contains("redis_version:"), "missing redis_version");
+    assert!(body.contains("rustyant_version:"), "missing rustyant_version");
+    let uptime = body
+        .lines()
+        .find_map(|l| l.strip_prefix("uptime_in_seconds:"))
+        .and_then(|s| s.parse::<i64>().ok())
+        .expect("uptime field");
+    assert!(uptime >= 1, "uptime should be at least 1s, got {uptime}");
+}
+
+#[tokio::test]
+async fn info_keyspace_reflects_stored_keys() {
+    let state = test_state();
+    // Empty keyspace → no db0 line.
+    let empty = info_as_string(&call(&state, &[b"INFO", b"keyspace"]).await);
+    assert!(empty.contains("# Keyspace"));
+    assert!(!empty.contains("db0:"));
+    // After a SET, db0 should report at least one key.
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    call(&state, &[b"SET", b"b", b"2"]).await;
+    let populated = info_as_string(&call(&state, &[b"INFO", b"keyspace"]).await);
+    assert!(populated.contains("db0:keys="), "expected db0 line:\n{populated}");
+}
+
+#[tokio::test]
+async fn info_single_section_filters_output() {
+    let state = test_state();
+    let body = info_as_string(&call(&state, &[b"INFO", b"clients"]).await);
+    assert!(body.contains("# Clients"));
+    assert!(!body.contains("# Server"), "clients section should not leak Server:\n{body}");
+}
+
+#[tokio::test]
+async fn info_everything_is_full_output() {
+    let state = test_state();
+    let body = info_as_string(&call(&state, &[b"INFO", b"everything"]).await);
+    for header in ["# Server", "# Clients", "# Stats", "# Keyspace"] {
+        assert!(body.contains(header));
+    }
+}
+
+#[tokio::test]
+async fn info_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"INFO", b"server", b"clients"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
+// COMMAND
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn command_count_returns_registered_command_count() {
+    let state = test_state();
+    let reply = call(&state, &[b"COMMAND", b"COUNT"]).await;
+    let n: i64 = String::from_utf8_lossy(&reply.raw).trim_start_matches(':').trim_end().parse().expect("int");
+    assert!(n > 100, "COMMAND COUNT unexpectedly small: {n}");
+}
+
+#[tokio::test]
+async fn command_list_returns_all_names() {
+    let state = test_state();
+    let reply = call(&state, &[b"COMMAND", b"LIST"]).await;
+    let names: Vec<String> =
+        reply.into_bulk_array().into_iter().map(|b| String::from_utf8_lossy(&b).into_owned()).collect();
+    for expected in ["get", "set", "info", "command", "getex", "expiretime"] {
+        assert!(names.iter().any(|n| n == expected), "COMMAND LIST missing {expected}; got {names:?}");
+    }
+}
+
+#[tokio::test]
+async fn command_info_get_returns_expected_metadata() {
+    let state = test_state();
+    // Parse the full reply as raw bytes and eyeball the frame since
+    // `into_bulk_array` flattens nested arrays. `COMMAND INFO GET` returns
+    // an outer array of one element; that element is a 6-tuple starting
+    // with the bulk string "get" and the integer 2 (exact arity).
+    let reply = call(&state, &[b"COMMAND", b"INFO", b"GET"]).await;
+    let raw = reply.raw;
+    let s = String::from_utf8_lossy(&raw);
+    // Outer array length 1 → `*1\r\n`; inner array length 6 → `*6\r\n`.
+    assert!(s.starts_with("*1\r\n*6\r\n"), "unexpected frame header:\n{s}");
+    assert!(s.contains("$3\r\nget\r\n"), "missing bulk 'get' in reply:\n{s}");
+    assert!(s.contains(":2\r\n"), "missing integer 2 (arity) in reply:\n{s}");
+}
+
+#[tokio::test]
+async fn command_info_unknown_command_returns_nil_slot() {
+    let state = test_state();
+    let reply = call(&state, &[b"COMMAND", b"INFO", b"NOPE"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Redis: each unknown-name slot is a bulk-string nil. Frame is `*1\r\n$-1\r\n`.
+    assert!(s.starts_with("*1\r\n"), "outer frame wrong:\n{s}");
+    assert!(s.contains("$-1\r\n"), "expected nil slot:\n{s}");
+}
+
+#[tokio::test]
+async fn command_unknown_subcommand_errors() {
+    let state = test_state();
+    call(&state, &[b"COMMAND", b"DOCS"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn command_bare_returns_full_metadata_array() {
+    let state = test_state();
+    // Plain `COMMAND` is an alias for `COMMAND INFO` (no filter).
+    let reply = call(&state, &[b"COMMAND"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Outer array starts with `*N\r\n` where N == total count (>100).
+    assert!(s.starts_with('*'), "expected array:\n{s}");
+}

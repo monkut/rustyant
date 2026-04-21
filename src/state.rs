@@ -3,12 +3,16 @@ use std::sync::Arc;
 use aws_sdk_s3::Client as S3Client;
 
 use crate::Settings;
-use crate::storage::{S3Storage, Storage};
+use crate::storage::{S3Storage, Storage, now_ms};
 
 #[derive(Debug, Clone)]
 pub struct State {
     pub settings: Arc<Settings>,
     pub storage: Arc<dyn Storage>,
+    /// Wall-clock epoch ms captured when this `State` was constructed. Drives
+    /// `INFO`'s `uptime_in_seconds` field so the number stays consistent across
+    /// Lambda invocations served by the same container.
+    pub started_at_ms: i64,
 }
 
 impl State {
@@ -21,11 +25,11 @@ impl State {
         }
         let s3 = S3Client::from_conf(builder.build());
         let storage = S3Storage::new(s3, settings.bucket.clone(), settings.key_prefix.clone());
-        Ok(Self { settings: Arc::new(settings), storage: Arc::new(storage) })
+        Ok(Self { settings: Arc::new(settings), storage: Arc::new(storage), started_at_ms: now_ms() })
     }
 
     #[must_use]
     pub fn with_storage(settings: Settings, storage: Arc<dyn Storage>) -> Self {
-        Self { settings: Arc::new(settings), storage }
+        Self { settings: Arc::new(settings), storage, started_at_ms: now_ms() }
     }
 }

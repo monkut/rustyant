@@ -7,7 +7,7 @@ use crate::error::RustyAntError;
 use crate::metrics;
 use crate::resp::RespReply;
 use crate::state::State;
-use crate::storage::{ScoreBound, TtlResult, bit_at, now_ms};
+use crate::storage::{GetExOp, ScoreBound, TtlResult, bit_at, now_ms};
 
 /// Coarse classification of a dispatch result, emitted as a structured log
 /// field so `CloudWatch` queries can count/alert by outcome without string
@@ -100,6 +100,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "PING" => Ok(RespReply::SimpleString("PONG".into())),
         "ECHO" => handle_echo(&args),
         "TIME" => handle_time(&args),
+        "INFO" => handle_info(state, args).await,
+        "COMMAND" => handle_command(&args),
         "DBSIZE" => handle_dbsize(state, args).await,
         "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
         "RANDOMKEY" => handle_randomkey(state, args).await,
@@ -115,6 +117,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "BITOP" => handle_bitop(state, args).await,
         // Strings
         "GET" => handle_get(state, args).await,
+        "GETEX" => handle_getex(state, args).await,
         "GETSET" => handle_getset(state, args).await,
         "GETDEL" => handle_getdel(state, args).await,
         "GETRANGE" => handle_getrange(state, args).await,
@@ -135,6 +138,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "PERSIST" => handle_persist(state, args).await,
         "TTL" => handle_ttl(state, args).await,
         "PTTL" => handle_pttl(state, args).await,
+        "EXPIRETIME" => handle_expiretime(state, args).await,
+        "PEXPIRETIME" => handle_pexpiretime(state, args).await,
         "RENAME" => handle_rename(state, args).await,
         "RENAMENX" => handle_renamenx(state, args).await,
         "KEYS" => handle_keys(state, args).await,
@@ -252,6 +257,39 @@ async fn handle_get(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyA
     arity("GET", args.len() == 1)?;
     let key = arg_as_str(&args[0])?;
     Ok(state.storage.get_string(key).await?.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(v))))
+}
+
+async fn handle_getex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("GETEX", !args.is_empty() && args.len() <= 3)?;
+    let key = arg_as_string(&args[0])?;
+    let op = parse_getex_op(&args[1..])?;
+    Ok(state.storage.get_string_with_ttl(&key, op).await?.map_or(RespReply::Nil, |v| RespReply::BulkString(Some(v))))
+}
+
+fn parse_getex_op(opts: &[Bytes]) -> Result<GetExOp, RustyAntError> {
+    if opts.is_empty() {
+        return Ok(GetExOp::Leave);
+    }
+    let name = arg_as_str(&opts[0])?.to_ascii_uppercase();
+    if name == "PERSIST" {
+        if opts.len() != 1 {
+            return Err(RustyAntError::Parse("PERSIST takes no value".into()));
+        }
+        return Ok(GetExOp::Persist);
+    }
+    let value = opts.get(1).ok_or_else(|| RustyAntError::Parse(format!("{name} requires a value")))?;
+    if opts.len() > 2 {
+        return Err(RustyAntError::Parse(format!("GETEX accepts at most one option; extra args after {name}")));
+    }
+    let n = parse_i64(value, name.as_str())?;
+    let at_ms = match name.as_str() {
+        "EX" => now_ms() + n.saturating_mul(1000),
+        "PX" => now_ms() + n,
+        "EXAT" => n.saturating_mul(1000),
+        "PXAT" => n,
+        other => return Err(RustyAntError::Parse(format!("unsupported GETEX option: {other}"))),
+    };
+    Ok(GetExOp::SetExpireAtMs(at_ms))
 }
 
 async fn handle_set(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
@@ -1089,6 +1127,26 @@ async fn handle_pttl(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     })
 }
 
+async fn handle_expiretime(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("EXPIRETIME", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    Ok(match state.storage.expire_time_ms(key).await? {
+        TtlResult::NoKey => RespReply::Integer(-2),
+        TtlResult::NoExpire => RespReply::Integer(-1),
+        TtlResult::Ms(ms) => RespReply::Integer(ms / 1000),
+    })
+}
+
+async fn handle_pexpiretime(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("PEXPIRETIME", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    Ok(match state.storage.expire_time_ms(key).await? {
+        TtlResult::NoKey => RespReply::Integer(-2),
+        TtlResult::NoExpire => RespReply::Integer(-1),
+        TtlResult::Ms(ms) => RespReply::Integer(ms),
+    })
+}
+
 async fn handle_rename(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
     arity("RENAME", args.len() == 2)?;
     let from = arg_as_str(&args[0])?;
@@ -1241,6 +1299,66 @@ async fn handle_dbsize(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
     arity("DBSIZE", args.is_empty())?;
     let n = state.storage.dbsize().await?;
     Ok(RespReply::Integer(n))
+}
+
+/// Redis `INFO` — multi-section bulk string, CRLF-separated.
+///
+/// rustyant emits four sections (`server`, `clients`, `stats`, `keyspace`).
+/// An optional single-section argument filters the output; `everything` /
+/// `default` / `all` are accepted as synonyms for "all sections" (Redis 7).
+async fn handle_info(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    use std::fmt::Write as _;
+
+    let section = match args.len() {
+        0 => None,
+        1 => Some(arg_as_str(&args[0])?.to_ascii_lowercase()),
+        _ => return Err(RustyAntError::WrongArity { command: "INFO".into() }),
+    };
+    let mut out = String::new();
+    if info_section_included(section.as_deref(), "server") {
+        let uptime = (now_ms().saturating_sub(state.started_at_ms)) / 1000;
+        out.push_str("# Server\r\n");
+        // Report a real Redis version so clients that gate on it (redis-py
+        // HELLO, etc.) treat rustyant as compatible. Actual package version
+        // lives under `rustyant_version`.
+        out.push_str("redis_version:7.4.0\r\n");
+        let _ = writeln!(out, "rustyant_version:{}\r", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(out, "process_id:{}\r", std::process::id());
+        let _ = writeln!(out, "uptime_in_seconds:{uptime}\r");
+        out.push_str("os:Linux-lambda\r\n");
+        out.push_str("arch_bits:64\r\n");
+        out.push_str("\r\n");
+    }
+    if info_section_included(section.as_deref(), "clients") {
+        // Lambda serves one request per invocation — there's no persistent
+        // client pool to report on. Fixed at 1 so clients that check this
+        // field don't trip on a zero.
+        out.push_str("# Clients\r\n");
+        out.push_str("connected_clients:1\r\n");
+        out.push_str("\r\n");
+    }
+    if info_section_included(section.as_deref(), "stats") {
+        // No cross-invocation counter to report; Lambda cold-starts reset it.
+        // Emit the fields so tools don't explode on missing keys, with zeros.
+        out.push_str("# Stats\r\n");
+        out.push_str("total_connections_received:0\r\n");
+        out.push_str("total_commands_processed:0\r\n");
+        out.push_str("instantaneous_ops_per_sec:0\r\n");
+        out.push_str("\r\n");
+    }
+    if info_section_included(section.as_deref(), "keyspace") {
+        let ks = state.storage.keyspace_stats().await?;
+        out.push_str("# Keyspace\r\n");
+        if ks.total_keys > 0 {
+            let _ = writeln!(out, "db0:keys={},expires={},avg_ttl=0\r", ks.total_keys, ks.keys_with_expire);
+        }
+        out.push_str("\r\n");
+    }
+    Ok(RespReply::BulkString(Some(Bytes::from(out))))
+}
+
+fn info_section_included(requested: Option<&str>, section: &str) -> bool {
+    requested.is_none_or(|r| r == section || matches!(r, "everything" | "default" | "all"))
 }
 
 async fn handle_flushall(state: &State, args: Vec<Bytes>, cmd: &str) -> Result<RespReply, RustyAntError> {
@@ -1525,4 +1643,200 @@ async fn handle_copy(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     }
     let copied = state.storage.copy(from, to, replace).await?;
     Ok(RespReply::Integer(i64::from(copied)))
+}
+
+// ---------------------------------------------------------------------------
+// COMMAND — minimal server introspection for redis-py's discovery path.
+// Scope is `COUNT` / `LIST` / `INFO`; `DOCS` and `GETKEYS` are out of scope
+// because redis-py does not require them.
+// ---------------------------------------------------------------------------
+
+/// `(name, arity, flags, first_key, last_key, step)` — the classic Redis
+/// 6-tuple shape that powers `COMMAND INFO`.
+///
+/// Arity is positive for exact argument count (including the command name)
+/// and negative for "at least |n|". `first_key` / `last_key` / `step`
+/// describe key extraction in RESP terms: `0` means no keys (server
+/// commands); `-1` as `last_key` means "to the last argument".
+type CommandMeta = (&'static str, i64, &'static [&'static str], i64, i64, i64);
+
+const COMMAND_META: &[CommandMeta] = &[
+    // Connection / server
+    ("ping", -1, &["fast"], 0, 0, 0),
+    ("echo", 2, &["fast"], 0, 0, 0),
+    ("time", 1, &["fast", "loading", "stale"], 0, 0, 0),
+    ("info", -1, &["loading", "stale"], 0, 0, 0),
+    ("command", -1, &["loading", "stale"], 0, 0, 0),
+    ("dbsize", 1, &["readonly", "fast"], 0, 0, 0),
+    ("flushdb", -1, &["write"], 0, 0, 0),
+    ("flushall", -1, &["write"], 0, 0, 0),
+    ("randomkey", 1, &["readonly"], 0, 0, 0),
+    // Generic / keyspace
+    ("del", -2, &["write"], 1, -1, 1),
+    ("unlink", -2, &["write", "fast"], 1, -1, 1),
+    ("copy", -3, &["write"], 1, 2, 1),
+    ("exists", -2, &["readonly", "fast"], 1, -1, 1),
+    ("expire", -3, &["write", "fast"], 1, 1, 1),
+    ("expireat", -3, &["write", "fast"], 1, 1, 1),
+    ("pexpire", -3, &["write", "fast"], 1, 1, 1),
+    ("pexpireat", -3, &["write", "fast"], 1, 1, 1),
+    ("persist", 2, &["write", "fast"], 1, 1, 1),
+    ("ttl", 2, &["readonly", "fast"], 1, 1, 1),
+    ("pttl", 2, &["readonly", "fast"], 1, 1, 1),
+    ("expiretime", 2, &["readonly", "fast"], 1, 1, 1),
+    ("pexpiretime", 2, &["readonly", "fast"], 1, 1, 1),
+    ("keys", 2, &["readonly"], 0, 0, 0),
+    ("scan", -2, &["readonly"], 0, 0, 0),
+    ("type", 2, &["readonly", "fast"], 1, 1, 1),
+    ("rename", 3, &["write"], 1, 2, 1),
+    ("renamenx", 3, &["write", "fast"], 1, 2, 1),
+    // Strings
+    ("get", 2, &["readonly", "fast"], 1, 1, 1),
+    ("getex", -2, &["write", "fast"], 1, 1, 1),
+    ("getset", 3, &["write", "fast"], 1, 1, 1),
+    ("getdel", 2, &["write", "fast"], 1, 1, 1),
+    ("getrange", 4, &["readonly"], 1, 1, 1),
+    ("setrange", 4, &["write", "denyoom"], 1, 1, 1),
+    ("strlen", 2, &["readonly", "fast"], 1, 1, 1),
+    ("append", 3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("set", -3, &["write", "denyoom"], 1, 1, 1),
+    ("setnx", 3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("setex", 4, &["write", "denyoom"], 1, 1, 1),
+    ("mget", -2, &["readonly", "fast"], 1, -1, 1),
+    ("mset", -3, &["write", "denyoom"], 1, -1, 2),
+    ("msetnx", -3, &["write", "denyoom"], 1, -1, 2),
+    ("incr", 2, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("incrby", 3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("incrbyfloat", 3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("decr", 2, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("decrby", 3, &["write", "denyoom", "fast"], 1, 1, 1),
+    // Bit ops
+    ("getbit", 3, &["readonly", "fast"], 1, 1, 1),
+    ("setbit", 4, &["write", "denyoom"], 1, 1, 1),
+    ("bitcount", -2, &["readonly"], 1, 1, 1),
+    ("bitpos", -3, &["readonly"], 1, 1, 1),
+    ("bitop", -4, &["write", "denyoom"], 2, -1, 1),
+    // Hashes
+    ("hset", -4, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("hsetnx", 4, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("hget", 3, &["readonly", "fast"], 1, 1, 1),
+    ("hdel", -3, &["write", "fast"], 1, 1, 1),
+    ("hexists", 3, &["readonly", "fast"], 1, 1, 1),
+    ("hgetall", 2, &["readonly"], 1, 1, 1),
+    ("hincrby", 4, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("hkeys", 2, &["readonly"], 1, 1, 1),
+    ("hlen", 2, &["readonly", "fast"], 1, 1, 1),
+    ("hmget", -3, &["readonly", "fast"], 1, 1, 1),
+    ("hscan", -3, &["readonly"], 1, 1, 1),
+    ("hstrlen", 3, &["readonly", "fast"], 1, 1, 1),
+    ("hvals", 2, &["readonly"], 1, 1, 1),
+    // Lists
+    ("lpush", -3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("lpushx", -3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("rpush", -3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("rpushx", -3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("lpop", -2, &["write", "fast"], 1, 1, 1),
+    ("rpop", -2, &["write", "fast"], 1, 1, 1),
+    ("lrange", 4, &["readonly"], 1, 1, 1),
+    ("lindex", 3, &["readonly"], 1, 1, 1),
+    ("llen", 2, &["readonly", "fast"], 1, 1, 1),
+    ("lset", 4, &["write", "denyoom"], 1, 1, 1),
+    ("ltrim", 4, &["write"], 1, 1, 1),
+    ("linsert", 5, &["write", "denyoom"], 1, 1, 1),
+    ("lrem", 4, &["write"], 1, 1, 1),
+    ("lmove", 5, &["write"], 1, 2, 1),
+    ("rpoplpush", 3, &["write", "denyoom"], 1, 2, 1),
+    ("lpos", -3, &["readonly"], 1, 1, 1),
+    // Sets
+    ("sadd", -3, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("srem", -3, &["write", "fast"], 1, 1, 1),
+    ("scard", 2, &["readonly", "fast"], 1, 1, 1),
+    ("sismember", 3, &["readonly", "fast"], 1, 1, 1),
+    ("smismember", -3, &["readonly", "fast"], 1, 1, 1),
+    ("smembers", 2, &["readonly"], 1, 1, 1),
+    ("srandmember", -2, &["readonly"], 1, 1, 1),
+    ("spop", -2, &["write", "fast"], 1, 1, 1),
+    ("sinter", -2, &["readonly"], 1, -1, 1),
+    ("sunion", -2, &["readonly"], 1, -1, 1),
+    ("sdiff", -2, &["readonly"], 1, -1, 1),
+    ("sscan", -3, &["readonly"], 1, 1, 1),
+    // Sorted sets
+    ("zadd", -4, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("zrem", -3, &["write", "fast"], 1, 1, 1),
+    ("zcard", 2, &["readonly", "fast"], 1, 1, 1),
+    ("zcount", 4, &["readonly", "fast"], 1, 1, 1),
+    ("zrange", -4, &["readonly"], 1, 1, 1),
+    ("zrevrange", -4, &["readonly"], 1, 1, 1),
+    ("zrangebyscore", -4, &["readonly"], 1, 1, 1),
+    ("zrevrangebyscore", -4, &["readonly"], 1, 1, 1),
+    ("zscore", 3, &["readonly", "fast"], 1, 1, 1),
+    ("zmscore", -3, &["readonly", "fast"], 1, 1, 1),
+    ("zrank", -3, &["readonly", "fast"], 1, 1, 1),
+    ("zrevrank", -3, &["readonly", "fast"], 1, 1, 1),
+    ("zincrby", 4, &["write", "denyoom", "fast"], 1, 1, 1),
+    ("zpopmin", -2, &["write", "fast"], 1, 1, 1),
+    ("zpopmax", -2, &["write", "fast"], 1, 1, 1),
+    ("zremrangebyrank", 4, &["write"], 1, 1, 1),
+    ("zremrangebyscore", 4, &["write"], 1, 1, 1),
+    ("zscan", -3, &["readonly"], 1, 1, 1),
+];
+
+fn handle_command(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() {
+        // Plain `COMMAND` returns metadata for every known command — same as
+        // `COMMAND INFO` with no filter. redis-cli relies on this.
+        return Ok(RespReply::Array(COMMAND_META.iter().map(command_meta_reply).collect()));
+    }
+    let sub = arg_as_str(&args[0])?.to_ascii_uppercase();
+    match sub.as_str() {
+        "COUNT" => {
+            if args.len() != 1 {
+                return Err(RustyAntError::WrongArity { command: "COMMAND COUNT".into() });
+            }
+            Ok(RespReply::Integer(i64::try_from(COMMAND_META.len()).unwrap_or(i64::MAX)))
+        }
+        "LIST" => {
+            if args.len() != 1 {
+                return Err(RustyAntError::WrongArity { command: "COMMAND LIST".into() });
+            }
+            Ok(RespReply::Array(
+                COMMAND_META
+                    .iter()
+                    .map(|(name, ..)| RespReply::BulkString(Some(Bytes::copy_from_slice(name.as_bytes()))))
+                    .collect(),
+            ))
+        }
+        "INFO" => {
+            // `COMMAND INFO` with no filter → all; otherwise filter by name
+            // (case-insensitive). Unknown names return Nil at the matching
+            // array position, matching Redis.
+            if args.len() == 1 {
+                return Ok(RespReply::Array(COMMAND_META.iter().map(command_meta_reply).collect()));
+            }
+            let mut out = Vec::with_capacity(args.len() - 1);
+            for want in args.iter().skip(1) {
+                let want_str = arg_as_str(want)?.to_ascii_lowercase();
+                match COMMAND_META.iter().find(|(name, ..)| *name == want_str) {
+                    Some(meta) => out.push(command_meta_reply(meta)),
+                    None => out.push(RespReply::Nil),
+                }
+            }
+            Ok(RespReply::Array(out))
+        }
+        other => Err(RustyAntError::Parse(format!("unsupported COMMAND subcommand: {other}"))),
+    }
+}
+
+fn command_meta_reply(meta: &CommandMeta) -> RespReply {
+    let (name, arity, flags, first_key, last_key, step) = *meta;
+    RespReply::Array(vec![
+        RespReply::BulkString(Some(Bytes::copy_from_slice(name.as_bytes()))),
+        RespReply::Integer(arity),
+        RespReply::Array(
+            flags.iter().map(|f| RespReply::BulkString(Some(Bytes::copy_from_slice(f.as_bytes())))).collect(),
+        ),
+        RespReply::Integer(first_key),
+        RespReply::Integer(last_key),
+        RespReply::Integer(step),
+    ])
 }
