@@ -3,8 +3,9 @@
 //! Spawns a local TCP WebSocket server that stands in for API Gateway's
 //! WebSocket front-door: for each incoming WS frame it builds a synthetic
 //! `ApiGatewayWebsocketProxyRequest`, runs `rustyant::ws::handle` against
-//! shared state, and sends the reply back on the same connection. Uses
-//! `InMemoryStorage` so the tests are hermetic — no AWS, no floci.
+//! shared state, and sends the reply back on the same connection. Backed by
+//! floci-emulated `S3Storage` — requires `RUSTYANT_FLOCI_URL` (see
+//! `tests/integration.rs` module doc for rationale).
 //!
 //! This closes the transport-level coverage gap left by `src/ws.rs::tests`:
 //! those tests call `handle` directly with hand-constructed events; here we
@@ -13,13 +14,12 @@
 //! does in production.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use aws_lambda_events::apigw::{ApiGatewayWebsocketProxyRequest, ApiGatewayWebsocketProxyRequestContext};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use rustyant::State;
-use rustyant::storage::InMemoryStorage;
+use rustyant::test_support::floci_state;
 use rustyant::ws::{WsOutcome, handle};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -30,14 +30,7 @@ use tokio_tungstenite::{WebSocketStream, accept_async, connect_async};
 // ---------------------------------------------------------------------------
 
 fn test_state() -> State {
-    let settings = rustyant::Settings {
-        bucket: "test".to_string(),
-        key_prefix: "e2e/".to_string(),
-        aws_region: None,
-        aws_endpoint_url: None,
-        emf_namespace: None,
-    };
-    State::with_storage(settings, Arc::new(InMemoryStorage::new()))
+    floci_state("ws-e2e")
 }
 
 /// Spin up a local WS server that mimics API Gateway. Returns the
@@ -143,8 +136,8 @@ async fn ws_set_then_get_persists_across_frames() {
     let url = spawn_ws_server(state).await;
 
     // Two separate WS connections would break persistence because each
-    // connection gets a fresh dispatch chain — but the InMemoryStorage
-    // is shared through `state`, so state survives across connections.
+    // connection gets a fresh dispatch chain — but the S3Storage (backed by
+    // floci) is shared through `state`, so keys survive across connections.
     let set = roundtrip(&url, b"*3\r\n$3\r\nSET\r\n$5\r\nhello\r\n$5\r\nworld\r\n").await;
     assert_eq!(&set, b"+OK\r\n");
 

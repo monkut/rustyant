@@ -68,23 +68,13 @@ pub async fn handle(state: &State, event: ApiGatewayWebsocketProxyRequest) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use aws_lambda_events::apigw::ApiGatewayWebsocketProxyRequestContext;
 
     use super::*;
-    use crate::Settings;
-    use crate::storage::InMemoryStorage;
+    use crate::test_support::floci_state;
 
     fn test_state() -> State {
-        let settings = Settings {
-            bucket: "test".to_string(),
-            key_prefix: "t/".to_string(),
-            aws_region: None,
-            aws_endpoint_url: None,
-            emf_namespace: None,
-        };
-        State::with_storage(settings, Arc::new(InMemoryStorage::new()))
+        floci_state("ws")
     }
 
     fn ws_event(route: &str, body: Option<&str>, is_base64: bool) -> ApiGatewayWebsocketProxyRequest {

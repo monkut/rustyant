@@ -1,12 +1,15 @@
 //! redis-py compatibility tests.
 //!
 //! Spawns a local TCP server that speaks RESP2 and dispatches each incoming
-//! frame through `rustyant::commands::dispatch` against an `InMemoryStorage`.
-//! Then drives a real `redis-py` (`redis.Redis(host='127.0.0.1', port=N)`) via
-//! a Python subprocess against the TCP port. This proves rustyant's command
-//! dispatch is wire-compatible with the de-facto-standard Python client.
+//! frame through `rustyant::commands::dispatch` against a floci-backed
+//! `S3Storage`. Then drives a real `redis-py` (`redis.Redis(host='127.0.0.1',
+//! port=N)`) via a Python subprocess against the TCP port. This proves
+//! rustyant's command dispatch is wire-compatible with the de-facto-standard
+//! Python client.
 //!
 //! The tests skip cleanly when Python 3 with `redis` is not installed.
+//! They also require `RUSTYANT_FLOCI_URL` — see the module doc in
+//! `tests/integration.rs` for the rationale.
 //!
 //! Scope caveat: this test harness is a TCP RESP2 server, NOT a rustyant
 //! production deployment. Real deployments run the handler behind API
@@ -19,16 +22,15 @@
 
 use std::net::SocketAddr;
 use std::process::{Command, Output};
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use redis_protocol::resp2::decode::decode_bytes_mut;
 use redis_protocol::resp2::types::BytesFrame;
+use rustyant::commands;
 use rustyant::resp::RespReply;
 use rustyant::state::State;
-use rustyant::storage::InMemoryStorage;
-use rustyant::{Settings, commands};
+use rustyant::test_support::floci_state;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -37,14 +39,7 @@ use tokio::net::{TcpListener, TcpStream};
 // ---------------------------------------------------------------------------
 
 fn test_state() -> State {
-    let settings = Settings {
-        bucket: "test".to_string(),
-        key_prefix: "redis-py/".to_string(),
-        aws_region: None,
-        aws_endpoint_url: None,
-        emf_namespace: None,
-    };
-    State::with_storage(settings, Arc::new(InMemoryStorage::new()))
+    floci_state("redis-py")
 }
 
 async fn spawn_tcp_server(state: State) -> SocketAddr {
@@ -260,6 +255,13 @@ print('ok')
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_py_setnx_create_only() {
+    // SETNX's "second call returns False" branch depends on S3's
+    // `If-None-Match: *` conditional write, which floci does not enforce.
+    // Same gate as `tests/floci.rs::s3_concurrent_incr_converges`.
+    if std::env::var("RUSTYANT_S3_CAS").is_err() {
+        eprintln!("SKIP: RUSTYANT_S3_CAS not set (floci does not enforce If-None-Match)");
+        return;
+    }
     run_redis_py_script(
         r"
 import redis
