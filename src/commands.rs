@@ -105,6 +105,25 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HELLO" => handle_hello(&args),
         "CLIENT" => handle_client(&args),
         "RESET" => Ok(RespReply::SimpleString("RESET".into())),
+        "AUTH" => handle_auth(&args),
+        "WAIT" => handle_wait(&args),
+        "SAVE" => {
+            arity("SAVE", args.is_empty())?;
+            Ok(RespReply::ok())
+        }
+        "BGSAVE" => handle_bgsave(&args),
+        "BGREWRITEAOF" => {
+            arity("BGREWRITEAOF", args.is_empty())?;
+            Ok(RespReply::SimpleString("Background append only file rewriting started".into()))
+        }
+        "LASTSAVE" => {
+            arity("LASTSAVE", args.is_empty())?;
+            // Honest stub: report container cold-start seconds. rustyant
+            // never does a "save" — every SET is durable on S3 on the spot.
+            Ok(RespReply::Integer(state.started_at_ms / 1000))
+        }
+        "LATENCY" => handle_latency(&args),
+        "DEBUG" => handle_debug(&args).await,
         "DBSIZE" => handle_dbsize(state, args).await,
         "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
         "RANDOMKEY" => handle_randomkey(state, args).await,
@@ -1749,6 +1768,108 @@ fn handle_client(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     }
 }
 
+/// Redis `AUTH` — `AUTH password` or `AUTH username password`.
+///
+/// rustyant has no auth backend; accept the call so clients that send
+/// credentials on connect (matching HELLO's AUTH-is-ignored behavior)
+/// don't hit an error. Arity is validated so genuine malformed requests
+/// still surface.
+fn handle_auth(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("AUTH", matches!(args.len(), 1 | 2))?;
+    Ok(RespReply::ok())
+}
+
+/// Redis `WAIT numreplicas timeout`.
+///
+/// rustyant has no replication model — returning `0` immediately is the
+/// honest answer: zero replicas have acknowledged. The two args are
+/// parsed for syntactic validation but the call does not block.
+fn handle_wait(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("WAIT", args.len() == 2)?;
+    let _ = parse_i64(&args[0], "numreplicas")?;
+    let _ = parse_i64(&args[1], "timeout")?;
+    Ok(RespReply::Integer(0))
+}
+
+/// Redis `BGSAVE [SCHEDULE]`.
+///
+/// No actual background save — every SET is already durable on S3. Reply
+/// with the same simple string Redis does so monitoring clients parse the
+/// acknowledgment unchanged.
+fn handle_bgsave(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    if args.len() > 1 {
+        return Err(RustyAntError::WrongArity { command: "BGSAVE".into() });
+    }
+    if let Some(opt) = args.first() {
+        match arg_as_str(opt)?.to_ascii_uppercase().as_str() {
+            "SCHEDULE" => {}
+            other => return Err(RustyAntError::Parse(format!("unsupported BGSAVE option: {other}"))),
+        }
+    }
+    Ok(RespReply::SimpleString("Background saving started".into()))
+}
+
+/// Redis `LATENCY` — monitoring subcommand router.
+///
+/// rustyant emits EMF metrics for latency observation (see `README.md`);
+/// the `LATENCY` command family itself is stubbed. `HISTORY` / `LATEST` /
+/// `GRAPH` return empty results, `RESET` returns `0`, `DOCTOR` returns a
+/// bland all-clear string.
+fn handle_latency(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "LATENCY".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    match sub.as_str() {
+        "RESET" => Ok(RespReply::Integer(0)),
+        "HISTORY" | "GRAPH" => {
+            // Both require a single event-name arg but rustyant tracks none.
+            if args.len() != 2 {
+                return Err(RustyAntError::WrongArity { command: format!("LATENCY {sub}") });
+            }
+            Ok(if sub == "GRAPH" { RespReply::BulkString(Some(Bytes::new())) } else { RespReply::Array(Vec::new()) })
+        }
+        "LATEST" => Ok(RespReply::Array(Vec::new())),
+        "DOCTOR" => Ok(RespReply::BulkString(Some(Bytes::from_static(
+            b"Dave, I have observed the system for a while and I have no latency issues to report.\n",
+        )))),
+        other => Err(RustyAntError::Parse(format!("unsupported LATENCY subcommand: {other}"))),
+    }
+}
+
+/// Redis `DEBUG` — developer subcommand router, mostly unsupported.
+///
+/// The only genuinely useful subcommand outside Redis internals is
+/// `DEBUG SLEEP <seconds>`, which callers use to probe client timeout
+/// handling. Everything else (OBJECT, SEGFAULT, RELOAD, SET-ACTIVE-EXPIRE,
+/// etc.) touches server-specific state rustyant doesn't have, so they
+/// return an explicit error rather than a silent lie.
+async fn handle_debug(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "DEBUG".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    match sub.as_str() {
+        "SLEEP" => {
+            if args.len() != 2 {
+                return Err(RustyAntError::WrongArity { command: "DEBUG SLEEP".into() });
+            }
+            let secs = arg_as_str(&args[1])?
+                .parse::<f64>()
+                .map_err(|_| RustyAntError::Parse("DEBUG SLEEP takes a number".into()))?;
+            if !secs.is_finite() || secs < 0.0 {
+                return Err(RustyAntError::Parse("DEBUG SLEEP takes a non-negative number".into()));
+            }
+            // Cap at the test-loop-friendly 5 seconds. Lambda hard-timeouts
+            // past this anyway; a longer sleep is almost always a mistake.
+            // The cast is safe: the value is finite, non-negative, and <= 5000.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let ms = (secs.min(5.0) * 1000.0) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            Ok(RespReply::ok())
+        }
+        other => Err(RustyAntError::Parse(format!(
+            "DEBUG {other} is not supported on rustyant (S3-backed; no engine-internal state to inspect)"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // COMMAND — minimal server introspection for redis-py's discovery path.
 // Scope is `COUNT` / `LIST` / `INFO`; `DOCS` and `GETKEYS` are out of scope
@@ -1774,6 +1895,14 @@ const COMMAND_META: &[CommandMeta] = &[
     ("hello", -1, &["fast", "loading", "stale"], 0, 0, 0),
     ("client", -2, &["admin", "noscript"], 0, 0, 0),
     ("reset", 1, &["fast", "loading", "stale"], 0, 0, 0),
+    ("auth", -2, &["fast", "loading", "stale"], 0, 0, 0),
+    ("wait", 3, &["admin"], 0, 0, 0),
+    ("save", 1, &["admin", "noscript"], 0, 0, 0),
+    ("bgsave", -1, &["admin"], 0, 0, 0),
+    ("bgrewriteaof", 1, &["admin"], 0, 0, 0),
+    ("lastsave", 1, &["readonly", "fast", "admin"], 0, 0, 0),
+    ("latency", -2, &["admin", "noscript", "loading", "stale"], 0, 0, 0),
+    ("debug", -2, &["admin", "noscript"], 0, 0, 0),
     ("dbsize", 1, &["readonly", "fast"], 0, 0, 0),
     ("flushdb", -1, &["write"], 0, 0, 0),
     ("flushall", -1, &["write"], 0, 0, 0),
