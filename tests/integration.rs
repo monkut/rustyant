@@ -3190,3 +3190,98 @@ async fn new_server_stubs_registered_in_command_meta() {
         assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// MULTI / EXEC / DISCARD / WATCH / UNWATCH — transaction-stub policy:
+// MULTI and WATCH fail explicitly (no cross-request state); UNWATCH is a
+// trivially-successful no-op; EXEC/DISCARD return Redis's standard
+// "without MULTI" error.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn multi_returns_explicit_not_supported_error() {
+    let state = test_state();
+    let reply = call(&state, &[b"MULTI"]).await;
+    reply.expect_error_prefix("ERR");
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("not supported"), "expected not-supported error, got {s:?}");
+}
+
+#[tokio::test]
+async fn multi_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"MULTI", b"extra"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn exec_without_multi_returns_standard_error() {
+    let state = test_state();
+    let reply = call(&state, &[b"EXEC"]).await;
+    reply.expect_error_prefix("ERR");
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("EXEC without MULTI"), "expected standard EXEC error, got {s:?}");
+}
+
+#[tokio::test]
+async fn exec_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"EXEC", b"extra"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn discard_without_multi_returns_standard_error() {
+    let state = test_state();
+    let reply = call(&state, &[b"DISCARD"]).await;
+    reply.expect_error_prefix("ERR");
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("DISCARD without MULTI"), "expected standard DISCARD error, got {s:?}");
+}
+
+#[tokio::test]
+async fn discard_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"DISCARD", b"extra"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn watch_single_key_returns_not_supported_error() {
+    let state = test_state();
+    let reply = call(&state, &[b"WATCH", b"key1"]).await;
+    reply.expect_error_prefix("ERR");
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("not supported"), "expected not-supported error, got {s:?}");
+}
+
+#[tokio::test]
+async fn watch_multiple_keys_returns_not_supported_error() {
+    let state = test_state();
+    call(&state, &[b"WATCH", b"k1", b"k2", b"k3"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn watch_without_keys_is_arity_error() {
+    let state = test_state();
+    call(&state, &[b"WATCH"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn unwatch_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"UNWATCH"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn unwatch_rejects_extra_args() {
+    let state = test_state();
+    call(&state, &[b"UNWATCH", b"extra"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn transaction_stubs_registered_in_command_meta() {
+    let state = test_state();
+    for name in [b"MULTI".as_ref(), b"EXEC".as_ref(), b"DISCARD".as_ref(), b"WATCH".as_ref(), b"UNWATCH".as_ref()] {
+        let reply = call(&state, &[b"COMMAND", b"INFO", name]).await;
+        let s = String::from_utf8_lossy(&reply.raw);
+        assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
+    }
+}
