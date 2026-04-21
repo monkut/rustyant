@@ -3039,3 +3039,154 @@ async fn command_info_hello_client_reset_are_registered() {
         assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// AUTH / WAIT / SAVE / BGSAVE / BGREWRITEAOF / LASTSAVE / LATENCY / DEBUG
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_password_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"AUTH", b"secret"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn auth_username_and_password_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"AUTH", b"alice", b"secret"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn auth_arity_errors() {
+    let state = test_state();
+    call(&state, &[b"AUTH"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"AUTH", b"a", b"b", b"c"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn wait_returns_zero_replicas() {
+    let state = test_state();
+    call(&state, &[b"WAIT", b"0", b"100"]).await.expect_integer(0);
+    call(&state, &[b"WAIT", b"5", b"500"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn wait_rejects_non_integer_args() {
+    let state = test_state();
+    call(&state, &[b"WAIT", b"many", b"100"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn save_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"SAVE"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn bgsave_returns_standard_acknowledgment() {
+    let state = test_state();
+    call(&state, &[b"BGSAVE"]).await.expect_simple("Background saving started");
+    call(&state, &[b"BGSAVE", b"SCHEDULE"]).await.expect_simple("Background saving started");
+}
+
+#[tokio::test]
+async fn bgsave_rejects_unknown_option() {
+    let state = test_state();
+    call(&state, &[b"BGSAVE", b"NOW"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn bgrewriteaof_returns_standard_acknowledgment() {
+    let state = test_state();
+    call(&state, &[b"BGREWRITEAOF"]).await.expect_simple("Background append only file rewriting started");
+}
+
+#[tokio::test]
+async fn lastsave_returns_positive_epoch_seconds() {
+    let state = test_state();
+    let reply = call(&state, &[b"LASTSAVE"]).await;
+    let n: i64 = String::from_utf8_lossy(&reply.raw).trim_start_matches(':').trim_end().parse().expect("int");
+    assert!(n > 1_700_000_000, "LASTSAVE should be a real epoch, got {n}");
+}
+
+#[tokio::test]
+async fn latency_reset_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"LATENCY", b"RESET"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn latency_history_returns_empty_array() {
+    let state = test_state();
+    let reply = call(&state, &[b"LATENCY", b"HISTORY", b"event"]).await;
+    assert_eq!(reply.raw, b"*0\r\n", "got {:?}", String::from_utf8_lossy(&reply.raw));
+}
+
+#[tokio::test]
+async fn latency_history_arity_errors_without_event() {
+    let state = test_state();
+    call(&state, &[b"LATENCY", b"HISTORY"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn latency_latest_returns_empty_array() {
+    let state = test_state();
+    let reply = call(&state, &[b"LATENCY", b"LATEST"]).await;
+    assert_eq!(reply.raw, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn latency_doctor_returns_bulk_string() {
+    let state = test_state();
+    let reply = call(&state, &[b"LATENCY", b"DOCTOR"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with('$'), "expected bulk:\n{s}");
+    assert!(s.contains("latency"), "expected doctor line:\n{s}");
+}
+
+#[tokio::test]
+async fn latency_unknown_subcommand_errors() {
+    let state = test_state();
+    call(&state, &[b"LATENCY", b"OVERLORD"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn debug_sleep_actually_waits() {
+    let state = test_state();
+    let started = std::time::Instant::now();
+    call(&state, &[b"DEBUG", b"SLEEP", b"0.2"]).await.expect_simple("OK");
+    let elapsed = started.elapsed();
+    assert!(elapsed.as_millis() >= 150, "DEBUG SLEEP returned early: {elapsed:?}");
+}
+
+#[tokio::test]
+async fn debug_sleep_rejects_negative() {
+    let state = test_state();
+    call(&state, &[b"DEBUG", b"SLEEP", b"-1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn debug_other_subcommands_error_explicitly() {
+    let state = test_state();
+    call(&state, &[b"DEBUG", b"OBJECT", b"k"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"DEBUG", b"RELOAD"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn new_server_stubs_registered_in_command_meta() {
+    let state = test_state();
+    for name in [
+        b"AUTH".as_ref(),
+        b"WAIT".as_ref(),
+        b"SAVE".as_ref(),
+        b"BGSAVE".as_ref(),
+        b"BGREWRITEAOF".as_ref(),
+        b"LASTSAVE".as_ref(),
+        b"LATENCY".as_ref(),
+        b"DEBUG".as_ref(),
+    ] {
+        let reply = call(&state, &[b"COMMAND", b"INFO", name]).await;
+        let s = String::from_utf8_lossy(&reply.raw);
+        assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
+    }
+}
