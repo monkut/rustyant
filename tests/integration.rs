@@ -3435,3 +3435,214 @@ async fn pubsub_stubs_registered_in_command_meta() {
         assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// GEOADD / GEOPOS / GEODIST / GEOHASH — Core 4 geo surface layered on ZSETs.
+// Reference values throughout come from Redis's own documentation example
+// (Sicily: Palermo + Catania), so the tests double as a check against Redis's
+// wire format.
+// ---------------------------------------------------------------------------
+
+const PALERMO_LON: &[u8] = b"13.361389";
+const PALERMO_LAT: &[u8] = b"38.115556";
+const CATANIA_LON: &[u8] = b"15.087269";
+const CATANIA_LAT: &[u8] = b"37.502669";
+
+#[tokio::test]
+async fn geoadd_single_member_returns_one() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g1", PALERMO_LON, PALERMO_LAT, b"Palermo"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn geoadd_two_members_returns_two() {
+    let state = test_state();
+    let added =
+        call(&state, &[b"GEOADD", b"g2", PALERMO_LON, PALERMO_LAT, b"Palermo", CATANIA_LON, CATANIA_LAT, b"Catania"])
+            .await;
+    added.expect_integer(2);
+}
+
+#[tokio::test]
+async fn geoadd_updating_existing_returns_zero_without_ch() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g3", PALERMO_LON, PALERMO_LAT, b"Palermo"]).await.expect_integer(1);
+    // Same member, different coords — update, not an add.
+    call(&state, &[b"GEOADD", b"g3", CATANIA_LON, CATANIA_LAT, b"Palermo"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn geoadd_ch_counts_updates() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g4", PALERMO_LON, PALERMO_LAT, b"p"]).await.expect_integer(1);
+    call(&state, &[b"GEOADD", b"g4", b"CH", CATANIA_LON, CATANIA_LAT, b"p"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn geoadd_nx_preserves_existing_coords() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g5", PALERMO_LON, PALERMO_LAT, b"p"]).await.expect_integer(1);
+    // NX: member exists, update is suppressed → no change counted.
+    call(&state, &[b"GEOADD", b"g5", b"NX", CATANIA_LON, CATANIA_LAT, b"p"]).await.expect_integer(0);
+    // GEOPOS confirms the coords are still Palermo's.
+    let reply = call(&state, &[b"GEOPOS", b"g5", b"p"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw);
+    assert!(raw.contains("13.36"), "NX leaked the update:\n{raw}");
+}
+
+#[tokio::test]
+async fn geoadd_xx_refuses_to_create_new_member() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g6", b"XX", PALERMO_LON, PALERMO_LAT, b"p"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"g6"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn geoadd_xx_allows_updating_existing_member() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g7", PALERMO_LON, PALERMO_LAT, b"p"]).await.expect_integer(1);
+    call(&state, &[b"GEOADD", b"g7", b"XX", b"CH", CATANIA_LON, CATANIA_LAT, b"p"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn geoadd_rejects_combining_nx_and_xx() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g8", b"NX", b"XX", PALERMO_LON, PALERMO_LAT, b"p"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geoadd_rejects_out_of_range_coordinates() {
+    let state = test_state();
+    // Longitude out of range.
+    call(&state, &[b"GEOADD", b"g9", b"181.0", b"38.0", b"p"]).await.expect_error_prefix("ERR");
+    // Latitude past Redis's Mercator cap.
+    call(&state, &[b"GEOADD", b"g9", b"13.0", b"86.0", b"p"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geoadd_wrong_arity_errors() {
+    let state = test_state();
+    call(&state, &[b"GEOADD"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"GEOADD", b"k"]).await.expect_error_prefix("ERR");
+    // Triple doesn't divide: lon lat member lon (missing lat + member)
+    call(&state, &[b"GEOADD", b"k", PALERMO_LON, PALERMO_LAT, b"p", CATANIA_LON]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geoadd_on_wrong_type_errors_with_wrong_type_message() {
+    let state = test_state();
+    call(&state, &[b"SET", b"g_string", b"x"]).await.expect_simple("OK");
+    let reply = call(&state, &[b"GEOADD", b"g_string", PALERMO_LON, PALERMO_LAT, b"p"]).await;
+    reply.expect_error_prefix("ERR");
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("wrong type"), "expected wrong-type error, got {s:?}");
+}
+
+#[tokio::test]
+async fn geopos_returns_lon_lat_within_tolerance() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g10", PALERMO_LON, PALERMO_LAT, b"Palermo"]).await.expect_integer(1);
+    let reply = call(&state, &[b"GEOPOS", b"g10", b"Palermo"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Expect an array of one array of two bulk strings.
+    assert!(s.starts_with("*1\r\n*2\r\n$"), "unexpected shape:\n{s}");
+    assert!(s.contains("13.36"), "longitude missing from reply:\n{s}");
+    assert!(s.contains("38.1"), "latitude missing from reply:\n{s}");
+}
+
+#[tokio::test]
+async fn geopos_missing_member_returns_nil_element() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g11", PALERMO_LON, PALERMO_LAT, b"Palermo"]).await.expect_integer(1);
+    let reply = call(&state, &[b"GEOPOS", b"g11", b"Palermo", b"Nowhere"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with("*2\r\n*2\r\n$"), "unexpected shape:\n{s}");
+    assert!(s.contains("$-1\r\n"), "expected nil for missing member:\n{s}");
+}
+
+#[tokio::test]
+async fn geopos_on_missing_key_returns_all_nil() {
+    let state = test_state();
+    let reply = call(&state, &[b"GEOPOS", b"ghost", b"a", b"b"]).await;
+    // Two nil elements.
+    assert_eq!(reply.raw, b"*2\r\n$-1\r\n$-1\r\n");
+}
+
+#[tokio::test]
+async fn geodist_palermo_catania_matches_redis_example_meters() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g12", PALERMO_LON, PALERMO_LAT, b"Palermo", CATANIA_LON, CATANIA_LAT, b"Catania"])
+        .await
+        .expect_integer(2);
+    let reply = call(&state, &[b"GEODIST", b"g12", b"Palermo", b"Catania"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Redis reports "166274.1516" m for this exact example.
+    assert!(s.contains("166274.15"), "expected Palermo→Catania ≈ 166274 m, got:\n{s}");
+}
+
+#[tokio::test]
+async fn geodist_km_unit_converts() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g13", PALERMO_LON, PALERMO_LAT, b"Palermo", CATANIA_LON, CATANIA_LAT, b"Catania"])
+        .await
+        .expect_integer(2);
+    let reply = call(&state, &[b"GEODIST", b"g13", b"Palermo", b"Catania", b"km"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("166.27"), "expected Palermo→Catania ≈ 166.27 km, got:\n{s}");
+}
+
+#[tokio::test]
+async fn geodist_missing_member_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g14", PALERMO_LON, PALERMO_LAT, b"Palermo"]).await.expect_integer(1);
+    call(&state, &[b"GEODIST", b"g14", b"Palermo", b"Ghost"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn geodist_rejects_unknown_unit() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g15", PALERMO_LON, PALERMO_LAT, b"Palermo", CATANIA_LON, CATANIA_LAT, b"Catania"])
+        .await
+        .expect_integer(2);
+    call(&state, &[b"GEODIST", b"g15", b"Palermo", b"Catania", b"yd"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geohash_matches_redis_reference_values() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g16", PALERMO_LON, PALERMO_LAT, b"Palermo", CATANIA_LON, CATANIA_LAT, b"Catania"])
+        .await
+        .expect_integer(2);
+    let reply = call(&state, &[b"GEOHASH", b"g16", b"Palermo", b"Catania"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Redis's canonical reply: ["sqc8b49rny0", "sqdtr74hyu0"]
+    assert!(s.contains("sqc8b49rny0"), "Palermo geohash wrong in:\n{s}");
+    assert!(s.contains("sqdtr74hyu0"), "Catania geohash wrong in:\n{s}");
+}
+
+#[tokio::test]
+async fn geohash_missing_member_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g17", PALERMO_LON, PALERMO_LAT, b"Palermo"]).await.expect_integer(1);
+    let reply = call(&state, &[b"GEOHASH", b"g17", b"Palermo", b"Ghost"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("sqc8b49rny0"), "expected Palermo hash:\n{s}");
+    assert!(s.contains("$-1\r\n"), "expected nil for missing member:\n{s}");
+}
+
+#[tokio::test]
+async fn geo_type_is_zset() {
+    let state = test_state();
+    call(&state, &[b"GEOADD", b"g18", PALERMO_LON, PALERMO_LAT, b"Palermo"]).await.expect_integer(1);
+    call(&state, &[b"TYPE", b"g18"]).await.expect_simple("zset");
+}
+
+#[tokio::test]
+async fn geo_stubs_registered_in_command_meta() {
+    let state = test_state();
+    for name in [b"GEOADD".as_ref(), b"GEOPOS".as_ref(), b"GEODIST".as_ref(), b"GEOHASH".as_ref()] {
+        let reply = call(&state, &[b"COMMAND", b"INFO", name]).await;
+        let s = String::from_utf8_lossy(&reply.raw);
+        assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
+    }
+}
