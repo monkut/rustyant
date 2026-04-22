@@ -3646,3 +3646,419 @@ async fn geo_stubs_registered_in_command_meta() {
         assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// GEOSEARCH / GEOSEARCHSTORE — spatial search on a geo ZSET.
+// Uses the Sicily example (Palermo + Catania) plus a farther-away "Dublin"
+// point for inclusion/exclusion tests, matching Redis's canonical docs
+// setup.
+// ---------------------------------------------------------------------------
+
+const DUBLIN_LON: &[u8] = b"-6.2603"; // Dublin, Ireland — ~2000 km from Sicily
+const DUBLIN_LAT: &[u8] = b"53.3498";
+
+async fn seed_sicily_plus_dublin(state: &State, key: &[u8]) {
+    call(
+        state,
+        &[
+            b"GEOADD",
+            key,
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"Palermo",
+            CATANIA_LON,
+            CATANIA_LAT,
+            b"Catania",
+            DUBLIN_LON,
+            DUBLIN_LAT,
+            b"Dublin",
+        ],
+    )
+    .await
+    .expect_integer(3);
+}
+
+#[tokio::test]
+async fn geosearch_byradius_fromlonlat_returns_nearby_members() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs1").await;
+    let reply =
+        call(&state, &[b"GEOSEARCH", b"gs1", b"FROMLONLAT", PALERMO_LON, PALERMO_LAT, b"BYRADIUS", b"200", b"km"])
+            .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("Palermo"), "expected Palermo within 200 km:\n{s}");
+    assert!(s.contains("Catania"), "expected Catania within 200 km:\n{s}");
+    assert!(!s.contains("Dublin"), "Dublin must not be within 200 km of Palermo:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_byradius_frommember_uses_members_location() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs2").await;
+    let reply = call(&state, &[b"GEOSEARCH", b"gs2", b"FROMMEMBER", b"Palermo", b"BYRADIUS", b"200", b"km"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("Palermo"), "raw reply:\n{s}");
+    assert!(s.contains("Catania"), "raw reply:\n{s}");
+    assert!(!s.contains("Dublin"), "raw reply:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_frommember_missing_errors() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs3").await;
+    call(&state, &[b"GEOSEARCH", b"gs3", b"FROMMEMBER", b"Ghost", b"BYRADIUS", b"200", b"km"])
+        .await
+        .expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geosearch_bybox_filters_by_rectangle() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs4").await;
+    // 400 km wide × 200 km tall box around Palermo catches Catania (~166 km
+    // east) but not Dublin (thousands of km away).
+    let reply =
+        call(&state, &[b"GEOSEARCH", b"gs4", b"FROMLONLAT", PALERMO_LON, PALERMO_LAT, b"BYBOX", b"400", b"200", b"km"])
+            .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("Palermo"));
+    assert!(s.contains("Catania"));
+    assert!(!s.contains("Dublin"));
+}
+
+#[tokio::test]
+async fn geosearch_asc_sorts_closest_first() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs5").await;
+    // Centre on Catania; Catania should come before Palermo in ASC.
+    let reply = call(
+        &state,
+        &[b"GEOSEARCH", b"gs5", b"FROMLONLAT", CATANIA_LON, CATANIA_LAT, b"BYRADIUS", b"300", b"km", b"ASC"],
+    )
+    .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    let catania_idx = s.find("Catania").expect("has Catania");
+    let palermo_idx = s.find("Palermo").expect("has Palermo");
+    assert!(catania_idx < palermo_idx, "ASC should put Catania first:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_desc_sorts_farthest_first() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs6").await;
+    let reply = call(
+        &state,
+        &[b"GEOSEARCH", b"gs6", b"FROMLONLAT", CATANIA_LON, CATANIA_LAT, b"BYRADIUS", b"300", b"km", b"DESC"],
+    )
+    .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    let catania_idx = s.find("Catania").expect("has Catania");
+    let palermo_idx = s.find("Palermo").expect("has Palermo");
+    assert!(palermo_idx < catania_idx, "DESC should put Palermo first:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_count_caps_results() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs7").await;
+    let reply = call(
+        &state,
+        &[
+            b"GEOSEARCH",
+            b"gs7",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"5000",
+            b"km",
+            b"ASC",
+            b"COUNT",
+            b"1",
+        ],
+    )
+    .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Exactly one result.
+    assert!(s.starts_with("*1\r\n"), "expected single-element array:\n{s}");
+    assert!(s.contains("Palermo"), "closest to Palermo is Palermo itself:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_count_any_is_accepted() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs8").await;
+    let reply = call(
+        &state,
+        &[
+            b"GEOSEARCH",
+            b"gs8",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"300",
+            b"km",
+            b"COUNT",
+            b"10",
+            b"ANY",
+        ],
+    )
+    .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with('*'), "should produce an array reply:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_withdist_appends_distance_per_match() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs9").await;
+    let reply = call(
+        &state,
+        &[
+            b"GEOSEARCH",
+            b"gs9",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"300",
+            b"km",
+            b"WITHDIST",
+            b"ASC",
+        ],
+    )
+    .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Nested arrays: each element is `*2\r\n<name>\r\n<dist>\r\n`.
+    assert!(s.contains("*2\r\n"), "expected per-result nested arrays:\n{s}");
+    // Palermo-to-Palermo self-distance is at most the 26-bit cell size
+    // (~0.5 m), so in km it's 0.0000 or 0.0001 depending on rounding.
+    assert!(s.contains("0.0000") || s.contains("0.0001"), "expected self-distance near 0 km:\n{s}");
+    assert!(s.contains("166.27") || s.contains("166.28"), "expected Palermo→Catania ≈ 166.27 km:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_withhash_appends_integer_score_per_match() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs10").await;
+    let reply = call(
+        &state,
+        &[b"GEOSEARCH", b"gs10", b"FROMLONLAT", PALERMO_LON, PALERMO_LAT, b"BYRADIUS", b"50", b"km", b"WITHHASH"],
+    )
+    .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    // Has an integer reply `:NNN\r\n` inside the nested array.
+    assert!(s.contains("\r\n:"), "expected integer hash in reply:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_withcoord_appends_lon_lat_per_match() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs11").await;
+    let reply = call(
+        &state,
+        &[b"GEOSEARCH", b"gs11", b"FROMLONLAT", PALERMO_LON, PALERMO_LAT, b"BYRADIUS", b"50", b"km", b"WITHCOORD"],
+    )
+    .await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("13.36"), "expected longitude in WITHCOORD reply:\n{s}");
+    assert!(s.contains("38.1"), "expected latitude in WITHCOORD reply:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearch_requires_centre_and_shape() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gs12").await;
+    // Missing centre.
+    call(&state, &[b"GEOSEARCH", b"gs12", b"BYRADIUS", b"10", b"km"]).await.expect_error_prefix("ERR");
+    // Missing shape.
+    call(&state, &[b"GEOSEARCH", b"gs12", b"FROMLONLAT", PALERMO_LON, PALERMO_LAT]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geosearch_on_missing_key_returns_empty_array() {
+    let state = test_state();
+    let reply = call(
+        &state,
+        &[b"GEOSEARCH", b"ghost-key", b"FROMLONLAT", PALERMO_LON, PALERMO_LAT, b"BYRADIUS", b"100", b"km"],
+    )
+    .await;
+    assert_eq!(reply.raw, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn geosearch_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"gs-string", b"x"]).await.expect_simple("OK");
+    call(&state, &[b"GEOSEARCH", b"gs-string", b"FROMLONLAT", PALERMO_LON, PALERMO_LAT, b"BYRADIUS", b"10", b"km"])
+        .await
+        .expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geosearchstore_copies_matches_to_destination_with_geohash_scores() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gss-src").await;
+    let stored = call(
+        &state,
+        &[
+            b"GEOSEARCHSTORE",
+            b"gss-dst",
+            b"gss-src",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"300",
+            b"km",
+        ],
+    )
+    .await;
+    stored.expect_integer(2);
+    // Destination should be a ZSET containing Palermo and Catania.
+    call(&state, &[b"TYPE", b"gss-dst"]).await.expect_simple("zset");
+    call(&state, &[b"ZCARD", b"gss-dst"]).await.expect_integer(2);
+    // GEOHASH on the destination should produce Palermo's canonical string —
+    // confirming scores were preserved (not replaced with distances).
+    let reply = call(&state, &[b"GEOHASH", b"gss-dst", b"Palermo"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("sqc8b49rny0"), "destination lost geohash score fidelity:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearchstore_storedist_uses_distance_as_score_in_request_unit() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gss2-src").await;
+    // BYRADIUS in metres → stored scores are in metres (Redis's rule:
+    // STOREDIST distances are in the unit requested by BYRADIUS/BYBOX).
+    let stored = call(
+        &state,
+        &[
+            b"GEOSEARCHSTORE",
+            b"gss2-dst",
+            b"gss2-src",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"300000",
+            b"m",
+            b"STOREDIST",
+        ],
+    )
+    .await;
+    stored.expect_integer(2);
+    // Palermo's score should be 0 (distance to itself); Catania's ~166274 m.
+    let reply = call(&state, &[b"ZSCORE", b"gss2-dst", b"Palermo"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.starts_with('$') && s.contains('0'), "expected 0-distance for self:\n{s}");
+    let reply = call(&state, &[b"ZSCORE", b"gss2-dst", b"Catania"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("166274"), "expected Catania distance ~166274 m:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearchstore_storedist_in_km_converts_unit() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gss3-src").await;
+    let stored = call(
+        &state,
+        &[
+            b"GEOSEARCHSTORE",
+            b"gss3-dst",
+            b"gss3-src",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"300",
+            b"km",
+            b"STOREDIST",
+        ],
+    )
+    .await;
+    stored.expect_integer(2);
+    // With km unit, Catania's stored score should be ~166.27 (km).
+    let reply = call(&state, &[b"ZSCORE", b"gss3-dst", b"Catania"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains("166.27") || s.contains("166.28"), "expected Catania ≈ 166.27 km as score:\n{s}");
+}
+
+#[tokio::test]
+async fn geosearchstore_overwrites_existing_destination() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gss4-src").await;
+    // Pre-populate destination with something different.
+    call(&state, &[b"SET", b"gss4-dst", b"ignored"]).await.expect_simple("OK");
+    call(
+        &state,
+        &[
+            b"GEOSEARCHSTORE",
+            b"gss4-dst",
+            b"gss4-src",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"300",
+            b"km",
+        ],
+    )
+    .await
+    .expect_integer(2);
+    // Destination is now a ZSET, not a string.
+    call(&state, &[b"TYPE", b"gss4-dst"]).await.expect_simple("zset");
+}
+
+#[tokio::test]
+async fn geosearchstore_with_no_matches_returns_zero_and_removes_destination() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gss5-src").await;
+    // Pre-populate destination so we can verify it gets cleared.
+    call(&state, &[b"GEOADD", b"gss5-dst", PALERMO_LON, PALERMO_LAT, b"old"]).await.expect_integer(1);
+    // Centre on the Pacific, thousands of km from every seeded member, and
+    // cap radius at 10 m so nothing matches.
+    call(
+        &state,
+        &[b"GEOSEARCHSTORE", b"gss5-dst", b"gss5-src", b"FROMLONLAT", b"-140.0", b"0.0", b"BYRADIUS", b"10", b"m"],
+    )
+    .await
+    .expect_integer(0);
+    // No members stored → destination should not exist.
+    call(&state, &[b"EXISTS", b"gss5-dst"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn geosearchstore_rejects_with_flags() {
+    let state = test_state();
+    seed_sicily_plus_dublin(&state, b"gss6-src").await;
+    // WITHCOORD / WITHDIST / WITHHASH are GEOSEARCH-only.
+    call(
+        &state,
+        &[
+            b"GEOSEARCHSTORE",
+            b"gss6-dst",
+            b"gss6-src",
+            b"FROMLONLAT",
+            PALERMO_LON,
+            PALERMO_LAT,
+            b"BYRADIUS",
+            b"300",
+            b"km",
+            b"WITHCOORD",
+        ],
+    )
+    .await
+    .expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn geosearch_stubs_registered_in_command_meta() {
+    let state = test_state();
+    for name in [b"GEOSEARCH".as_ref(), b"GEOSEARCHSTORE".as_ref()] {
+        let reply = call(&state, &[b"COMMAND", b"INFO", name]).await;
+        let s = String::from_utf8_lossy(&reply.raw);
+        assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
+    }
+}
