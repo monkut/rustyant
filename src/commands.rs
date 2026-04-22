@@ -532,20 +532,82 @@ async fn handle_sadd(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
 // ---- Sorted Sets ----------------------------------------------------------
 
 async fn handle_zadd(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
-    if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+    if args.len() < 3 {
         return Err(RustyAntError::WrongArity { command: "ZADD".into() });
     }
     let key = arg_as_string(&args[0])?;
-    let mut pairs: Vec<(f64, String)> = Vec::with_capacity((args.len() - 1) / 2);
-    let mut i = 1;
-    while i + 1 < args.len() {
-        let score = parse_f64(&args[i], "score")?;
-        let member = arg_as_string(&args[i + 1])?;
-        pairs.push((score, member));
-        i += 2;
+    let mut flags = ZAddFlags::default();
+    let mut incr = false;
+    let mut idx = 1;
+    while idx < args.len() {
+        let token = arg_as_str(&args[idx])?;
+        match token.to_ascii_uppercase().as_str() {
+            "NX" => {
+                flags.nx = true;
+                idx += 1;
+            }
+            "XX" => {
+                flags.xx = true;
+                idx += 1;
+            }
+            "GT" => {
+                flags.gt = true;
+                idx += 1;
+            }
+            "LT" => {
+                flags.lt = true;
+                idx += 1;
+            }
+            "CH" => {
+                flags.ch = true;
+                idx += 1;
+            }
+            "INCR" => {
+                incr = true;
+                idx += 1;
+            }
+            _ => break,
+        }
     }
-    let added = state.storage.zadd(&key, pairs).await?;
-    Ok(RespReply::Integer(added))
+    if flags.nx && flags.xx {
+        return Err(RustyAntError::Parse("XX and NX options at the same time are not compatible".into()));
+    }
+    if flags.gt && flags.lt {
+        return Err(RustyAntError::Parse("GT, LT, and/or NX options at the same time are not compatible".into()));
+    }
+    if flags.nx && (flags.gt || flags.lt) {
+        return Err(RustyAntError::Parse("GT, LT, and/or NX options at the same time are not compatible".into()));
+    }
+    // Remaining args must be score/member pairs.
+    let remaining = args.len() - idx;
+    if remaining < 2 || remaining % 2 != 0 {
+        return Err(RustyAntError::WrongArity { command: "ZADD".into() });
+    }
+    let mut pairs: Vec<(f64, String)> = Vec::with_capacity(remaining / 2);
+    while idx < args.len() {
+        let score = parse_f64(&args[idx], "score")?;
+        let member = arg_as_string(&args[idx + 1])?;
+        pairs.push((score, member));
+        idx += 2;
+    }
+    if incr {
+        if pairs.len() != 1 {
+            return Err(RustyAntError::Parse("INCR option supports a single increment-element pair".into()));
+        }
+        let (delta, member) = pairs.into_iter().next().expect("len == 1 checked above");
+        let new_score = state.storage.zadd_ext_incr(&key, delta, &member, flags).await?;
+        return Ok(new_score
+            .map_or(RespReply::Nil, |s| RespReply::BulkString(Some(Bytes::from(format_score(s).into_bytes())))));
+    }
+    // Fast path: no flags at all → original zadd (preserves call-site shape
+    // for the common case).
+    let has_any_flag = flags.nx || flags.xx || flags.gt || flags.lt || flags.ch;
+    let count = if has_any_flag {
+        state.storage.zadd_ext(&key, pairs, flags).await?
+    } else {
+        state.storage.zadd(&key, pairs).await?
+    };
+    Ok(RespReply::Integer(count))
 }
 
 async fn handle_zrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
