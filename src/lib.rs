@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod error;
+pub mod geo;
 pub mod handler;
 pub mod metrics;
 pub mod resp;

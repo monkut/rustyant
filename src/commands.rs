@@ -4,10 +4,11 @@ use bytes::Bytes;
 use tracing::info;
 
 use crate::error::RustyAntError;
+use crate::geo::{self, GeoUnit};
 use crate::metrics;
 use crate::resp::RespReply;
 use crate::state::State;
-use crate::storage::{GetExOp, ScoreBound, TtlResult, bit_at, now_ms};
+use crate::storage::{GetExOp, ScoreBound, TtlResult, ZAddFlags, bit_at, now_ms};
 
 /// Coarse classification of a dispatch result, emitted as a structured log
 /// field so `CloudWatch` queries can count/alert by outcome without string
@@ -135,6 +136,10 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "PUNSUBSCRIBE" => handle_punsubscribe(&args),
         "PUBLISH" => handle_publish(&args),
         "PUBSUB" => handle_pubsub(&args),
+        "GEOADD" => handle_geoadd(state, args).await,
+        "GEOPOS" => handle_geopos(state, args).await,
+        "GEODIST" => handle_geodist(state, args).await,
+        "GEOHASH" => handle_geohash(state, args).await,
         "DBSIZE" => handle_dbsize(state, args).await,
         "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
         "RANDOMKEY" => handle_randomkey(state, args).await,
@@ -2026,6 +2031,131 @@ fn handle_pubsub(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
 }
 
 // ---------------------------------------------------------------------------
+// GEOADD / GEOPOS / GEODIST / GEOHASH — geo surface layered on ZSET scores.
+//
+// Each geo member is stored as a ZSET entry whose score is a 52-bit
+// interleaved geohash integer (see `geo::encode_score`). GEOADD is ZADD with
+// computed scores plus NX/XX/CH semantics; the other commands read the score
+// and decode it. Only the Redis 7+ surface — deprecated GEORADIUS* is not
+// implemented and won't be added.
+// ---------------------------------------------------------------------------
+
+async fn handle_geoadd(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 4 {
+        return Err(RustyAntError::WrongArity { command: "GEOADD".into() });
+    }
+    let key = arg_as_string(&args[0])?;
+    let mut flags = ZAddFlags::default();
+    let mut idx = 1;
+    while idx < args.len() {
+        let token = arg_as_str(&args[idx])?;
+        match token.to_ascii_uppercase().as_str() {
+            "NX" => {
+                flags.nx = true;
+                idx += 1;
+            }
+            "XX" => {
+                flags.xx = true;
+                idx += 1;
+            }
+            "CH" => {
+                flags.ch = true;
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+    if flags.nx && flags.xx {
+        return Err(RustyAntError::Parse("XX and NX options at the same time are not compatible".into()));
+    }
+    // Remaining args must be triples: lon lat member [lon lat member ...]
+    let remaining = args.len() - idx;
+    if remaining < 3 || remaining % 3 != 0 {
+        return Err(RustyAntError::WrongArity { command: "GEOADD".into() });
+    }
+    let mut pairs: Vec<(f64, String)> = Vec::with_capacity(remaining / 3);
+    while idx < args.len() {
+        let lon = parse_f64(&args[idx], "longitude")?;
+        let lat = parse_f64(&args[idx + 1], "latitude")?;
+        geo::validate_lon_lat(lon, lat)?;
+        let member = arg_as_string(&args[idx + 2])?;
+        #[allow(clippy::cast_precision_loss)]
+        let score = geo::encode_score(lon, lat) as f64;
+        pairs.push((score, member));
+        idx += 3;
+    }
+    let count = state.storage.zadd_ext(&key, pairs, flags).await?;
+    Ok(RespReply::Integer(count))
+}
+
+async fn handle_geopos(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity { command: "GEOPOS".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let members: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let scores = state.storage.zmscore(key, &members).await?;
+    let replies = scores
+        .into_iter()
+        .map(|s| {
+            s.map_or(RespReply::Nil, |score| {
+                let (lon, lat) = geo::decode_score(geo::score_to_u64(score));
+                RespReply::Array(vec![
+                    RespReply::BulkString(Some(Bytes::from(format_lon_lat(lon)))),
+                    RespReply::BulkString(Some(Bytes::from(format_lon_lat(lat)))),
+                ])
+            })
+        })
+        .collect();
+    Ok(RespReply::Array(replies))
+}
+
+async fn handle_geodist(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if !(3..=4).contains(&args.len()) {
+        return Err(RustyAntError::WrongArity { command: "GEODIST".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let m1 = arg_as_string(&args[1])?;
+    let m2 = arg_as_string(&args[2])?;
+    let unit = args.get(3).map_or(Ok(GeoUnit::Meters), |b| arg_as_str(b).and_then(GeoUnit::parse))?;
+    let scores = state.storage.zmscore(key, &[m1, m2]).await?;
+    let (Some(s1), Some(s2)) = (scores[0], scores[1]) else {
+        return Ok(RespReply::Nil);
+    };
+    let (lon1, lat1) = geo::decode_score(geo::score_to_u64(s1));
+    let (lon2, lat2) = geo::decode_score(geo::score_to_u64(s2));
+    let meters = geo::haversine_meters(lon1, lat1, lon2, lat2);
+    let converted = meters / unit.to_meters();
+    // Redis formats GEODIST replies with four decimal places.
+    Ok(RespReply::BulkString(Some(Bytes::from(format!("{converted:.4}").into_bytes()))))
+}
+
+async fn handle_geohash(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity { command: "GEOHASH".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let members: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let scores = state.storage.zmscore(key, &members).await?;
+    let replies = scores
+        .into_iter()
+        .map(|s| {
+            s.map_or(RespReply::Nil, |score| {
+                RespReply::BulkString(Some(Bytes::from(geo::geohash_string(score).into_bytes())))
+            })
+        })
+        .collect();
+    Ok(RespReply::Array(replies))
+}
+
+/// Redis formats `GEOPOS` coordinates as `%.17Lf` (17 decimal places). The
+/// round-trip through a 26-bit cell means the tail digits reflect the cell
+/// centre; clients that care stringify them back into doubles anyway.
+fn format_lon_lat(v: f64) -> Vec<u8> {
+    format!("{v:.17}").into_bytes()
+}
+
+// ---------------------------------------------------------------------------
 // COMMAND — minimal server introspection for redis-py's discovery path.
 // Scope is `COUNT` / `LIST` / `INFO`; `DOCS` and `GETKEYS` are out of scope
 // because redis-py does not require them.
@@ -2073,6 +2203,12 @@ const COMMAND_META: &[CommandMeta] = &[
     ("punsubscribe", -1, &["pubsub", "loading", "stale", "fast"], 0, 0, 0),
     ("publish", 3, &["pubsub", "loading", "stale", "fast"], 0, 0, 0),
     ("pubsub", -2, &["pubsub", "admin", "loading", "stale"], 0, 0, 0),
+    // Geo commands — layered on ZSET scores. Core 4 (Redis 7+); deprecated
+    // GEORADIUS* family is intentionally not surfaced.
+    ("geoadd", -5, &["write", "denyoom"], 1, 1, 1),
+    ("geopos", -3, &["readonly"], 1, 1, 1),
+    ("geodist", -4, &["readonly"], 1, 1, 1),
+    ("geohash", -3, &["readonly"], 1, 1, 1),
     ("dbsize", 1, &["readonly", "fast"], 0, 0, 0),
     ("flushdb", -1, &["write"], 0, 0, 0),
     ("flushall", -1, &["write"], 0, 0, 0),

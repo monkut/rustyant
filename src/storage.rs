@@ -58,6 +58,22 @@ pub struct KeyspaceStats {
     pub keys_with_expire: i64,
 }
 
+/// Flags controlling a `ZADD`-family insert. Used today by `GEOADD`; Redis
+/// `ZADD` accepts a superset (`GT` / `LT` / `INCR`) which can be wired in
+/// later without breaking the storage surface.
+///
+/// Mutual exclusions are validated at the command layer — `nx` and `xx`
+/// cannot both be set; the storage impl trusts the caller.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZAddFlags {
+    /// `NX`: only insert new members; leave existing scores alone.
+    pub nx: bool,
+    /// `XX`: only update existing members; refuse to add new ones.
+    pub xx: bool,
+    /// `CH`: count (added + score-changed) rather than just newly added.
+    pub ch: bool,
+}
+
 /// Score-bound for `ZRANGEBYSCORE` matching Redis's syntax: bare number is
 /// inclusive, `(N` is exclusive, `+inf` / `-inf` are the extremes.
 #[derive(Debug, Clone, Copy)]
@@ -634,6 +650,9 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     ) -> Result<(u64, Vec<String>), RustyAntError>;
 
     async fn zadd(&self, key: &str, pairs: Vec<(f64, String)>) -> Result<i64, RustyAntError>;
+    /// `ZADD`-with-flags variant used by `GEOADD`. Returns newly-added count
+    /// by default, or `added + updated` when `flags.ch` is set.
+    async fn zadd_ext(&self, key: &str, pairs: Vec<(f64, String)>, flags: ZAddFlags) -> Result<i64, RustyAntError>;
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
     async fn zincr_by(&self, key: &str, member: &str, delta: f64) -> Result<f64, RustyAntError>;
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError>;
@@ -1320,6 +1339,46 @@ impl Storage for S3Storage {
             }
             let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
             Ok(CasAction::Write(new_entry, added))
+        })
+        .await
+    }
+
+    async fn zadd_ext(&self, key: &str, pairs: Vec<(f64, String)>, flags: ZAddFlags) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            let mut added: i64 = 0;
+            let mut updated: i64 = 0;
+            for (score, member) in &pairs {
+                if let Some(prev) = map.get(member).copied() {
+                    if flags.nx {
+                        continue;
+                    }
+                    // Redis counts a score-equality no-op as unchanged even
+                    // under CH, so compare bit-for-bit before bumping.
+                    if prev.to_bits() != score.to_bits() {
+                        map.insert(member.clone(), *score);
+                        updated += 1;
+                    }
+                } else {
+                    if flags.xx {
+                        continue;
+                    }
+                    map.insert(member.clone(), *score);
+                    added += 1;
+                }
+            }
+            let count = if flags.ch { added + updated } else { added };
+            // Nothing touched the map — avoid gratuitously writing or, worse,
+            // materializing an empty ZSet for a never-existed key under XX.
+            if added == 0 && updated == 0 {
+                return Ok(CasAction::NoOp(count));
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
+            Ok(CasAction::Write(new_entry, count))
         })
         .await
     }
