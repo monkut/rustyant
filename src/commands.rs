@@ -140,6 +140,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "GEOPOS" => handle_geopos(state, args).await,
         "GEODIST" => handle_geodist(state, args).await,
         "GEOHASH" => handle_geohash(state, args).await,
+        "GEOSEARCH" => handle_geosearch(state, args).await,
+        "GEOSEARCHSTORE" => handle_geosearchstore(state, args).await,
         "DBSIZE" => handle_dbsize(state, args).await,
         "FLUSHDB" | "FLUSHALL" => handle_flushall(state, args, &cmd).await,
         "RANDOMKEY" => handle_randomkey(state, args).await,
@@ -2156,6 +2158,284 @@ fn format_lon_lat(v: f64) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// GEOSEARCH / GEOSEARCHSTORE — spatial search over a geo-populated ZSET.
+//
+// The implementation is a linear scan: load every `(member, score)` pair,
+// decode to `(lon, lat)`, filter by the requested circle or box, then
+// optionally sort by distance and limit. Redis accelerates this with a
+// geohash prefix walk; rustyant loads the whole ZSET in one S3 object per
+// request regardless, so the walk wouldn't change the cost profile and
+// would add significant code.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum GeoSort {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone)]
+enum GeoCentre {
+    Member(String),
+    LonLat(f64, f64),
+}
+
+#[derive(Debug, Copy, Clone)]
+enum GeoShape {
+    Radius(f64),            // metres
+    Box { w: f64, h: f64 }, // metres
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // mirrors Redis's flag layout
+struct GeoSearchOpts {
+    centre: GeoCentre,
+    shape: GeoShape,
+    unit: GeoUnit,
+    sort: Option<GeoSort>,
+    count: Option<(usize, bool)>, // (count, any)
+    with_coord: bool,
+    with_dist: bool,
+    with_hash: bool,
+    store_dist: bool, // GEOSEARCHSTORE only
+}
+
+#[derive(Debug, Clone)]
+struct GeoMatch {
+    member: String,
+    score: f64,
+    lon: f64,
+    lat: f64,
+    distance_m: f64,
+}
+
+async fn handle_geosearch(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    // Minimum: key + FROMMEMBER m + BYRADIUS n unit = 6 tokens.
+    if args.len() < 6 {
+        return Err(RustyAntError::WrongArity { command: "GEOSEARCH".into() });
+    }
+    let key = arg_as_string(&args[0])?;
+    let opts = parse_geosearch_opts(&args[1..], false)?;
+    let matches = run_geo_search(state, &key, &opts).await?;
+    Ok(format_geosearch_reply(&matches, &opts))
+}
+
+async fn handle_geosearchstore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    // Minimum: dst + src + FROMMEMBER m + BYRADIUS n unit = 7 tokens.
+    if args.len() < 7 {
+        return Err(RustyAntError::WrongArity { command: "GEOSEARCHSTORE".into() });
+    }
+    let destination = arg_as_string(&args[0])?;
+    let source = arg_as_string(&args[1])?;
+    let opts = parse_geosearch_opts(&args[2..], true)?;
+    let matches = run_geo_search(state, &source, &opts).await?;
+    // Redis overwrites the destination unconditionally (no WRONGTYPE check).
+    state.storage.delete(&destination).await?;
+    if matches.is_empty() {
+        return Ok(RespReply::Integer(0));
+    }
+    let pairs: Vec<(f64, String)> = matches
+        .iter()
+        .map(|m| {
+            let score = if opts.store_dist { m.distance_m / opts.unit.to_meters() } else { m.score };
+            (score, m.member.clone())
+        })
+        .collect();
+    let _ = state.storage.zadd(&destination, pairs).await?;
+    Ok(RespReply::Integer(i64::try_from(matches.len()).unwrap_or(i64::MAX)))
+}
+
+fn parse_geosearch_opts(args: &[Bytes], is_store: bool) -> Result<GeoSearchOpts, RustyAntError> {
+    let mut centre: Option<GeoCentre> = None;
+    let mut shape: Option<(GeoShape, GeoUnit)> = None;
+    let mut sort: Option<GeoSort> = None;
+    let mut count: Option<(usize, bool)> = None;
+    let mut with_coord = false;
+    let mut with_dist = false;
+    let mut with_hash = false;
+    let mut store_dist = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let token = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match token.as_str() {
+            "FROMMEMBER" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("FROMMEMBER requires a member".into()));
+                }
+                centre = Some(GeoCentre::Member(arg_as_string(&args[i + 1])?));
+                i += 2;
+            }
+            "FROMLONLAT" => {
+                if i + 2 >= args.len() {
+                    return Err(RustyAntError::Parse("FROMLONLAT requires lon and lat".into()));
+                }
+                let lon = parse_f64(&args[i + 1], "longitude")?;
+                let lat = parse_f64(&args[i + 2], "latitude")?;
+                geo::validate_lon_lat(lon, lat)?;
+                centre = Some(GeoCentre::LonLat(lon, lat));
+                i += 3;
+            }
+            "BYRADIUS" => {
+                if i + 2 >= args.len() {
+                    return Err(RustyAntError::Parse("BYRADIUS requires radius and unit".into()));
+                }
+                let radius = parse_f64(&args[i + 1], "radius")?;
+                if !radius.is_finite() || radius < 0.0 {
+                    return Err(RustyAntError::Parse("radius must be a non-negative number".into()));
+                }
+                let unit = GeoUnit::parse(arg_as_str(&args[i + 2])?)?;
+                shape = Some((GeoShape::Radius(radius * unit.to_meters()), unit));
+                i += 3;
+            }
+            "BYBOX" => {
+                if i + 3 >= args.len() {
+                    return Err(RustyAntError::Parse("BYBOX requires width, height and unit".into()));
+                }
+                let w = parse_f64(&args[i + 1], "width")?;
+                let h = parse_f64(&args[i + 2], "height")?;
+                if !w.is_finite() || !h.is_finite() || w < 0.0 || h < 0.0 {
+                    return Err(RustyAntError::Parse("BYBOX width and height must be non-negative".into()));
+                }
+                let unit = GeoUnit::parse(arg_as_str(&args[i + 3])?)?;
+                let m = unit.to_meters();
+                shape = Some((GeoShape::Box { w: w * m, h: h * m }, unit));
+                i += 4;
+            }
+            "ASC" => {
+                sort = Some(GeoSort::Asc);
+                i += 1;
+            }
+            "DESC" => {
+                sort = Some(GeoSort::Desc);
+                i += 1;
+            }
+            "COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("COUNT requires a value".into()));
+                }
+                let n = parse_i64(&args[i + 1], "COUNT")?;
+                if n <= 0 {
+                    return Err(RustyAntError::Parse("COUNT must be positive".into()));
+                }
+                let count_val = usize::try_from(n).unwrap_or(usize::MAX);
+                // Optional trailing ANY keyword.
+                let any = i + 2 < args.len() && arg_as_str(&args[i + 2]).is_ok_and(|s| s.eq_ignore_ascii_case("ANY"));
+                count = Some((count_val, any));
+                i += if any { 3 } else { 2 };
+            }
+            "WITHCOORD" if !is_store => {
+                with_coord = true;
+                i += 1;
+            }
+            "WITHDIST" if !is_store => {
+                with_dist = true;
+                i += 1;
+            }
+            "WITHHASH" if !is_store => {
+                with_hash = true;
+                i += 1;
+            }
+            "STOREDIST" if is_store => {
+                store_dist = true;
+                i += 1;
+            }
+            other => return Err(RustyAntError::Parse(format!("unsupported GEOSEARCH option: {other}"))),
+        }
+    }
+
+    let centre =
+        centre.ok_or_else(|| RustyAntError::Parse("exactly one of FROMMEMBER | FROMLONLAT is required".into()))?;
+    let (shape, unit) =
+        shape.ok_or_else(|| RustyAntError::Parse("exactly one of BYRADIUS | BYBOX is required".into()))?;
+    Ok(GeoSearchOpts { centre, shape, unit, sort, count, with_coord, with_dist, with_hash, store_dist })
+}
+
+async fn run_geo_search(state: &State, key: &str, opts: &GeoSearchOpts) -> Result<Vec<GeoMatch>, RustyAntError> {
+    // Resolve the search centre. FROMMEMBER must exist in the source ZSET;
+    // a missing member is an explicit error to match Redis.
+    let (centre_lon, centre_lat) = match &opts.centre {
+        GeoCentre::LonLat(lon, lat) => (*lon, *lat),
+        GeoCentre::Member(m) => {
+            let score = state.storage.zscore(key, m).await?;
+            let score =
+                score.ok_or_else(|| RustyAntError::Parse(format!("could not decode requested zset member '{m}'")))?;
+            geo::decode_score(geo::score_to_u64(score))
+        }
+    };
+    let items = state.storage.zitems(key).await?;
+    let mut matches: Vec<GeoMatch> = Vec::with_capacity(items.len());
+    for (member, score) in items {
+        let (lon, lat) = geo::decode_score(geo::score_to_u64(score));
+        let distance_m = match opts.shape {
+            GeoShape::Radius(r) => {
+                let d = geo::haversine_meters(centre_lon, centre_lat, lon, lat);
+                if d > r {
+                    continue;
+                }
+                d
+            }
+            GeoShape::Box { w, h } => match geo::point_in_box(centre_lon, centre_lat, w, h, lon, lat) {
+                Some(d) => d,
+                None => continue,
+            },
+        };
+        matches.push(GeoMatch { member, score, lon, lat, distance_m });
+    }
+
+    // Sort (unless ANY mode with a COUNT limit, which may skip ordering
+    // precision — rustyant still sorts for determinism; the ANY flag is
+    // parsed and documented as advisory).
+    match opts.sort {
+        Some(GeoSort::Asc) => {
+            matches.sort_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        Some(GeoSort::Desc) => {
+            matches.sort_by(|a, b| b.distance_m.partial_cmp(&a.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        None => {}
+    }
+    if let Some((n, _any)) = opts.count {
+        matches.truncate(n);
+    }
+    Ok(matches)
+}
+
+fn format_geosearch_reply(matches: &[GeoMatch], opts: &GeoSearchOpts) -> RespReply {
+    let augmented = opts.with_coord || opts.with_dist || opts.with_hash;
+    if !augmented {
+        return RespReply::Array(
+            matches.iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.member.clone().into_bytes())))).collect(),
+        );
+    }
+    let unit_div = opts.unit.to_meters();
+    let entries = matches
+        .iter()
+        .map(|m| {
+            let mut parts = Vec::with_capacity(4);
+            parts.push(RespReply::BulkString(Some(Bytes::from(m.member.clone().into_bytes()))));
+            if opts.with_dist {
+                let d = m.distance_m / unit_div;
+                parts.push(RespReply::BulkString(Some(Bytes::from(format!("{d:.4}").into_bytes()))));
+            }
+            if opts.with_hash {
+                #[allow(clippy::cast_possible_wrap)]
+                let hash_i = geo::score_to_u64(m.score) as i64;
+                parts.push(RespReply::Integer(hash_i));
+            }
+            if opts.with_coord {
+                parts.push(RespReply::Array(vec![
+                    RespReply::BulkString(Some(Bytes::from(format_lon_lat(m.lon)))),
+                    RespReply::BulkString(Some(Bytes::from(format_lon_lat(m.lat)))),
+                ]));
+            }
+            RespReply::Array(parts)
+        })
+        .collect();
+    RespReply::Array(entries)
+}
+
+// ---------------------------------------------------------------------------
 // COMMAND — minimal server introspection for redis-py's discovery path.
 // Scope is `COUNT` / `LIST` / `INFO`; `DOCS` and `GETKEYS` are out of scope
 // because redis-py does not require them.
@@ -2209,6 +2489,8 @@ const COMMAND_META: &[CommandMeta] = &[
     ("geopos", -3, &["readonly"], 1, 1, 1),
     ("geodist", -4, &["readonly"], 1, 1, 1),
     ("geohash", -3, &["readonly"], 1, 1, 1),
+    ("geosearch", -7, &["readonly"], 1, 1, 1),
+    ("geosearchstore", -8, &["write", "denyoom"], 1, 2, 1),
     ("dbsize", 1, &["readonly", "fast"], 0, 0, 0),
     ("flushdb", -1, &["write"], 0, 0, 0),
     ("flushall", -1, &["write"], 0, 0, 0),

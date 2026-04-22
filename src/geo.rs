@@ -178,6 +178,30 @@ pub fn haversine_meters(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     EARTH_RADIUS_M * c
 }
 
+/// Redis-compatible "is the point inside this lat-aligned box" check.
+///
+/// Returns the Haversine distance from centre to point in metres when the
+/// point is inside the box, `None` otherwise. Redis projects axis distances
+/// independently: it measures lat-axis distance (`|Δlat|`) and lon-axis
+/// distance (`|Δlon|` at the centre's latitude) via Haversine and compares
+/// each against half the box dimension. This avoids flat-Earth distortion
+/// that a naïve degree-based rectangle would introduce at high latitudes.
+pub fn point_in_box(
+    centre_lon: f64,
+    centre_lat: f64,
+    width_m: f64,
+    height_m: f64,
+    point_lon: f64,
+    point_lat: f64,
+) -> Option<f64> {
+    let lat_distance = haversine_meters(0.0, centre_lat, 0.0, point_lat);
+    let lon_distance = haversine_meters(centre_lon, centre_lat, point_lon, centre_lat);
+    if lat_distance > height_m / 2.0 || lon_distance > width_m / 2.0 {
+        return None;
+    }
+    Some(haversine_meters(centre_lon, centre_lat, point_lon, point_lat))
+}
+
 #[cfg(test)]
 #[allow(clippy::unreadable_literal, clippy::inconsistent_digit_grouping, clippy::cast_precision_loss)]
 mod tests {
@@ -256,5 +280,24 @@ mod tests {
         assert!((GeoUnit::Kilometers.to_meters() - 1000.0).abs() < 1e-9);
         assert!((GeoUnit::Miles.to_meters() - 1609.344).abs() < 1e-9);
         assert!((GeoUnit::Feet.to_meters() - 0.3048).abs() < 1e-9);
+    }
+
+    #[test]
+    fn point_in_box_accepts_palermo_inside_wide_box_around_catania() {
+        let (clon, clat) = CATANIA;
+        let (plon, plat) = PALERMO;
+        // 400 km wide, 200 km tall — Palermo (~166 km west, ~60 km north)
+        // sits comfortably inside.
+        let d = point_in_box(clon, clat, 400_000.0, 200_000.0, plon, plat);
+        assert!(d.is_some(), "palermo should fall inside a 400×200 km box around catania");
+    }
+
+    #[test]
+    fn point_in_box_rejects_palermo_outside_narrow_box_around_catania() {
+        let (clon, clat) = CATANIA;
+        let (plon, plat) = PALERMO;
+        // 10 km wide × 10 km tall — Palermo is ~166 km away and should miss.
+        let d = point_in_box(clon, clat, 10_000.0, 10_000.0, plon, plat);
+        assert!(d.is_none(), "palermo should NOT fall inside a 10×10 km box around catania");
     }
 }

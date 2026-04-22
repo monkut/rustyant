@@ -653,6 +653,11 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// `ZADD`-with-flags variant used by `GEOADD`. Returns newly-added count
     /// by default, or `added + updated` when `flags.ch` is set.
     async fn zadd_ext(&self, key: &str, pairs: Vec<(f64, String)>, flags: ZAddFlags) -> Result<i64, RustyAntError>;
+    /// Return every `(member, score)` pair in the ZSET at `key`, unsorted.
+    /// `GEOSEARCH` uses this to scan the whole collection in one pass; on S3
+    /// the ZSET is a single object so one call materializes the full set
+    /// regardless.
+    async fn zitems(&self, key: &str) -> Result<Vec<(String, f64)>, RustyAntError>;
     async fn zrem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError>;
     async fn zincr_by(&self, key: &str, member: &str, delta: f64) -> Result<f64, RustyAntError>;
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError>;
@@ -1381,6 +1386,14 @@ impl Storage for S3Storage {
             Ok(CasAction::Write(new_entry, count))
         })
         .await
+    }
+
+    async fn zitems(&self, key: &str) -> Result<Vec<(String, f64)>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(m.into_iter().collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
     }
 
     async fn zrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<String>, RustyAntError> {
