@@ -2200,30 +2200,36 @@ async fn handle_debug(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
 }
 
 // ---------------------------------------------------------------------------
-// MULTI / EXEC / DISCARD / WATCH / UNWATCH — transaction surface.
+// Transport-gated commands (MULTI / WATCH / SUBSCRIBE / PSUBSCRIBE /
+// UNSUBSCRIBE / PUNSUBSCRIBE) share one policy and one error message: rustyant
+// dispatches one command per request with no cross-request connection state
+// and no server-initiated push, so any command that needs either (transaction
+// queueing, optimistic CAS, long-lived subscriber channel) must error
+// explicitly rather than silently return +OK and leave the client hung.
 //
-// rustyant runs one command per HTTP request and holds no connection-level
-// state between requests, so MULTI / EXEC queueing and WATCH's optimistic
-// CAS cannot be honored. The policy (carried over from AUTH/LATENCY/DEBUG)
-// is "error explicitly where a lie would hide real misbehavior":
+// EXEC / DISCARD keep Redis's canonical `EXEC without MULTI` / `DISCARD
+// without MULTI` replies — returning the shape real Redis returns is positive
+// compat signal for clients that probe the error string.
 //
-//   - MULTI     → explicit error. Accepting it silently and then failing at
-//                 EXEC would break any client expecting atomic batching.
-//   - EXEC      → Redis's standard `EXEC without MULTI` error, since MULTI
-//                 can never have succeeded.
-//   - DISCARD   → Redis's standard `DISCARD without MULTI` error, same
-//                 reasoning as EXEC.
-//   - WATCH     → explicit error. Returning +OK would claim optimistic CAS
-//                 semantics we cannot provide.
-//   - UNWATCH   → +OK. "Clear watched keys" is a no-op when none exist; no
-//                 contract is violated by quietly succeeding.
+// UNWATCH / PUBLISH / PUBSUB are honest no-ops, not errors: clearing an empty
+// watch set is trivially successful; `:0` subscribers is literally the truth
+// on a no-substrate server; empty/zero replies for PUBSUB introspection let
+// monitoring tools confirm a redis-shaped server without lying.
 // ---------------------------------------------------------------------------
+
+/// Shared error for commands rustyant cannot honestly satisfy given its
+/// one-command-per-request transport (no connection-level state, no
+/// server-initiated push). Consolidated so all six call sites carry the same
+/// policy statement rather than six near-duplicate sentences.
+fn not_supported_on_this_transport(cmd: &str) -> RustyAntError {
+    RustyAntError::Parse(format!(
+        "{cmd} is not supported on rustyant: requires connection-level state or server-initiated push, which rustyant's one-command-per-request transport does not provide"
+    ))
+}
 
 fn handle_multi(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     arity("MULTI", args.is_empty())?;
-    Err(RustyAntError::Parse(
-        "MULTI/EXEC transactions are not supported on rustyant (stateless HTTP/Lambda — no cross-request state for command queueing)".into(),
-    ))
+    Err(not_supported_on_this_transport("MULTI"))
 }
 
 fn handle_exec(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
@@ -2240,68 +2246,35 @@ fn handle_watch(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     // Redis requires at least one key; enforce arity before rejecting so a
     // malformed `WATCH` still surfaces as a clearer "wrong arity" error.
     arity("WATCH", !args.is_empty())?;
-    Err(RustyAntError::Parse(
-        "WATCH is not supported on rustyant (no connection-level state to tie a WATCH to a subsequent EXEC)".into(),
-    ))
+    Err(not_supported_on_this_transport("WATCH"))
 }
 
 fn handle_unwatch(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     arity("UNWATCH", args.is_empty())?;
-    // No watched keys can ever exist (WATCH errors out), so "clear all
-    // watched keys" is a trivially-successful no-op. Matches Redis's
-    // behavior when UNWATCH is called outside a transaction.
+    // Matches real Redis's "UNWATCH outside MULTI" behavior — trivially-
+    // successful no-op when no keys are watched.
     Ok(RespReply::ok())
 }
 
-// ---------------------------------------------------------------------------
-// SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBLISH / PUBSUB
-//
-// Pub/sub needs two things rustyant cannot offer: a long-lived push channel
-// to each subscriber, and a cross-connection broker. HTTP-over-Lambda has
-// neither — every request is a one-shot invocation with no peer to push
-// server-initiated frames to. Following the same policy as MULTI/WATCH:
-//
-//   - SUBSCRIBE / PSUBSCRIBE / UNSUBSCRIBE / PUNSUBSCRIBE → explicit error.
-//     These commands only make sense inside a subscribed session; returning
-//     a +OK shape would fool client libraries into entering push-read mode
-//     on a connection that will never deliver a message.
-//   - PUBLISH → `:0`. Real Redis returns the number of clients that received
-//     the message; rustyant has zero subscribers by construction, so `:0` is
-//     literally correct and matches what Redis returns on an idle server.
-//   - PUBSUB CHANNELS → empty array. No active channels exist.
-//   - PUBSUB NUMSUB → `(channel, :0)` pairs for each requested channel.
-//   - PUBSUB NUMPAT → `:0`. No pattern subscriptions exist.
-// ---------------------------------------------------------------------------
-
 fn handle_subscribe(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     arity("SUBSCRIBE", !args.is_empty())?;
-    Err(RustyAntError::Parse(
-        "SUBSCRIBE is not supported on rustyant (stateless HTTP/Lambda — no long-lived push channel to a subscriber)"
-            .into(),
-    ))
+    Err(not_supported_on_this_transport("SUBSCRIBE"))
 }
 
 fn handle_psubscribe(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     arity("PSUBSCRIBE", !args.is_empty())?;
-    Err(RustyAntError::Parse(
-        "PSUBSCRIBE is not supported on rustyant (stateless HTTP/Lambda — no long-lived push channel to a subscriber)"
-            .into(),
-    ))
+    Err(not_supported_on_this_transport("PSUBSCRIBE"))
 }
 
 fn handle_unsubscribe(_args: &[Bytes]) -> Result<RespReply, RustyAntError> {
-    // Redis allows UNSUBSCRIBE with zero args ("unsubscribe from all"), so
-    // no arity check — but we still error because the command only makes
-    // sense inside a subscribed session we never enter.
-    Err(RustyAntError::Parse(
-        "UNSUBSCRIBE is not supported on rustyant (subscribe surface is stubbed; see SUBSCRIBE)".into(),
-    ))
+    // Redis allows UNSUBSCRIBE with zero args ("unsubscribe from all"); we
+    // still error because the command only makes sense inside a subscribed
+    // session rustyant never enters.
+    Err(not_supported_on_this_transport("UNSUBSCRIBE"))
 }
 
 fn handle_punsubscribe(_args: &[Bytes]) -> Result<RespReply, RustyAntError> {
-    Err(RustyAntError::Parse(
-        "PUNSUBSCRIBE is not supported on rustyant (subscribe surface is stubbed; see PSUBSCRIBE)".into(),
-    ))
+    Err(not_supported_on_this_transport("PUNSUBSCRIBE"))
 }
 
 fn handle_publish(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
