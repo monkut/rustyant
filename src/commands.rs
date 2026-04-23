@@ -110,6 +110,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
             arity("QUIT", args.is_empty())?;
             Ok(RespReply::ok())
         }
+        "SELECT" => handle_select(&args),
         "AUTH" => handle_auth(&args),
         "WAIT" => handle_wait(&args),
         "SAVE" => {
@@ -2492,6 +2493,18 @@ fn handle_client(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
 fn handle_auth(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     arity("AUTH", matches!(args.len(), 1 | 2))?;
     Ok(RespReply::ok())
+}
+
+/// Redis `SELECT index`.
+///
+/// rustyant is single-namespace by construction (one S3 prefix, `CONFIG GET
+/// databases` reports `1`). `SELECT 0` succeeds so clients that probe for
+/// db 0 on connection setup stay quiet; any other index errors with Redis's
+/// standard out-of-range message.
+fn handle_select(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    arity("SELECT", args.len() == 1)?;
+    let idx = parse_i64(&args[0], "DB index")?;
+    if idx == 0 { Ok(RespReply::ok()) } else { Err(RustyAntError::Parse("DB index is out of range".into())) }
 }
 
 /// Redis `WAIT numreplicas timeout`.

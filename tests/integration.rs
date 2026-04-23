@@ -133,6 +133,25 @@ async fn quit_rejects_args() {
 }
 
 #[tokio::test]
+async fn select_zero_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"SELECT", b"0"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn select_non_zero_errors() {
+    let state = test_state();
+    call(&state, &[b"SELECT", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn select_non_numeric_errors() {
+    let state = test_state();
+    call(&state, &[b"SELECT", b"abc"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"SELECT"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn malformed_body_returns_parse_error() {
     let state = test_state();
     let resp = handle(
