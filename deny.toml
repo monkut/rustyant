@@ -25,6 +25,7 @@ ignore = [
   "RUSTSEC-2026-0009", # time crate — stack-exhaustion DoS
   "RUSTSEC-2026-0098", # rustls-webpki 0.101.x URI name constraints
   "RUSTSEC-2026-0099", # rustls-webpki 0.101.x wildcard name constraints
+  "RUSTSEC-2026-0002", # lru 0.12.5 IterMut unsound — pinned by aws-sdk-s3; fixed in lru 0.13+
 ]
 
 [licenses]
