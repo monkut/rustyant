@@ -106,6 +106,10 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HELLO" => handle_hello(&args),
         "CLIENT" => handle_client(&args),
         "RESET" => Ok(RespReply::SimpleString("RESET".into())),
+        "QUIT" => {
+            arity("QUIT", args.is_empty())?;
+            Ok(RespReply::ok())
+        }
         "AUTH" => handle_auth(&args),
         "WAIT" => handle_wait(&args),
         "SAVE" => {
