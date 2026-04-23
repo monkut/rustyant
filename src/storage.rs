@@ -58,18 +58,25 @@ pub struct KeyspaceStats {
     pub keys_with_expire: i64,
 }
 
-/// Flags controlling a `ZADD`-family insert. Used today by `GEOADD`; Redis
-/// `ZADD` accepts a superset (`GT` / `LT` / `INCR`) which can be wired in
-/// later without breaking the storage surface.
+/// Flags controlling a `ZADD`-family insert.
 ///
-/// Mutual exclusions are validated at the command layer — `nx` and `xx`
-/// cannot both be set; the storage impl trusts the caller.
+/// `INCR` is not a flag here because it changes the return type (new score
+/// vs. count) — commands dispatch to `zadd_ext_incr` instead. Mutual
+/// exclusions (`nx` with `xx` / `gt` / `lt`; `gt` with `lt`) are validated at
+/// the command layer — the storage impl trusts the caller.
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_excessive_bools)] // mirrors Redis's ZADD flag layout 1:1
 pub struct ZAddFlags {
     /// `NX`: only insert new members; leave existing scores alone.
     pub nx: bool,
     /// `XX`: only update existing members; refuse to add new ones.
     pub xx: bool,
+    /// `GT`: only update if the new score is strictly greater than the old.
+    /// New members (no old score) are still added.
+    pub gt: bool,
+    /// `LT`: only update if the new score is strictly less than the old.
+    /// New members (no old score) are still added.
+    pub lt: bool,
     /// `CH`: count (added + score-changed) rather than just newly added.
     pub ch: bool,
 }
@@ -650,9 +657,22 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     ) -> Result<(u64, Vec<String>), RustyAntError>;
 
     async fn zadd(&self, key: &str, pairs: Vec<(f64, String)>) -> Result<i64, RustyAntError>;
-    /// `ZADD`-with-flags variant used by `GEOADD`. Returns newly-added count
-    /// by default, or `added + updated` when `flags.ch` is set.
+    /// `ZADD`-with-flags variant. Honours `NX` / `XX` / `GT` / `LT` / `CH`;
+    /// see `ZAddFlags`. Returns newly-added count by default, or
+    /// `added + updated` when `flags.ch` is set. Used by `GEOADD` and by
+    /// `ZADD` itself when the command carries any of these flags.
     async fn zadd_ext(&self, key: &str, pairs: Vec<(f64, String)>, flags: ZAddFlags) -> Result<i64, RustyAntError>;
+    /// `ZADD INCR` variant: add `delta` to `member`'s score (creating the
+    /// member with score = `delta` if absent), honouring `NX` / `XX` / `GT`
+    /// / `LT`. Returns the new score, or `None` when a flag suppressed the
+    /// update.
+    async fn zadd_ext_incr(
+        &self,
+        key: &str,
+        delta: f64,
+        member: &str,
+        flags: ZAddFlags,
+    ) -> Result<Option<f64>, RustyAntError>;
     /// Return every `(member, score)` pair in the ZSET at `key`, unsorted.
     /// `GEOSEARCH` uses this to scan the whole collection in one pass; on S3
     /// the ZSET is a single object so one call materializes the full set
@@ -1362,6 +1382,12 @@ impl Storage for S3Storage {
                     if flags.nx {
                         continue;
                     }
+                    if flags.gt && *score <= prev {
+                        continue;
+                    }
+                    if flags.lt && *score >= prev {
+                        continue;
+                    }
                     // Redis counts a score-equality no-op as unchanged even
                     // under CH, so compare bit-for-bit before bumping.
                     if prev.to_bits() != score.to_bits() {
@@ -1372,6 +1398,8 @@ impl Storage for S3Storage {
                     if flags.xx {
                         continue;
                     }
+                    // GT / LT don't block fresh inserts — there's no previous
+                    // score to compare against, so Redis adds unconditionally.
                     map.insert(member.clone(), *score);
                     added += 1;
                 }
@@ -1384,6 +1412,50 @@ impl Storage for S3Storage {
             }
             let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
             Ok(CasAction::Write(new_entry, count))
+        })
+        .await
+    }
+
+    async fn zadd_ext_incr(
+        &self,
+        key: &str,
+        delta: f64,
+        member: &str,
+        flags: ZAddFlags,
+    ) -> Result<Option<f64>, RustyAntError> {
+        let member_owned = member.to_string();
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            let new_score = if let Some(prev) = map.get(&member_owned).copied() {
+                if flags.nx {
+                    return Ok(CasAction::NoOp(None));
+                }
+                let candidate = prev + delta;
+                if candidate.is_nan() {
+                    return Err(RustyAntError::Parse("resulting score is not a number (NaN)".into()));
+                }
+                if flags.gt && candidate <= prev {
+                    return Ok(CasAction::NoOp(None));
+                }
+                if flags.lt && candidate >= prev {
+                    return Ok(CasAction::NoOp(None));
+                }
+                map.insert(member_owned.clone(), candidate);
+                candidate
+            } else {
+                if flags.xx {
+                    return Ok(CasAction::NoOp(None));
+                }
+                // Fresh insert; GT / LT don't block it (no prior score).
+                map.insert(member_owned.clone(), delta);
+                delta
+            };
+            let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(map) };
+            Ok(CasAction::Write(new_entry, Some(new_score)))
         })
         .await
     }

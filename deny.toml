@@ -25,6 +25,8 @@ ignore = [
   "RUSTSEC-2026-0009", # time crate — stack-exhaustion DoS
   "RUSTSEC-2026-0098", # rustls-webpki 0.101.x URI name constraints
   "RUSTSEC-2026-0099", # rustls-webpki 0.101.x wildcard name constraints
+  "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 CRL-parsing panic — same aws-smithy-http-client/rustls 0.21 path as 0098/0099; the 0.103 tree in the same lockfile is already on the fixed 0.103.13
+  "RUSTSEC-2026-0002", # lru 0.12.5 IterMut unsound — pinned by aws-sdk-s3; fixed in lru 0.13+
 ]
 
 [licenses]

@@ -528,6 +528,156 @@ async fn zadd_odd_args_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// ZADD flag extensions — NX / XX / GT / LT / CH / INCR
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn zadd_nx_does_not_update_existing_member() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-nx", b"1", b"a"]).await.expect_integer(1);
+    // NX: existing member is untouched; no new added → 0.
+    call(&state, &[b"ZADD", b"z-nx", b"NX", b"9", b"a"]).await.expect_integer(0);
+    // Score remains 1.
+    let reply = call(&state, &[b"ZSCORE", b"z-nx", b"a"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains('1'), "score should still be 1:\n{s}");
+}
+
+#[tokio::test]
+async fn zadd_xx_refuses_to_create_new_member() {
+    let state = test_state();
+    // Empty key; XX should refuse to create it.
+    call(&state, &[b"ZADD", b"z-xx", b"XX", b"1", b"a"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"z-xx"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zadd_gt_only_updates_when_new_score_is_higher() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-gt", b"5", b"a"]).await.expect_integer(1);
+    // 3 is lower — update suppressed.
+    call(&state, &[b"ZADD", b"z-gt", b"GT", b"CH", b"3", b"a"]).await.expect_integer(0);
+    // 10 is higher — update passes.
+    call(&state, &[b"ZADD", b"z-gt", b"GT", b"CH", b"10", b"a"]).await.expect_integer(1);
+    // GT doesn't block fresh inserts.
+    call(&state, &[b"ZADD", b"z-gt", b"GT", b"1", b"new"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn zadd_lt_only_updates_when_new_score_is_lower() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-lt", b"5", b"a"]).await.expect_integer(1);
+    // 10 is higher — suppressed.
+    call(&state, &[b"ZADD", b"z-lt", b"LT", b"CH", b"10", b"a"]).await.expect_integer(0);
+    // 3 is lower — passes.
+    call(&state, &[b"ZADD", b"z-lt", b"LT", b"CH", b"3", b"a"]).await.expect_integer(1);
+    // LT doesn't block fresh inserts.
+    call(&state, &[b"ZADD", b"z-lt", b"LT", b"100", b"new"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn zadd_rejects_gt_and_lt_together() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-mutex", b"GT", b"LT", b"1", b"a"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zadd_rejects_nx_with_gt_or_lt() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-mutex2", b"NX", b"GT", b"1", b"a"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZADD", b"z-mutex3", b"NX", b"LT", b"1", b"a"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zadd_rejects_nx_with_xx() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-mutex4", b"NX", b"XX", b"1", b"a"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zadd_incr_on_missing_member_sets_score_to_delta() {
+    let state = test_state();
+    let reply = call(&state, &[b"ZADD", b"z-incr", b"INCR", b"5", b"a"]).await;
+    reply.expect_bulk(b"5");
+}
+
+#[tokio::test]
+async fn zadd_incr_on_existing_member_adds_to_score() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-incr2", b"5", b"a"]).await.expect_integer(1);
+    let reply = call(&state, &[b"ZADD", b"z-incr2", b"INCR", b"3", b"a"]).await;
+    reply.expect_bulk(b"8");
+}
+
+#[tokio::test]
+async fn zadd_incr_nx_on_existing_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-incr-nx", b"5", b"a"]).await.expect_integer(1);
+    let reply = call(&state, &[b"ZADD", b"z-incr-nx", b"NX", b"INCR", b"3", b"a"]).await;
+    reply.expect_nil();
+    // Score untouched.
+    let reply = call(&state, &[b"ZSCORE", b"z-incr-nx", b"a"]).await;
+    let s = String::from_utf8_lossy(&reply.raw);
+    assert!(s.contains('5'), "score should still be 5:\n{s}");
+}
+
+#[tokio::test]
+async fn zadd_incr_xx_on_missing_returns_nil() {
+    let state = test_state();
+    let reply = call(&state, &[b"ZADD", b"z-incr-xx", b"XX", b"INCR", b"3", b"a"]).await;
+    reply.expect_nil();
+    call(&state, &[b"EXISTS", b"z-incr-xx"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zadd_incr_gt_suppresses_decrement() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-incr-gt", b"5", b"a"]).await.expect_integer(1);
+    // +(-2) = 3 which is < 5 → GT suppresses.
+    let reply = call(&state, &[b"ZADD", b"z-incr-gt", b"GT", b"INCR", b"-2", b"a"]).await;
+    reply.expect_nil();
+    // +2 = 7 which is > 5 → GT passes.
+    let reply = call(&state, &[b"ZADD", b"z-incr-gt", b"GT", b"INCR", b"2", b"a"]).await;
+    reply.expect_bulk(b"7");
+}
+
+#[tokio::test]
+async fn zadd_incr_lt_suppresses_increment() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-incr-lt", b"5", b"a"]).await.expect_integer(1);
+    // +2 = 7, LT requires lower → suppressed.
+    let reply = call(&state, &[b"ZADD", b"z-incr-lt", b"LT", b"INCR", b"2", b"a"]).await;
+    reply.expect_nil();
+    // -2 = 3 < 5 → passes.
+    let reply = call(&state, &[b"ZADD", b"z-incr-lt", b"LT", b"INCR", b"-2", b"a"]).await;
+    reply.expect_bulk(b"3");
+}
+
+#[tokio::test]
+async fn zadd_incr_requires_single_pair() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-multi", b"INCR", b"1", b"a", b"2", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zadd_ch_counts_score_updates() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-ch", b"1", b"a", b"2", b"b"]).await.expect_integer(2);
+    // Without CH: update to an existing member doesn't count.
+    call(&state, &[b"ZADD", b"z-ch", b"10", b"a"]).await.expect_integer(0);
+    // With CH: score change counts + one fresh add.
+    call(&state, &[b"ZADD", b"z-ch", b"CH", b"20", b"a", b"99", b"new"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn zadd_ch_with_gt_counts_only_passing_updates() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z-ch-gt", b"5", b"a", b"5", b"b"]).await.expect_integer(2);
+    // Only the 'b' update passes GT (6 > 5); 'a' blocked (3 <= 5).
+    call(&state, &[b"ZADD", b"z-ch-gt", b"GT", b"CH", b"3", b"a", b"6", b"b"]).await.expect_integer(1);
+}
+
+// ---------------------------------------------------------------------------
 // String multi-key + NX/EX (SETNX, SETEX, MGET, MSET)
 // ---------------------------------------------------------------------------
 
