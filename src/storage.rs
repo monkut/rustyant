@@ -126,6 +126,56 @@ impl ScoreBound {
     }
 }
 
+/// Lex-bound for `ZRANGEBYLEX` / `ZLEXCOUNT`.
+///
+/// Matches Redis's syntax: `[member` is inclusive, `(member` is exclusive,
+/// `-` / `+` are the extremes. Comparison is byte-wise (Redis's `memcmp`),
+/// so it only makes sense when all members share the same score —
+/// documented at both ends.
+#[derive(Debug, Clone)]
+pub enum LexBound {
+    Inclusive(String),
+    Exclusive(String),
+    MinusInf,
+    PlusInf,
+}
+
+impl LexBound {
+    pub fn parse(s: &str) -> Result<Self, RustyAntError> {
+        match s {
+            "-" => Ok(Self::MinusInf),
+            "+" => Ok(Self::PlusInf),
+            other => other.strip_prefix('[').map(|rest| Self::Inclusive(rest.to_string())).map_or_else(
+                || {
+                    other.strip_prefix('(').map_or_else(
+                        || Err(RustyAntError::Parse("min or max not valid string range item".into())),
+                        |rest| Ok(Self::Exclusive(rest.to_string())),
+                    )
+                },
+                Ok,
+            ),
+        }
+    }
+
+    fn ge_min(&self, member: &str) -> bool {
+        match self {
+            Self::Inclusive(v) => member >= v.as_str(),
+            Self::Exclusive(v) => member > v.as_str(),
+            Self::MinusInf => true,
+            Self::PlusInf => false,
+        }
+    }
+
+    fn le_max(&self, member: &str) -> bool {
+        match self {
+            Self::Inclusive(v) => member <= v.as_str(),
+            Self::Exclusive(v) => member < v.as_str(),
+            Self::MinusInf => false,
+            Self::PlusInf => true,
+        }
+    }
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
@@ -272,6 +322,31 @@ fn apply_setrange(data: &mut Vec<u8>, offset: usize, value: &[u8]) {
 /// bounds.
 fn filter_zset_by_score(map: BTreeMap<String, f64>, min: ScoreBound, max: ScoreBound) -> Vec<String> {
     sorted_zset(map).into_iter().filter(|(_, s)| min.ge_min(*s) && max.le_max(*s)).map(|(m, _)| m).collect()
+}
+
+/// Walk the `ZSet` in ascending member lex order and collect members whose
+/// byte-wise key falls within the lex window. Callers apply any `LIMIT` on
+/// the returned slice. Redis's lex-range commands only make sense when all
+/// scores are equal; this does not validate that — same stance as Redis.
+fn filter_zset_by_lex(map: &BTreeMap<String, f64>, min: &LexBound, max: &LexBound) -> Vec<String> {
+    map.keys().filter(|m| min.ge_min(m.as_str()) && max.le_max(m.as_str())).cloned().collect()
+}
+
+/// Apply a `(offset, count)` limit to an already-ordered member list. `count`
+/// <= 0 or `None` returns everything from `offset` onward. Offsets past the
+/// end collapse to empty, matching Redis.
+fn apply_lex_limit(mut members: Vec<String>, limit: Option<(i64, i64)>) -> Vec<String> {
+    let Some((offset, count)) = limit else { return members };
+    let offset_usize = usize::try_from(offset.max(0)).unwrap_or(0);
+    if offset_usize >= members.len() {
+        return Vec::new();
+    }
+    members.drain(..offset_usize);
+    if count >= 0 {
+        let cap = usize::try_from(count).unwrap_or(0);
+        members.truncate(cap);
+    }
+    members
 }
 
 /// Number of members whose score falls within `[min, max]` (inclusive/
@@ -687,6 +762,26 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     -> Result<Vec<String>, RustyAntError>;
     async fn zremrangebyrank(&self, key: &str, start: i64, stop: i64) -> Result<i64, RustyAntError>;
     async fn zremrangebyscore(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError>;
+    /// Lex-ordered range read. `limit` is `(offset, count)`; `count` <= 0 or
+    /// `None` means no cap. Results are in ascending member order.
+    async fn zrangebylex(
+        &self,
+        key: &str,
+        min: LexBound,
+        max: LexBound,
+        limit: Option<(i64, i64)>,
+    ) -> Result<Vec<String>, RustyAntError>;
+    /// `ZREVRANGEBYLEX` — Redis takes `(key, max, min)` order to signal the
+    /// reverse direction; the storage layer mirrors that.
+    async fn zrevrangebylex(
+        &self,
+        key: &str,
+        max: LexBound,
+        min: LexBound,
+        limit: Option<(i64, i64)>,
+    ) -> Result<Vec<String>, RustyAntError>;
+    async fn zlexcount(&self, key: &str, min: LexBound, max: LexBound) -> Result<i64, RustyAntError>;
+    async fn zremrangebylex(&self, key: &str, min: LexBound, max: LexBound) -> Result<i64, RustyAntError>;
     async fn zpopmin(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError>;
     async fn zpopmax(&self, key: &str, count: usize) -> Result<Vec<(String, f64)>, RustyAntError>;
     async fn zscore(&self, key: &str, member: &str) -> Result<Option<f64>, RustyAntError>;
@@ -2263,6 +2358,78 @@ impl Storage for S3Storage {
             } else {
                 let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
                 Ok(CasAction::Write(new_entry, removed_i))
+            }
+        })
+        .await
+    }
+
+    async fn zrangebylex(
+        &self,
+        key: &str,
+        min: LexBound,
+        max: LexBound,
+        limit: Option<(i64, i64)>,
+    ) -> Result<Vec<String>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                let filtered = filter_zset_by_lex(&m, &min, &max);
+                Ok(apply_lex_limit(filtered, limit))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn zrevrangebylex(
+        &self,
+        key: &str,
+        max: LexBound,
+        min: LexBound,
+        limit: Option<(i64, i64)>,
+    ) -> Result<Vec<String>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                let mut filtered = filter_zset_by_lex(&m, &min, &max);
+                filtered.reverse();
+                Ok(apply_lex_limit(filtered, limit))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn zlexcount(&self, key: &str, min: LexBound, max: LexBound) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => {
+                let n = m.keys().filter(|k| min.ge_min(k.as_str()) && max.le_max(k.as_str())).count();
+                Ok(i64::try_from(n).unwrap_or(i64::MAX))
+            }
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn zremrangebylex(&self, key: &str, min: LexBound, max: LexBound) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::ZSet(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let mut kept = BTreeMap::new();
+            let mut removed: i64 = 0;
+            for (member, score) in map {
+                if min.ge_min(member.as_str()) && max.le_max(member.as_str()) {
+                    removed += 1;
+                } else {
+                    kept.insert(member, score);
+                }
+            }
+            if kept.is_empty() {
+                Ok(CasAction::Delete(removed))
+            } else {
+                let new_entry = StoredValue { expires_at_ms, value: Value::ZSet(kept) };
+                Ok(CasAction::Write(new_entry, removed))
             }
         })
         .await
