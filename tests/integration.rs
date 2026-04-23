@@ -1451,6 +1451,164 @@ async fn zscan_paginates_with_scores() {
     assert_eq!(seen, want);
 }
 
+// ---------------------------------------------------------------------------
+// ZINTERSTORE / ZUNIONSTORE / ZDIFFSTORE — sorted-set aggregates into dst.
+// Inputs can be SET (contributing score 1.0) or ZSET. WEIGHTS multiply each
+// input's scores before AGGREGATE combines overlapping members.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn zinterstore_sums_scores_by_default() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zi-a", b"1", b"x", b"2", b"y"]).await;
+    call(&state, &[b"ZADD", b"zi-b", b"3", b"x", b"4", b"z"]).await;
+    call(&state, &[b"ZINTERSTORE", b"zi-dst", b"2", b"zi-a", b"zi-b"]).await.expect_integer(1);
+    // x is the only common member; SUM(1, 3) = 4.
+    let reply = call(&state, &[b"ZSCORE", b"zi-dst", b"x"]).await;
+    reply.expect_bulk(b"4");
+}
+
+#[tokio::test]
+async fn zinterstore_with_weights_multiplies_scores() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"ziw-a", b"1", b"x"]).await;
+    call(&state, &[b"ZADD", b"ziw-b", b"1", b"x"]).await;
+    call(&state, &[b"ZINTERSTORE", b"ziw-dst", b"2", b"ziw-a", b"ziw-b", b"WEIGHTS", b"2", b"3"])
+        .await
+        .expect_integer(1);
+    // 1*2 + 1*3 = 5.
+    call(&state, &[b"ZSCORE", b"ziw-dst", b"x"]).await.expect_bulk(b"5");
+}
+
+#[tokio::test]
+async fn zinterstore_aggregate_min_picks_smaller() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zim-a", b"10", b"x"]).await;
+    call(&state, &[b"ZADD", b"zim-b", b"3", b"x"]).await;
+    call(&state, &[b"ZINTERSTORE", b"zim-dst", b"2", b"zim-a", b"zim-b", b"AGGREGATE", b"MIN"]).await.expect_integer(1);
+    call(&state, &[b"ZSCORE", b"zim-dst", b"x"]).await.expect_bulk(b"3");
+}
+
+#[tokio::test]
+async fn zinterstore_aggregate_max_picks_larger() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zix-a", b"10", b"x"]).await;
+    call(&state, &[b"ZADD", b"zix-b", b"3", b"x"]).await;
+    call(&state, &[b"ZINTERSTORE", b"zix-dst", b"2", b"zix-a", b"zix-b", b"AGGREGATE", b"MAX"]).await.expect_integer(1);
+    call(&state, &[b"ZSCORE", b"zix-dst", b"x"]).await.expect_bulk(b"10");
+}
+
+#[tokio::test]
+async fn zinterstore_accepts_set_input_with_score_one() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zis-z", b"5", b"x", b"7", b"y"]).await;
+    call(&state, &[b"SADD", b"zis-s", b"x"]).await;
+    // Intersection: x only; SUM(5, 1) = 6.
+    call(&state, &[b"ZINTERSTORE", b"zis-dst", b"2", b"zis-z", b"zis-s"]).await.expect_integer(1);
+    call(&state, &[b"ZSCORE", b"zis-dst", b"x"]).await.expect_bulk(b"6");
+}
+
+#[tokio::test]
+async fn zunionstore_combines_scores_across_sources() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zu-a", b"1", b"x", b"2", b"y"]).await;
+    call(&state, &[b"ZADD", b"zu-b", b"10", b"y", b"3", b"z"]).await;
+    call(&state, &[b"ZUNIONSTORE", b"zu-dst", b"2", b"zu-a", b"zu-b"]).await.expect_integer(3);
+    // x only in a → 1; y in both → SUM(2, 10) = 12; z only in b → 3.
+    call(&state, &[b"ZSCORE", b"zu-dst", b"x"]).await.expect_bulk(b"1");
+    call(&state, &[b"ZSCORE", b"zu-dst", b"y"]).await.expect_bulk(b"12");
+    call(&state, &[b"ZSCORE", b"zu-dst", b"z"]).await.expect_bulk(b"3");
+}
+
+#[tokio::test]
+async fn zdiffstore_keeps_members_only_in_first_source() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zd-a", b"1", b"x", b"2", b"y", b"3", b"z"]).await;
+    call(&state, &[b"ZADD", b"zd-b", b"9", b"y"]).await;
+    call(&state, &[b"ZADD", b"zd-c", b"9", b"z"]).await;
+    call(&state, &[b"ZDIFFSTORE", b"zd-dst", b"3", b"zd-a", b"zd-b", b"zd-c"]).await.expect_integer(1);
+    // Only x survives; first-set score preserved.
+    call(&state, &[b"ZSCORE", b"zd-dst", b"x"]).await.expect_bulk(b"1");
+}
+
+#[tokio::test]
+async fn zdiffstore_rejects_weights_or_aggregate() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zdw-a", b"1", b"x"]).await;
+    call(&state, &[b"ZADD", b"zdw-b", b"1", b"x"]).await;
+    call(&state, &[b"ZDIFFSTORE", b"zdw-dst", b"2", b"zdw-a", b"zdw-b", b"WEIGHTS", b"1", b"1"])
+        .await
+        .expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zstore_empty_result_deletes_destination() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"ze1-a", b"1", b"x"]).await;
+    call(&state, &[b"ZADD", b"ze1-b", b"1", b"y"]).await;
+    // Pre-populate the destination; empty intersection should wipe it.
+    call(&state, &[b"ZADD", b"ze1-dst", b"1", b"leftover"]).await;
+    call(&state, &[b"ZINTERSTORE", b"ze1-dst", b"2", b"ze1-a", b"ze1-b"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"ze1-dst"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zstore_overwrites_destination_of_any_type() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zo-a", b"1", b"x"]).await;
+    // Destination is a string; ZINTERSTORE overwrites it unconditionally.
+    call(&state, &[b"SET", b"zo-dst", b"ignored"]).await.expect_simple("OK");
+    call(&state, &[b"ZINTERSTORE", b"zo-dst", b"1", b"zo-a"]).await.expect_integer(1);
+    call(&state, &[b"TYPE", b"zo-dst"]).await.expect_simple("zset");
+}
+
+#[tokio::test]
+async fn zstore_numkeys_zero_errors() {
+    let state = test_state();
+    call(&state, &[b"ZINTERSTORE", b"dst", b"0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zstore_numkeys_exceeds_arg_count_errors() {
+    let state = test_state();
+    call(&state, &[b"ZINTERSTORE", b"dst", b"3", b"a", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zinterstore_rejects_unknown_aggregate_mode() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"za-a", b"1", b"x"]).await;
+    call(&state, &[b"ZINTERSTORE", b"dst", b"1", b"za-a", b"AGGREGATE", b"MEDIAN"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zinterstore_weights_count_mismatch_errors() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"zwm-a", b"1", b"x"]).await;
+    call(&state, &[b"ZADD", b"zwm-b", b"1", b"y"]).await;
+    // Two inputs but only one weight provided.
+    call(&state, &[b"ZINTERSTORE", b"dst", b"2", b"zwm-a", b"zwm-b", b"WEIGHTS", b"2"])
+        .await
+        .expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zstore_commands_registered_in_command_meta() {
+    let state = test_state();
+    for name in [
+        b"SINTERSTORE".as_ref(),
+        b"SUNIONSTORE".as_ref(),
+        b"SDIFFSTORE".as_ref(),
+        b"ZINTERSTORE".as_ref(),
+        b"ZUNIONSTORE".as_ref(),
+        b"ZDIFFSTORE".as_ref(),
+    ] {
+        let reply = call(&state, &[b"COMMAND", b"INFO", name]).await;
+        let s = String::from_utf8_lossy(&reply.raw);
+        assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
+    }
+}
+
 #[tokio::test]
 async fn hscan_wire_reply_has_cursor_and_pairs() {
     // End-to-end wire check: a single-page HSCAN must return
@@ -1904,6 +2062,83 @@ async fn sinter_on_wrong_type_errors() {
     call(&state, &[b"SADD", b"s", b"x"]).await;
     call(&state, &[b"SET", b"k", b"v"]).await;
     call(&state, &[b"SINTER", b"s", b"k"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
+// SINTERSTORE / SUNIONSTORE / SDIFFSTORE — write set aggregates into a dest.
+// Empty results delete the destination; overwriting is unconditional (no
+// WRONGTYPE check on the destination), matching Redis.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sinterstore_stores_common_members() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"ss-a", b"x", b"y", b"z"]).await;
+    call(&state, &[b"SADD", b"ss-b", b"y", b"z", b"w"]).await;
+    call(&state, &[b"SINTERSTORE", b"ss-dst", b"ss-a", b"ss-b"]).await.expect_integer(2);
+    call(&state, &[b"TYPE", b"ss-dst"]).await.expect_simple("set");
+    let mut members = bulks_to_strs(&call(&state, &[b"SMEMBERS", b"ss-dst"]).await.into_bulk_array());
+    members.sort();
+    assert_eq!(members, vec!["y".to_string(), "z".into()]);
+}
+
+#[tokio::test]
+async fn sunionstore_stores_combined_members() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"su-a", b"x", b"y"]).await;
+    call(&state, &[b"SADD", b"su-b", b"y", b"z"]).await;
+    call(&state, &[b"SUNIONSTORE", b"su-dst", b"su-a", b"su-b"]).await.expect_integer(3);
+    let mut members = bulks_to_strs(&call(&state, &[b"SMEMBERS", b"su-dst"]).await.into_bulk_array());
+    members.sort();
+    assert_eq!(members, vec!["x".to_string(), "y".into(), "z".into()]);
+}
+
+#[tokio::test]
+async fn sdiffstore_stores_first_minus_rest() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"sd-a", b"x", b"y", b"z"]).await;
+    call(&state, &[b"SADD", b"sd-b", b"y"]).await;
+    call(&state, &[b"SADD", b"sd-c", b"z"]).await;
+    call(&state, &[b"SDIFFSTORE", b"sd-dst", b"sd-a", b"sd-b", b"sd-c"]).await.expect_integer(1);
+    let members = bulks_to_strs(&call(&state, &[b"SMEMBERS", b"sd-dst"]).await.into_bulk_array());
+    assert_eq!(members, vec!["x".to_string()]);
+}
+
+#[tokio::test]
+async fn sinterstore_empty_result_deletes_destination() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"se1-a", b"x"]).await;
+    call(&state, &[b"SADD", b"se1-b", b"y"]).await;
+    // Pre-populate destination so we can see it get cleared.
+    call(&state, &[b"SADD", b"se1-dst", b"old"]).await;
+    call(&state, &[b"SINTERSTORE", b"se1-dst", b"se1-a", b"se1-b"]).await.expect_integer(0);
+    call(&state, &[b"EXISTS", b"se1-dst"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn sinterstore_overwrites_destination_of_any_type() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"so-a", b"x", b"y"]).await;
+    call(&state, &[b"SADD", b"so-b", b"y"]).await;
+    // Destination is a string; should be overwritten without WRONGTYPE.
+    call(&state, &[b"SET", b"so-dst", b"ignored"]).await.expect_simple("OK");
+    call(&state, &[b"SINTERSTORE", b"so-dst", b"so-a", b"so-b"]).await.expect_integer(1);
+    call(&state, &[b"TYPE", b"so-dst"]).await.expect_simple("set");
+}
+
+#[tokio::test]
+async fn sinterstore_rejects_non_set_input() {
+    let state = test_state();
+    call(&state, &[b"SET", b"sw-str", b"x"]).await;
+    call(&state, &[b"SADD", b"sw-set", b"y"]).await;
+    call(&state, &[b"SINTERSTORE", b"sw-dst", b"sw-str", b"sw-set"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn sinterstore_arity_errors() {
+    let state = test_state();
+    // Missing source key.
+    call(&state, &[b"SINTERSTORE", b"dst"]).await.expect_error_prefix("ERR");
 }
 
 #[tokio::test]

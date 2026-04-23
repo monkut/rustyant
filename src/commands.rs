@@ -238,11 +238,17 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "SINTER" => handle_sinter(state, args).await,
         "SUNION" => handle_sunion(state, args).await,
         "SDIFF" => handle_sdiff(state, args).await,
+        "SINTERSTORE" => handle_sstore(state, args, SetOp::Inter).await,
+        "SUNIONSTORE" => handle_sstore(state, args, SetOp::Union).await,
+        "SDIFFSTORE" => handle_sstore(state, args, SetOp::Diff).await,
         "SPOP" => handle_spop(state, args).await,
         "SRANDMEMBER" => handle_srandmember(state, args).await,
         "SSCAN" => handle_sscan(state, args).await,
         // Sorted sets
         "ZADD" => handle_zadd(state, args).await,
+        "ZINTERSTORE" => handle_zstore(state, args, ZStoreOp::Inter).await,
+        "ZUNIONSTORE" => handle_zstore(state, args, ZStoreOp::Union).await,
+        "ZDIFFSTORE" => handle_zstore(state, args, ZStoreOp::Diff).await,
         "ZREM" => handle_zrem(state, args).await,
         "ZINCRBY" => handle_zincrby(state, args).await,
         "ZRANGE" => handle_zrange(state, args).await,
@@ -1062,6 +1068,249 @@ async fn handle_sdiff(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
     Ok(RespReply::Array(
         members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// SINTERSTORE / SUNIONSTORE / SDIFFSTORE — set aggregates into a destination.
+//
+// Inputs must all be SET (or missing); any other kind is a WRONGTYPE error.
+// Destination is overwritten unconditionally (no WRONGTYPE check, matching
+// Redis). An empty result deletes the destination.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Copy, Clone)]
+enum SetOp {
+    Inter,
+    Union,
+    Diff,
+}
+
+async fn handle_sstore(state: &State, args: Vec<Bytes>, op: SetOp) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity {
+            command: match op {
+                SetOp::Inter => "SINTERSTORE",
+                SetOp::Union => "SUNIONSTORE",
+                SetOp::Diff => "SDIFFSTORE",
+            }
+            .into(),
+        });
+    }
+    let dest = arg_as_string(&args[0])?;
+    let src_keys: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    let members = match op {
+        SetOp::Inter => state.storage.sinter(&src_keys).await?,
+        SetOp::Union => state.storage.sunion(&src_keys).await?,
+        SetOp::Diff => state.storage.sdiff(&src_keys).await?,
+    };
+    state.storage.delete(&dest).await?;
+    if members.is_empty() {
+        return Ok(RespReply::Integer(0));
+    }
+    let count = state.storage.sadd(&dest, members).await?;
+    Ok(RespReply::Integer(count))
+}
+
+// ---------------------------------------------------------------------------
+// ZINTERSTORE / ZUNIONSTORE / ZDIFFSTORE — sorted-set aggregates into a
+// destination, with optional WEIGHTS and AGGREGATE for Inter/Union.
+//
+// Inputs can be SET or ZSET (or missing); a SET contributes each member
+// with score 1.0 before weight multiplication. Destination is overwritten
+// unconditionally. An empty result deletes the destination.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ZStoreOp {
+    Inter,
+    Union,
+    Diff,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Aggregate {
+    Sum,
+    Min,
+    Max,
+}
+
+async fn handle_zstore(state: &State, args: Vec<Bytes>, op: ZStoreOp) -> Result<RespReply, RustyAntError> {
+    let cmd_name: &str = match op {
+        ZStoreOp::Inter => "ZINTERSTORE",
+        ZStoreOp::Union => "ZUNIONSTORE",
+        ZStoreOp::Diff => "ZDIFFSTORE",
+    };
+    // Minimum: dest numkeys key = 3 tokens.
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: cmd_name.into() });
+    }
+    let dest = arg_as_string(&args[0])?;
+    let numkeys_i = parse_i64(&args[1], "numkeys")?;
+    if numkeys_i <= 0 {
+        return Err(RustyAntError::Parse("at least 1 input key is needed for this command".into()));
+    }
+    let numkeys = usize::try_from(numkeys_i).unwrap_or(0);
+    if args.len() < 2 + numkeys {
+        return Err(RustyAntError::Parse("Number of keys can't be greater than number of args".into()));
+    }
+    let src_keys: Vec<String> = args.iter().skip(2).take(numkeys).map(arg_as_string).collect::<Result<_, _>>()?;
+
+    // Trailing options: WEIGHTS w1 w2 ... / AGGREGATE SUM|MIN|MAX.
+    // ZDIFFSTORE does not accept either — surface an error per Redis.
+    let tail = &args[2 + numkeys..];
+    let (weights, aggregate) = if op == ZStoreOp::Diff {
+        if !tail.is_empty() {
+            return Err(RustyAntError::Parse(format!("syntax error near '{}'", arg_as_str(&tail[0])?)));
+        }
+        (vec![1.0_f64; numkeys], Aggregate::Sum)
+    } else {
+        parse_weights_aggregate(tail, numkeys)?
+    };
+
+    // Load each source, applying its weight to produce (member, weighted score).
+    let mut per_input: Vec<Vec<(String, f64)>> = Vec::with_capacity(numkeys);
+    for (k, w) in src_keys.iter().zip(weights.iter()) {
+        let items = load_zset_or_set(state, k).await?;
+        per_input.push(items.into_iter().map(|(m, s)| (m, s * w)).collect());
+    }
+
+    let pairs = match op {
+        ZStoreOp::Inter => aggregate_intersection(&per_input, aggregate),
+        ZStoreOp::Union => aggregate_union(per_input, aggregate),
+        ZStoreOp::Diff => aggregate_difference(per_input),
+    };
+
+    state.storage.delete(&dest).await?;
+    if pairs.is_empty() {
+        return Ok(RespReply::Integer(0));
+    }
+    let count = state.storage.zadd(&dest, pairs).await?;
+    Ok(RespReply::Integer(count))
+}
+
+fn parse_weights_aggregate(tail: &[Bytes], numkeys: usize) -> Result<(Vec<f64>, Aggregate), RustyAntError> {
+    let mut weights = vec![1.0_f64; numkeys];
+    let mut aggregate = Aggregate::Sum;
+    let mut i = 0;
+    while i < tail.len() {
+        let token = arg_as_str(&tail[i])?.to_ascii_uppercase();
+        match token.as_str() {
+            "WEIGHTS" => {
+                if i + numkeys >= tail.len() {
+                    return Err(RustyAntError::Parse("WEIGHTS needs one value per input key".into()));
+                }
+                for (slot, arg) in weights.iter_mut().zip(tail[i + 1..i + 1 + numkeys].iter()) {
+                    *slot = parse_f64(arg, "weight")?;
+                }
+                i += 1 + numkeys;
+            }
+            "AGGREGATE" => {
+                if i + 1 >= tail.len() {
+                    return Err(RustyAntError::Parse("AGGREGATE requires SUM, MIN, or MAX".into()));
+                }
+                aggregate = match arg_as_str(&tail[i + 1])?.to_ascii_uppercase().as_str() {
+                    "SUM" => Aggregate::Sum,
+                    "MIN" => Aggregate::Min,
+                    "MAX" => Aggregate::Max,
+                    other => return Err(RustyAntError::Parse(format!("unsupported AGGREGATE mode: {other}"))),
+                };
+                i += 2;
+            }
+            other => return Err(RustyAntError::Parse(format!("syntax error near '{other}'"))),
+        }
+    }
+    Ok((weights, aggregate))
+}
+
+async fn load_zset_or_set(state: &State, key: &str) -> Result<Vec<(String, f64)>, RustyAntError> {
+    match state.storage.kind(key).await? {
+        Some("zset") => state.storage.zitems(key).await,
+        Some("set") => {
+            let members = state.storage.smembers(key).await?;
+            Ok(members.into_iter().map(|m| (m, 1.0)).collect())
+        }
+        Some(_) => Err(RustyAntError::WrongType { key: key.to_string() }),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn aggregate_intersection(per_input: &[Vec<(String, f64)>], agg: Aggregate) -> Vec<(f64, String)> {
+    use std::collections::HashMap;
+    let Some(first) = per_input.first() else {
+        return Vec::new();
+    };
+    // Start with the first input; subsequent inputs shrink the candidate set.
+    let mut current: HashMap<String, f64> = first.iter().cloned().collect();
+    for input in &per_input[1..] {
+        if current.is_empty() {
+            return Vec::new();
+        }
+        let next: HashMap<String, f64> = input.iter().cloned().collect();
+        current.retain(|member, existing| {
+            next.get(member).is_some_and(|incoming| {
+                *existing = combine_scores(*existing, *incoming, agg);
+                true
+            })
+        });
+    }
+    current.into_iter().map(|(m, s)| (s, m)).collect()
+}
+
+fn aggregate_union(per_input: Vec<Vec<(String, f64)>>, agg: Aggregate) -> Vec<(f64, String)> {
+    use std::collections::HashMap;
+    let mut acc: HashMap<String, f64> = HashMap::new();
+    for input in per_input {
+        for (member, score) in input {
+            acc.entry(member).and_modify(|existing| *existing = combine_scores(*existing, score, agg)).or_insert(score);
+        }
+    }
+    acc.into_iter().map(|(m, s)| (s, m)).collect()
+}
+
+fn aggregate_difference(per_input: Vec<Vec<(String, f64)>>) -> Vec<(f64, String)> {
+    use std::collections::HashSet;
+    if per_input.is_empty() {
+        return Vec::new();
+    }
+    // ZDIFFSTORE: members in first set that don't appear in any other.
+    // Scores from the first set are preserved (Redis doesn't aggregate —
+    // there's only one source of truth for each surviving member).
+    let mut drop: HashSet<String> = HashSet::new();
+    for input in per_input.iter().skip(1) {
+        for (member, _) in input {
+            drop.insert(member.clone());
+        }
+    }
+    per_input
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(m, _)| !drop.contains(m))
+        .map(|(m, s)| (s, m))
+        .collect()
+}
+
+fn combine_scores(a: f64, b: f64, agg: Aggregate) -> f64 {
+    match agg {
+        Aggregate::Sum => a + b,
+        // Redis uses partial_cmp ordering for these; NaN falls through to
+        // the first operand, matching Redis's "nan-pessimistic" behaviour.
+        Aggregate::Min => {
+            if b < a {
+                b
+            } else {
+                a
+            }
+        }
+        Aggregate::Max => {
+            if b > a {
+                b
+            } else {
+                a
+            }
+        }
+    }
 }
 
 async fn handle_spop(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
@@ -2645,6 +2894,9 @@ const COMMAND_META: &[CommandMeta] = &[
     ("sinter", -2, &["readonly"], 1, -1, 1),
     ("sunion", -2, &["readonly"], 1, -1, 1),
     ("sdiff", -2, &["readonly"], 1, -1, 1),
+    ("sinterstore", -3, &["write", "denyoom"], 1, -1, 1),
+    ("sunionstore", -3, &["write", "denyoom"], 1, -1, 1),
+    ("sdiffstore", -3, &["write", "denyoom"], 1, -1, 1),
     ("sscan", -3, &["readonly"], 1, 1, 1),
     // Sorted sets
     ("zadd", -4, &["write", "denyoom", "fast"], 1, 1, 1),
@@ -2664,6 +2916,12 @@ const COMMAND_META: &[CommandMeta] = &[
     ("zpopmax", -2, &["write", "fast"], 1, 1, 1),
     ("zremrangebyrank", 4, &["write"], 1, 1, 1),
     ("zremrangebyscore", 4, &["write"], 1, 1, 1),
+    // *STORE aggregates. Redis's first_key/last_key/step describe the
+    // destination-key-then-source-keys layout; rustyant reuses delete+zadd
+    // under the hood so the layout is purely informational here.
+    ("zinterstore", -4, &["write", "denyoom"], 1, 1, 1),
+    ("zunionstore", -4, &["write", "denyoom"], 1, 1, 1),
+    ("zdiffstore", -4, &["write", "denyoom"], 1, 1, 1),
     ("zscan", -3, &["readonly"], 1, 1, 1),
 ];
 
