@@ -888,6 +888,74 @@ async fn zcard_counts_members() {
 }
 
 #[tokio::test]
+async fn zrandmember_no_count_returns_bulk_or_nil() {
+    let state = test_state();
+    // Missing key → nil bulk.
+    call(&state, &[b"ZRANDMEMBER", b"missing"]).await.expect_nil();
+    call(&state, &[b"ZADD", b"z", b"1", b"only"]).await;
+    // Single known member → that member.
+    call(&state, &[b"ZRANDMEMBER", b"z"]).await.expect_bulk(b"only");
+}
+
+#[tokio::test]
+async fn zrandmember_positive_count_distinct() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let reply = call(&state, &[b"ZRANDMEMBER", b"z", b"2"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 2);
+    let distinct: std::collections::HashSet<_> = reply.iter().collect();
+    assert_eq!(distinct.len(), 2, "positive count must be distinct");
+    // Requested count exceeds zset size → returns all members, capped.
+    let reply = call(&state, &[b"ZRANDMEMBER", b"z", b"10"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 3);
+}
+
+#[tokio::test]
+async fn zrandmember_negative_count_allows_duplicates() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"only"]).await;
+    let reply = call(&state, &[b"ZRANDMEMBER", b"z", b"-5"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 5);
+    for item in reply {
+        assert_eq!(&item[..], b"only");
+    }
+}
+
+#[tokio::test]
+async fn zrandmember_withscores_interleaves_pairs() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let reply = call(&state, &[b"ZRANDMEMBER", b"z", b"3", b"WITHSCORES"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 6);
+    // Every other entry is a score for the prior member.
+    for chunk in reply.chunks(2) {
+        let member = std::str::from_utf8(&chunk[0]).expect("utf8");
+        let score = std::str::from_utf8(&chunk[1]).expect("utf8");
+        let expected = match member {
+            "a" => "1",
+            "b" => "2",
+            "c" => "3",
+            other => panic!("unexpected member {other}"),
+        };
+        assert_eq!(score, expected);
+    }
+}
+
+#[tokio::test]
+async fn zrandmember_missing_key_with_count_returns_empty_array() {
+    let state = test_state();
+    let reply = call(&state, &[b"ZRANDMEMBER", b"missing", b"3"]).await.into_bulk_array();
+    assert!(reply.is_empty());
+}
+
+#[tokio::test]
+async fn zrandmember_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZRANDMEMBER", b"k"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn zrank_returns_ascending_index() {
     let state = test_state();
     call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
