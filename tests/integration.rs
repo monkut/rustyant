@@ -2589,6 +2589,66 @@ async fn smismember_on_wrong_type_errors() {
 }
 
 #[tokio::test]
+async fn smove_transfers_member() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"src", b"a", b"b", b"c"]).await;
+    call(&state, &[b"SADD", b"dst", b"x"]).await;
+    call(&state, &[b"SMOVE", b"src", b"dst", b"a"]).await.expect_integer(1);
+    // Member removed from source, added to dest.
+    call(&state, &[b"SISMEMBER", b"src", b"a"]).await.expect_integer(0);
+    call(&state, &[b"SISMEMBER", b"dst", b"a"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn smove_missing_member_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"src", b"a"]).await;
+    call(&state, &[b"SADD", b"dst", b"x"]).await;
+    call(&state, &[b"SMOVE", b"src", b"dst", b"missing"]).await.expect_integer(0);
+    call(&state, &[b"SISMEMBER", b"dst", b"missing"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn smove_missing_source_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"SMOVE", b"nope", b"dst", b"a"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn smove_same_key_is_noop_when_member_present() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"a"]).await;
+    call(&state, &[b"SMOVE", b"s", b"s", b"a"]).await.expect_integer(1);
+    call(&state, &[b"SCARD", b"s"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn smove_wrong_type_source_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"src", b"v"]).await;
+    call(&state, &[b"SADD", b"dst", b"x"]).await;
+    call(&state, &[b"SMOVE", b"src", b"dst", b"a"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn smove_wrong_type_destination_preserves_source() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"src", b"a"]).await;
+    call(&state, &[b"SET", b"dst", b"v"]).await;
+    call(&state, &[b"SMOVE", b"src", b"dst", b"a"]).await.expect_error_prefix("ERR");
+    // Source is unchanged — the pre-check caught the bad dst before the SREM.
+    call(&state, &[b"SISMEMBER", b"src", b"a"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn smove_empties_source_removes_key() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"src", b"only"]).await;
+    call(&state, &[b"SMOVE", b"src", b"dst", b"only"]).await.expect_integer(1);
+    call(&state, &[b"EXISTS", b"src"]).await.expect_integer(0);
+}
+
+#[tokio::test]
 async fn spop_single_removes_and_returns_member() {
     let state = test_state();
     call(&state, &[b"SADD", b"s", b"only"]).await;
