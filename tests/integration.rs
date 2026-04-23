@@ -250,6 +250,91 @@ async fn strlen_on_wrong_type_errors() {
 }
 
 #[tokio::test]
+async fn lcs_returns_subsequence_bytes() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"ohmytext"]).await;
+    call(&state, &[b"SET", b"b", b"mynewtext"]).await;
+    // Classic Redis example: LCS("ohmytext","mynewtext") = "mytext".
+    call(&state, &[b"LCS", b"a", b"b"]).await.expect_bulk(b"mytext");
+}
+
+#[tokio::test]
+async fn lcs_len_returns_length_integer() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"ohmytext"]).await;
+    call(&state, &[b"SET", b"b", b"mynewtext"]).await;
+    call(&state, &[b"LCS", b"a", b"b", b"LEN"]).await.expect_integer(6);
+}
+
+#[tokio::test]
+async fn lcs_missing_key_is_empty_string() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"hello"]).await;
+    // b does not exist → empty string → LCS is empty.
+    call(&state, &[b"LCS", b"a", b"b"]).await.expect_bulk(b"");
+    call(&state, &[b"LCS", b"a", b"b", b"LEN"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn lcs_len_and_idx_mutually_exclusive() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"x"]).await;
+    call(&state, &[b"SET", b"b", b"y"]).await;
+    call(&state, &[b"LCS", b"a", b"b", b"LEN", b"IDX"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn lcs_idx_returns_map_reply() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"ohmytext"]).await;
+    call(&state, &[b"SET", b"b", b"mynewtext"]).await;
+    // Reply is a 4-element array: ["matches", <array>, "len", 6]. parse_command
+    // only decodes bulk-of-bulks, so we inspect the raw wire format for the
+    // "matches" / "len" labels and the total length.
+    let reply = call(&state, &[b"LCS", b"a", b"b", b"IDX"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.starts_with("*4\r\n"), "expected 4-element map-like reply, got: {raw}");
+    assert!(raw.contains("matches"), "missing 'matches' label: {raw}");
+    assert!(raw.contains("len"), "missing 'len' label: {raw}");
+    // Total LCS length is 6 ("mytext").
+    assert!(raw.ends_with(":6\r\n"), "expected total length 6 at end, got: {raw}");
+}
+
+#[tokio::test]
+async fn lcs_idx_withmatchlen_appends_length() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"abc"]).await;
+    call(&state, &[b"SET", b"b", b"abc"]).await;
+    // Full-string match: matches array has a single triple [[0,2],[0,2],3].
+    let reply = call(&state, &[b"LCS", b"a", b"b", b"IDX", b"WITHMATCHLEN"]).await;
+    // Raw wire-check: the reply should contain ":3" (match length).
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains(":3"), "expected match length 3 in reply: {raw}");
+}
+
+#[tokio::test]
+async fn lcs_minmatchlen_filters_short_runs() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"ohmytext"]).await;
+    call(&state, &[b"SET", b"b", b"mynewtext"]).await;
+    // matches: "my" (len 2), "text" (len 4). MINMATCHLEN 3 drops "my".
+    let reply = call(&state, &[b"LCS", b"a", b"b", b"IDX", b"MINMATCHLEN", b"3"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    // Should contain "text" match indices but not "my" match indices.
+    // "text" in a is at [4,7], in b at [5,8]; "my" in a at [2,3], in b at [0,1].
+    assert!(raw.contains(":4\r\n:7"), "expected text-run indices in reply: {raw}");
+    assert!(!raw.contains(":2\r\n:3"), "expected my-run indices filtered out: {raw}");
+}
+
+#[tokio::test]
+async fn lcs_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"a", b"x"]).await;
+    call(&state, &[b"SET", b"b", b"y"]).await;
+    call(&state, &[b"LCS", b"a", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn append_to_missing_key_creates_string() {
     let state = test_state();
     call(&state, &[b"APPEND", b"k", b"hello"]).await.expect_integer(5);
