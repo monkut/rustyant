@@ -105,6 +105,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "COMMAND" => handle_command(&args),
         "HELLO" => handle_hello(&args),
         "CLIENT" => handle_client(&args),
+        "OBJECT" => handle_object(state, args).await,
         "RESET" => Ok(RespReply::SimpleString("RESET".into())),
         "QUIT" => {
             arity("QUIT", args.is_empty())?;
@@ -2504,6 +2505,65 @@ fn hello_info_reply() -> RespReply {
 /// call on connect (SETINFO, SETNAME, ID, GETNAME) are accepted quietly;
 /// the rest return `+OK` too, with an explicit error only for genuinely
 /// unknown subcommand names.
+/// Redis `OBJECT` — introspection router that debuggers / GUI tools call.
+///
+/// `ENCODING` returns an honest fixed encoding per value-kind. rustyant has
+/// no listpack / quicklist / hashtable split internally, so the reported
+/// names are the "modern" Redis defaults. `IDLETIME` / `REFCOUNT` return
+/// `0` / `1` respectively — stable values since the backing concepts
+/// don't exist on S3. `FREQ` surfaces Redis's exact error when LFU is
+/// not configured. `HELP` returns canonical usage bullets.
+async fn handle_object(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "OBJECT".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    if sub == "HELP" {
+        return Ok(RespReply::Array(
+            [
+                "OBJECT ENCODING <key> -- Return the kind of internal representation used in order to store the value.",
+                "OBJECT FREQ <key> -- Return the access frequency index of the key (LFU-only, not supported).",
+                "OBJECT IDLETIME <key> -- Return the idle time of the key (seconds).",
+                "OBJECT REFCOUNT <key> -- Return the number of references of the value.",
+                "OBJECT HELP -- Prints this help.",
+            ]
+            .into_iter()
+            .map(|s| RespReply::BulkString(Some(Bytes::from_static(s.as_bytes()))))
+            .collect(),
+        ));
+    }
+    // ENCODING / IDLETIME / REFCOUNT / FREQ all take exactly one key.
+    if args.len() != 2 {
+        return Err(RustyAntError::WrongArity { command: format!("OBJECT {sub}") });
+    }
+    let key = arg_as_str(&args[1])?;
+    match sub.as_str() {
+        "ENCODING" => match state.storage.kind(key).await? {
+            Some("string") => Ok(RespReply::BulkString(Some(Bytes::from_static(b"raw")))),
+            Some("hash" | "list" | "zset") => Ok(RespReply::BulkString(Some(Bytes::from_static(b"listpack")))),
+            Some("set") => Ok(RespReply::BulkString(Some(Bytes::from_static(b"hashtable")))),
+            Some(other) => Ok(RespReply::BulkString(Some(Bytes::from(other.as_bytes().to_vec())))),
+            None => Err(RustyAntError::Parse("no such key".into())),
+        },
+        "IDLETIME" => {
+            if state.storage.exists(key).await? {
+                Ok(RespReply::Integer(0))
+            } else {
+                Err(RustyAntError::Parse("no such key".into()))
+            }
+        }
+        "REFCOUNT" => {
+            if state.storage.exists(key).await? {
+                Ok(RespReply::Integer(1))
+            } else {
+                Err(RustyAntError::Parse("no such key".into()))
+            }
+        }
+        "FREQ" => Err(RustyAntError::Parse(
+            "An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between maxmemory policies at runtime LFU and LRU data will take some time to adjust.".into(),
+        )),
+        other => Err(RustyAntError::Parse(format!("unsupported OBJECT subcommand: {other}"))),
+    }
+}
+
 fn handle_client(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "CLIENT".into() })?;
     let sub = arg_as_str(sub)?.to_ascii_uppercase();
