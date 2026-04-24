@@ -19,3 +19,6 @@ extend-ignore-re = [
 # "EXAT" as a misspelling of "EXACT".
 exat = "exat"
 EXAT = "EXAT"
+# SMOVE — Redis set-move command; typos hears it as `move`.
+smove = "smove"
+SMOVE = "SMOVE"

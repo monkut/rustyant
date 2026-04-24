@@ -249,6 +249,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "SINTERSTORE" => handle_sstore(state, args, SetOp::Inter).await,
         "SUNIONSTORE" => handle_sstore(state, args, SetOp::Union).await,
         "SDIFFSTORE" => handle_sstore(state, args, SetOp::Diff).await,
+        "SMOVE" => handle_smove(state, args).await,
         "SPOP" => handle_spop(state, args).await,
         "SRANDMEMBER" => handle_srandmember(state, args).await,
         "SSCAN" => handle_sscan(state, args).await,
@@ -1806,6 +1807,42 @@ async fn handle_srem(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     let members: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
     let removed = state.storage.srem(key, &members).await?;
     Ok(RespReply::Integer(removed))
+}
+
+/// Redis `SMOVE source destination member`.
+///
+/// Cross-key move is best-effort on the S3 backend (same guarantee as
+/// `RENAME` / `COPY`): a concurrent writer landing between the `SREM` and
+/// `SADD` can surface an error after the element has already left the
+/// source. The destination type is pre-checked so a WRONGTYPE on dst
+/// cannot cost the source its member. Same-key short-circuits to a
+/// membership check and returns `1` without writing.
+async fn handle_smove(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("SMOVE", args.len() == 3)?;
+    let source = arg_as_string(&args[0])?;
+    let destination = arg_as_string(&args[1])?;
+    let member = arg_as_string(&args[2])?;
+
+    // Pre-check destination: must be a set or missing, else WRONGTYPE without
+    // touching the source.
+    match state.storage.kind(&destination).await? {
+        Some("set") | None => {}
+        Some(_) => return Err(RustyAntError::WrongType { key: destination }),
+    }
+
+    // Membership check on source (propagates WRONGTYPE on non-set sources).
+    if !state.storage.sismember(&source, &member).await? {
+        return Ok(RespReply::Integer(0));
+    }
+
+    if source == destination {
+        // Member already lives in the set; no write needed.
+        return Ok(RespReply::Integer(1));
+    }
+
+    state.storage.srem(&source, std::slice::from_ref(&member)).await?;
+    state.storage.sadd(&destination, vec![member]).await?;
+    Ok(RespReply::Integer(1))
 }
 
 async fn handle_zrem(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
