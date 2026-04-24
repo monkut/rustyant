@@ -424,6 +424,197 @@ async fn pf_stored_as_string_roundtrips_via_get() {
     assert!(raw[body_start..].starts_with(b"HYLL"), "GET on HLL key did not return an HYLL-prefixed blob");
 }
 
+// ---------------------------------------------------------------------------
+// Streams — XADD / XLEN / XRANGE / XREVRANGE / XDEL / XTRIM / XREAD / XINFO
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn xadd_appends_and_xlen_counts() {
+    let state = test_state();
+    // Auto-id with a single field.
+    let reply = call(&state, &[b"XADD", b"s", b"*", b"f1", b"v1"]).await;
+    // Reply is a bulk string "<ms>-0" or similar; just check it parses.
+    let body = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(body.contains('-'), "expected ms-seq id: {body}");
+    call(&state, &[b"XLEN", b"s"]).await.expect_integer(1);
+    call(&state, &[b"XADD", b"s", b"*", b"f1", b"v2", b"f2", b"v3"]).await;
+    call(&state, &[b"XLEN", b"s"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn xadd_explicit_id_round_trips() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-1", b"f", b"v"]).await.expect_bulk(b"1-1");
+    // Backwards id → error.
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"v"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"XADD", b"s", b"2-0", b"f", b"v"]).await.expect_bulk(b"2-0");
+}
+
+#[tokio::test]
+async fn xadd_nomkstream_on_missing_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"ghost", b"NOMKSTREAM", b"*", b"f", b"v"]).await.expect_nil();
+    call(&state, &[b"EXISTS", b"ghost"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn xlen_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"XLEN", b"missing"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn xrange_returns_matching_entries() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"k", b"a"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"k", b"b"]).await;
+    call(&state, &[b"XADD", b"s", b"3-0", b"k", b"c"]).await;
+    let reply = call(&state, &[b"XRANGE", b"s", b"-", b"+"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.starts_with("*3\r\n"), "expected 3 entries, got: {raw}");
+    // Ids appear in the reply.
+    assert!(raw.contains("1-0") && raw.contains("2-0") && raw.contains("3-0"));
+}
+
+#[tokio::test]
+async fn xrange_count_caps_results() {
+    let state = test_state();
+    for ms in 1..=5u64 {
+        call(&state, &[b"XADD", b"s", format!("{ms}-0").as_bytes(), b"k", b"v"]).await;
+    }
+    let reply = call(&state, &[b"XRANGE", b"s", b"-", b"+", b"COUNT", b"2"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.starts_with("*2\r\n"), "expected 2 entries, got: {raw}");
+}
+
+#[tokio::test]
+async fn xrevrange_walks_backwards() {
+    let state = test_state();
+    for ms in 1..=3u64 {
+        call(&state, &[b"XADD", b"s", format!("{ms}-0").as_bytes(), b"k", b"v"]).await;
+    }
+    let reply = call(&state, &[b"XREVRANGE", b"s", b"+", b"-"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    // First id in the reply should be the highest (3-0).
+    let pos_3 = raw.find("3-0").expect("3-0 present");
+    let pos_1 = raw.find("1-0").expect("1-0 present");
+    assert!(pos_3 < pos_1, "XREVRANGE should emit newest first");
+}
+
+#[tokio::test]
+async fn xdel_removes_by_id() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"f", b"b"]).await;
+    call(&state, &[b"XADD", b"s", b"3-0", b"f", b"c"]).await;
+    call(&state, &[b"XDEL", b"s", b"2-0", b"99-0"]).await.expect_integer(1);
+    call(&state, &[b"XLEN", b"s"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn xtrim_maxlen_trims_head() {
+    let state = test_state();
+    for ms in 1..=5u64 {
+        call(&state, &[b"XADD", b"s", format!("{ms}-0").as_bytes(), b"k", b"v"]).await;
+    }
+    call(&state, &[b"XTRIM", b"s", b"MAXLEN", b"2"]).await.expect_integer(3);
+    call(&state, &[b"XLEN", b"s"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn xtrim_minid_drops_below_threshold() {
+    let state = test_state();
+    for ms in 1..=5u64 {
+        call(&state, &[b"XADD", b"s", format!("{ms}-0").as_bytes(), b"k", b"v"]).await;
+    }
+    // Drop everything strictly below 3-0.
+    call(&state, &[b"XTRIM", b"s", b"MINID", b"3-0"]).await.expect_integer(2);
+    call(&state, &[b"XLEN", b"s"]).await.expect_integer(3);
+}
+
+#[tokio::test]
+async fn xadd_trim_clause_applies_on_append() {
+    let state = test_state();
+    for ms in 1..=3u64 {
+        call(&state, &[b"XADD", b"s", format!("{ms}-0").as_bytes(), b"k", b"v"]).await;
+    }
+    // Append with MAXLEN 2 → pre-existing head is trimmed, final length 2.
+    call(&state, &[b"XADD", b"s", b"MAXLEN", b"2", b"4-0", b"k", b"v"]).await.expect_bulk(b"4-0");
+    call(&state, &[b"XLEN", b"s"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn xread_returns_entries_after_id() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"f", b"b"]).await;
+    let reply = call(&state, &[b"XREAD", b"STREAMS", b"s", b"1-0"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    // Only 2-0 is strictly after 1-0.
+    assert!(raw.contains("2-0"), "reply should contain 2-0: {raw}");
+    assert!(!raw.contains("1-0"), "reply should not contain 1-0: {raw}");
+}
+
+#[tokio::test]
+async fn xread_count_caps_per_stream() {
+    let state = test_state();
+    for ms in 1..=5u64 {
+        call(&state, &[b"XADD", b"s", format!("{ms}-0").as_bytes(), b"k", b"v"]).await;
+    }
+    let reply = call(&state, &[b"XREAD", b"COUNT", b"2", b"STREAMS", b"s", b"0"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    // Two entries.
+    assert!(raw.contains("1-0") && raw.contains("2-0"));
+    assert!(!raw.contains("3-0"), "COUNT 2 should cap results: {raw}");
+}
+
+#[tokio::test]
+async fn xread_with_dollar_returns_nil_for_nonblocking() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"v"]).await;
+    // `$` means "only new entries" — rustyant is non-blocking, so nil.
+    call(&state, &[b"XREAD", b"STREAMS", b"s", b"$"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn xread_all_empty_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"XREAD", b"STREAMS", b"missing", b"0"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn xinfo_stream_summary() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"k", b"a"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"k", b"b"]).await;
+    let reply = call(&state, &[b"XINFO", b"STREAM", b"s"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("length"));
+    assert!(raw.contains("last-generated-id"));
+    assert!(raw.contains("2-0"), "should carry the latest id");
+}
+
+#[tokio::test]
+async fn xinfo_stream_missing_key_errors() {
+    let state = test_state();
+    call(&state, &[b"XINFO", b"STREAM", b"ghost"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn xadd_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"XADD", b"k", b"*", b"f", b"v"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"XLEN", b"k"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn type_of_stream_reports_stream() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"*", b"f", b"v"]).await;
+    call(&state, &[b"TYPE", b"s"]).await.expect_simple("stream");
+}
+
 #[tokio::test]
 async fn malformed_body_returns_parse_error() {
     let state = test_state();

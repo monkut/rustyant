@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::RustyAntError;
 use crate::hll;
+use crate::stream::{AddIdSpec, RangeId, StreamEntry, StreamId, StreamValue, TrimBound, resolve_add_id, trim_in_place};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoredValue {
@@ -26,6 +27,7 @@ pub enum Value {
     List(Vec<Vec<u8>>),
     Set(BTreeSet<String>),
     ZSet(BTreeMap<String, f64>),
+    Stream(crate::stream::StreamValue),
 }
 
 #[derive(Debug)]
@@ -227,6 +229,7 @@ const fn value_kind(value: &Value) -> &'static str {
         Value::List(_) => "list",
         Value::Set(_) => "set",
         Value::ZSet(_) => "zset",
+        Value::Stream(_) => "stream",
     }
 }
 
@@ -910,6 +913,61 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
         pattern: Option<&str>,
         count: usize,
     ) -> Result<(u64, Vec<(String, f64)>), RustyAntError>;
+
+    // ---- Streams -------------------------------------------------------
+    /// Redis `XADD`. Resolves the caller's id spec against the stream's
+    /// `last_generated_id`, appends the entry, and optionally trims the
+    /// head to satisfy a `MAXLEN` / `MINID` bound. Returns the id that
+    /// was actually written.
+    ///
+    /// `nomkstream` set to true: behave like Redis's NOMKSTREAM — if the
+    /// key does not exist, return `None` without creating it.
+    async fn xadd(
+        &self,
+        key: &str,
+        id: AddIdSpec,
+        fields: Vec<(String, Vec<u8>)>,
+        nomkstream: bool,
+        trim: Option<(TrimBound, Option<usize>)>,
+    ) -> Result<Option<StreamId>, RustyAntError>;
+
+    /// Redis `XLEN`: number of entries in the stream. 0 for missing key;
+    /// WRONGTYPE if the key exists as a different kind.
+    async fn xlen(&self, key: &str) -> Result<i64, RustyAntError>;
+
+    /// Redis `XRANGE` / `XREVRANGE`: entries whose id falls within
+    /// `[start, end]`. `reverse=true` walks the matching slice from
+    /// newest to oldest. `count` caps the number of returned entries.
+    async fn xrange(
+        &self,
+        key: &str,
+        start: RangeId,
+        end: RangeId,
+        count: Option<usize>,
+        reverse: bool,
+    ) -> Result<Vec<StreamEntry>, RustyAntError>;
+
+    /// Redis `XDEL`: remove entries by id; returns the number deleted.
+    async fn xdel(&self, key: &str, ids: &[StreamId]) -> Result<i64, RustyAntError>;
+
+    /// Redis `XTRIM`: apply `bound` to the stream, returning the count
+    /// of entries removed. `limit` caps the work per call (Redis's
+    /// `LIMIT n` argument).
+    async fn xtrim(&self, key: &str, bound: TrimBound, limit: Option<usize>) -> Result<i64, RustyAntError>;
+
+    /// Redis `XREAD`: for each `(key, after_id)` pair, return entries
+    /// strictly after `after_id`. `count` caps per-stream. The caller is
+    /// responsible for shaping the `XREAD` reply — this just returns the
+    /// flat map from stream name to its matching entries.
+    async fn xread(
+        &self,
+        keys: &[String],
+        after_ids: &[StreamId],
+        count: Option<usize>,
+    ) -> Result<Vec<(String, Vec<StreamEntry>)>, RustyAntError>;
+
+    /// Redis `XINFO STREAM key`: headline summary of the stream.
+    async fn xinfo_stream(&self, key: &str) -> Result<Option<StreamValue>, RustyAntError>;
 
     /// Return every key matching `pattern` (Redis-style glob: `*`, `?`).
     /// On S3 this fans out to repeated `ListObjectsV2` calls until the
@@ -1879,6 +1937,153 @@ impl Storage for S3Storage {
             }
             Some(_) => Err(wrong_type(key)),
             None => Ok((0, Vec::new())),
+        }
+    }
+
+    // ---- Streams -------------------------------------------------------
+
+    async fn xadd(
+        &self,
+        key: &str,
+        id_spec: AddIdSpec,
+        fields: Vec<(String, Vec<u8>)>,
+        nomkstream: bool,
+        trim: Option<(TrimBound, Option<usize>)>,
+    ) -> Result<Option<StreamId>, RustyAntError> {
+        let now = u64::try_from(now_ms().max(0)).unwrap_or(0);
+        self.cas(key, move |entry| {
+            let (mut stream, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => {
+                    if nomkstream {
+                        return Ok(CasAction::NoOp(None));
+                    }
+                    (StreamValue::default(), None)
+                }
+            };
+            let id = resolve_add_id(id_spec, stream.last_generated_id, now)?;
+            stream.entries.push(StreamEntry { id, fields: fields.clone() });
+            stream.last_generated_id = id;
+            stream.entries_added = stream.entries_added.saturating_add(1);
+            if let Some((bound, limit)) = trim {
+                trim_in_place(&mut stream, bound, limit);
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+            Ok(CasAction::Write(new_entry, Some(id)))
+        })
+        .await
+    }
+
+    async fn xlen(&self, key: &str) -> Result<i64, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Stream(s), .. }) => Ok(i64::try_from(s.entries.len()).unwrap_or(i64::MAX)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(0),
+        }
+    }
+
+    async fn xrange(
+        &self,
+        key: &str,
+        start: RangeId,
+        end: RangeId,
+        count: Option<usize>,
+        reverse: bool,
+    ) -> Result<Vec<StreamEntry>, RustyAntError> {
+        let stream = match self.load(key).await? {
+            Some(StoredValue { value: Value::Stream(s), .. }) => s,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Ok(Vec::new()),
+        };
+        let mut filtered: Vec<StreamEntry> =
+            stream.entries.into_iter().filter(|e| start.ge_min(e.id) && end.le_max(e.id)).collect();
+        if reverse {
+            filtered.reverse();
+        }
+        if let Some(cap) = count {
+            filtered.truncate(cap);
+        }
+        Ok(filtered)
+    }
+
+    async fn xdel(&self, key: &str, ids: &[StreamId]) -> Result<i64, RustyAntError> {
+        let ids = ids.to_vec();
+        self.cas(key, move |entry| {
+            let (mut stream, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let before = stream.entries.len();
+            stream.entries.retain(|e| {
+                if ids.contains(&e.id) {
+                    if e.id > stream.max_deleted_entry_id {
+                        stream.max_deleted_entry_id = e.id;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            let removed = i64::try_from(before - stream.entries.len()).unwrap_or(i64::MAX);
+            if removed == 0 {
+                return Ok(CasAction::NoOp(0));
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+            Ok(CasAction::Write(new_entry, removed))
+        })
+        .await
+    }
+
+    async fn xtrim(&self, key: &str, bound: TrimBound, limit: Option<usize>) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut stream, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let removed = trim_in_place(&mut stream, bound, limit);
+            if removed == 0 {
+                return Ok(CasAction::NoOp(0));
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+            Ok(CasAction::Write(new_entry, i64::try_from(removed).unwrap_or(i64::MAX)))
+        })
+        .await
+    }
+
+    async fn xread(
+        &self,
+        keys: &[String],
+        after_ids: &[StreamId],
+        count: Option<usize>,
+    ) -> Result<Vec<(String, Vec<StreamEntry>)>, RustyAntError> {
+        let mut out: Vec<(String, Vec<StreamEntry>)> = Vec::new();
+        for (key, after) in keys.iter().zip(after_ids.iter()) {
+            let entries = match self.load(key).await? {
+                Some(StoredValue { value: Value::Stream(s), .. }) => {
+                    let mut matched: Vec<StreamEntry> = s.entries.into_iter().filter(|e| e.id > *after).collect();
+                    if let Some(cap) = count {
+                        matched.truncate(cap);
+                    }
+                    matched
+                }
+                Some(_) => return Err(wrong_type(key)),
+                None => Vec::new(),
+            };
+            if !entries.is_empty() {
+                out.push((key.clone(), entries));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn xinfo_stream(&self, key: &str) -> Result<Option<StreamValue>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Stream(s), .. }) => Ok(Some(s)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(None),
         }
     }
 
