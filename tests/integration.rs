@@ -1245,6 +1245,71 @@ async fn hincrbyfloat_on_wrong_type_errors() {
 }
 
 #[tokio::test]
+async fn hrandfield_no_count_returns_bulk_or_nil() {
+    let state = test_state();
+    call(&state, &[b"HRANDFIELD", b"missing"]).await.expect_nil();
+    call(&state, &[b"HSET", b"h", b"only", b"1"]).await;
+    call(&state, &[b"HRANDFIELD", b"h"]).await.expect_bulk(b"only");
+}
+
+#[tokio::test]
+async fn hrandfield_positive_count_distinct() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"a", b"1", b"b", b"2", b"c", b"3"]).await;
+    let reply = call(&state, &[b"HRANDFIELD", b"h", b"2"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 2);
+    let distinct: std::collections::HashSet<_> = reply.iter().collect();
+    assert_eq!(distinct.len(), 2, "positive count must be distinct");
+    // Excess count caps at hash size.
+    let reply = call(&state, &[b"HRANDFIELD", b"h", b"10"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 3);
+}
+
+#[tokio::test]
+async fn hrandfield_negative_count_allows_duplicates() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"only", b"1"]).await;
+    let reply = call(&state, &[b"HRANDFIELD", b"h", b"-5"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 5);
+    for item in reply {
+        assert_eq!(&item[..], b"only");
+    }
+}
+
+#[tokio::test]
+async fn hrandfield_withvalues_interleaves_pairs() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"a", b"1", b"b", b"2", b"c", b"3"]).await;
+    let reply = call(&state, &[b"HRANDFIELD", b"h", b"3", b"WITHVALUES"]).await.into_bulk_array();
+    assert_eq!(reply.len(), 6);
+    for chunk in reply.chunks(2) {
+        let field = std::str::from_utf8(&chunk[0]).expect("utf8");
+        let value = std::str::from_utf8(&chunk[1]).expect("utf8");
+        let expected = match field {
+            "a" => "1",
+            "b" => "2",
+            "c" => "3",
+            other => panic!("unexpected field {other}"),
+        };
+        assert_eq!(value, expected);
+    }
+}
+
+#[tokio::test]
+async fn hrandfield_missing_key_with_count_returns_empty() {
+    let state = test_state();
+    let reply = call(&state, &[b"HRANDFIELD", b"missing", b"3"]).await.into_bulk_array();
+    assert!(reply.is_empty());
+}
+
+#[tokio::test]
+async fn hrandfield_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"HRANDFIELD", b"k"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn srem_returns_count_removed() {
     let state = test_state();
     call(&state, &[b"SADD", b"s", b"a", b"b", b"c"]).await;

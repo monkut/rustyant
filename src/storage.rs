@@ -547,6 +547,39 @@ fn pick_random(set: &BTreeSet<String>, count: i64, allow_duplicates: bool) -> Ve
         .collect()
 }
 
+/// `HRANDFIELD` sampler: uniform over fields. Returns `(field, value)` pairs
+/// so the handler can serialize with or without values. Shares the
+/// positive/negative count semantics of `pick_random`.
+fn pick_random_from_hash(
+    map: &BTreeMap<String, Vec<u8>>,
+    count: i64,
+    allow_duplicates: bool,
+) -> Vec<(String, Vec<u8>)> {
+    if map.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    let ordered: Vec<(&String, &Vec<u8>)> = map.iter().collect();
+    let len = ordered.len();
+    if !allow_duplicates {
+        let take = usize::try_from(count).unwrap_or(0).min(len);
+        let start = usize::try_from(pseudo_rand_u64() % (len as u64)).unwrap_or(0);
+        return (0..take)
+            .map(|i| (ordered[(start + i) % len].0.clone(), ordered[(start + i) % len].1.clone()))
+            .collect();
+    }
+    let take = usize::try_from(count.unsigned_abs()).unwrap_or(0);
+    let mut rng = pseudo_rand_u64();
+    (0..take)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let idx = usize::try_from(rng % (len as u64)).unwrap_or(0);
+            (ordered[idx].0.clone(), ordered[idx].1.clone())
+        })
+        .collect()
+}
+
 /// `ZRANDMEMBER` sampler: uniform over members (Redis ignores scores for
 /// weighting). Returns `(member, score)` pairs so the handler can format
 /// with or without scores. Mirrors `pick_random`'s positive/negative count
@@ -691,6 +724,16 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError>;
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError>;
     async fn hincr_by_float(&self, key: &str, field: &str, delta: f64) -> Result<f64, RustyAntError>;
+    /// Redis `HRANDFIELD` sampler: uniform over fields. Positive `count` ⇒
+    /// distinct fields (capped at hash size); negative ⇒ exactly `|count|`
+    /// with duplicates. Returns `(field, value)` pairs; the handler decides
+    /// whether to serialize values.
+    async fn hrandfield(
+        &self,
+        key: &str,
+        count: i64,
+        allow_duplicates: bool,
+    ) -> Result<Vec<(String, Vec<u8>)>, RustyAntError>;
     /// Incremental iteration over a hash's `(field, value)` pairs. `cursor=0`
     /// starts a fresh scan; a non-zero return cursor means more pages remain,
     /// `0` means the scan is exhausted. `count` bounds the batch size; `MATCH`
@@ -2253,6 +2296,19 @@ impl Storage for S3Storage {
             Ok(CasAction::Write(new_entry, new_val))
         })
         .await
+    }
+
+    async fn hrandfield(
+        &self,
+        key: &str,
+        count: i64,
+        allow_duplicates: bool,
+    ) -> Result<Vec<(String, Vec<u8>)>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Hash(m), .. }) => Ok(pick_random_from_hash(&m, count, allow_duplicates)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
     }
 
     async fn srem(&self, key: &str, members: &[String]) -> Result<i64, RustyAntError> {

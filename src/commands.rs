@@ -218,6 +218,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HMGET" => handle_hmget(state, args).await,
         "HINCRBY" => handle_hincrby(state, args).await,
         "HINCRBYFLOAT" => handle_hincrbyfloat(state, args).await,
+        "HRANDFIELD" => handle_hrandfield(state, args).await,
         "HSCAN" => handle_hscan(state, args).await,
         // Lists
         "LPUSH" => handle_push(state, args, true).await,
@@ -1799,6 +1800,50 @@ async fn handle_hincrbyfloat(state: &State, args: Vec<Bytes>) -> Result<RespRepl
     }
     let new_val = state.storage.hincr_by_float(key, field, delta).await?;
     Ok(RespReply::BulkString(Some(Bytes::from(format_score(new_val).into_bytes()))))
+}
+
+/// Redis `HRANDFIELD key [count [WITHVALUES]]`.
+///
+/// No-count form: one random field as bulk, or nil on missing key.
+/// Positive count: up to `count` distinct fields. Negative count:
+/// exactly `|count|` fields with duplicates allowed. `WITHVALUES`
+/// interleaves `field, value` pairs in reply.
+async fn handle_hrandfield(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HRANDFIELD", matches!(args.len(), 1..=3))?;
+    let key = arg_as_str(&args[0])?;
+
+    if args.len() == 1 {
+        let mut picked = state.storage.hrandfield(key, 1, false).await?;
+        return Ok(picked
+            .pop()
+            .map_or(RespReply::Nil, |(f, _)| RespReply::BulkString(Some(Bytes::from(f.into_bytes())))));
+    }
+
+    let count = parse_i64(&args[1], "count")?;
+    let with_values = if args.len() == 3 {
+        if !arg_as_str(&args[2])?.eq_ignore_ascii_case("WITHVALUES") {
+            return Err(RustyAntError::Parse("syntax error".into()));
+        }
+        true
+    } else {
+        false
+    };
+
+    let allow_duplicates = count < 0;
+    let abs_count = count.checked_abs().ok_or_else(|| RustyAntError::Parse("count overflow".into()))?;
+    let picked = state.storage.hrandfield(key, abs_count, allow_duplicates).await?;
+    if with_values {
+        let mut out = Vec::with_capacity(picked.len() * 2);
+        for (field, value) in picked {
+            out.push(RespReply::BulkString(Some(Bytes::from(field.into_bytes()))));
+            out.push(RespReply::BulkString(Some(Bytes::from(value))));
+        }
+        Ok(RespReply::Array(out))
+    } else {
+        Ok(RespReply::Array(
+            picked.into_iter().map(|(f, _)| RespReply::BulkString(Some(Bytes::from(f.into_bytes())))).collect(),
+        ))
+    }
 }
 
 async fn handle_srem(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
