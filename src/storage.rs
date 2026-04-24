@@ -107,7 +107,8 @@ impl ScoreBound {
         Ok(Self::Inclusive(v))
     }
 
-    fn ge_min(self, score: f64) -> bool {
+    /// True when `score` satisfies the minimum-side bound.
+    pub fn ge_min(self, score: f64) -> bool {
         match self {
             Self::Inclusive(v) => score >= v,
             Self::Exclusive(v) => score > v,
@@ -116,7 +117,8 @@ impl ScoreBound {
         }
     }
 
-    fn le_max(self, score: f64) -> bool {
+    /// True when `score` satisfies the maximum-side bound.
+    pub fn le_max(self, score: f64) -> bool {
         match self {
             Self::Inclusive(v) => score <= v,
             Self::Exclusive(v) => score < v,
@@ -157,7 +159,8 @@ impl LexBound {
         }
     }
 
-    fn ge_min(&self, member: &str) -> bool {
+    /// True when `member` satisfies the minimum-side bound.
+    pub fn ge_min(&self, member: &str) -> bool {
         match self {
             Self::Inclusive(v) => member >= v.as_str(),
             Self::Exclusive(v) => member > v.as_str(),
@@ -166,7 +169,8 @@ impl LexBound {
         }
     }
 
-    fn le_max(&self, member: &str) -> bool {
+    /// True when `member` satisfies the maximum-side bound.
+    pub fn le_max(&self, member: &str) -> bool {
         match self {
             Self::Inclusive(v) => member <= v.as_str(),
             Self::Exclusive(v) => member < v.as_str(),

@@ -1529,6 +1529,120 @@ async fn zrangebyscore_infinity_bounds() {
     assert_eq!(m[1].as_ref(), b"b");
 }
 
+#[tokio::test]
+async fn zrangebyscore_with_withscores_and_limit() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    // WITHSCORES only.
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"1", b"4", b"WITHSCORES"]).await.into_bulk_array();
+    assert_eq!(m.len(), 8);
+    assert_eq!(m[0].as_ref(), b"a");
+    assert_eq!(m[1].as_ref(), b"1");
+    assert_eq!(m[2].as_ref(), b"b");
+    assert_eq!(m[3].as_ref(), b"2");
+    // LIMIT only: offset 1, count 2 → b, c.
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"1", b"4", b"LIMIT", b"1", b"2"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+    // Both WITHSCORES + LIMIT interleaved.
+    let m = call(&state, &[b"ZRANGEBYSCORE", b"z", b"1", b"4", b"LIMIT", b"0", b"2", b"WITHSCORES"])
+        .await
+        .into_bulk_array();
+    assert_eq!(m.len(), 4);
+    assert_eq!(m[0].as_ref(), b"a");
+    assert_eq!(m[1].as_ref(), b"1");
+}
+
+#[tokio::test]
+async fn zrevrangebyscore_with_withscores() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    // Reverse: (max, min) = (3, 1) → c, b, a — interleaved with scores.
+    let m = call(&state, &[b"ZREVRANGEBYSCORE", b"z", b"3", b"1", b"WITHSCORES"]).await.into_bulk_array();
+    assert_eq!(m.len(), 6);
+    assert_eq!(m[0].as_ref(), b"c");
+    assert_eq!(m[1].as_ref(), b"3");
+    assert_eq!(m[4].as_ref(), b"a");
+}
+
+// ---------------------------------------------------------------------------
+// Unified ZRANGE form — [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn zrange_unified_withscores() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let m = call(&state, &[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"]).await.into_bulk_array();
+    assert_eq!(m.len(), 6);
+    assert_eq!(m[0].as_ref(), b"a");
+    assert_eq!(m[1].as_ref(), b"1");
+    assert_eq!(m[2].as_ref(), b"b");
+    assert_eq!(m[3].as_ref(), b"2");
+}
+
+#[tokio::test]
+async fn zrange_unified_rev_matches_zrevrange() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    let m = call(&state, &[b"ZRANGE", b"z", b"0", b"-1", b"REV"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrange_unified_byscore() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    let m = call(&state, &[b"ZRANGE", b"z", b"2", b"3", b"BYSCORE"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrange_unified_byscore_rev_swaps_args() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    // With REV, Redis expects (max, min) argument order.
+    let m = call(&state, &[b"ZRANGE", b"z", b"3", b"2", b"BYSCORE", b"REV"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"c".to_vec(), b"b".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrange_unified_byscore_with_limit() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d"]).await;
+    let m = call(&state, &[b"ZRANGE", b"z", b"1", b"4", b"BYSCORE", b"LIMIT", b"1", b"2"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrange_unified_bylex() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d"]).await;
+    let m = call(&state, &[b"ZRANGE", b"z", b"[b", b"[c", b"BYLEX"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrange_unified_limit_without_by_errors() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    // LIMIT requires BYSCORE or BYLEX.
+    call(&state, &[b"ZRANGE", b"z", b"0", b"-1", b"LIMIT", b"0", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zrange_unified_bylex_withscores_errors() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a"]).await;
+    call(&state, &[b"ZRANGE", b"z", b"-", b"+", b"BYLEX", b"WITHSCORES"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zrange_unified_byscore_and_bylex_mutually_exclusive() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"ZRANGE", b"z", b"0", b"-1", b"BYSCORE", b"BYLEX"]).await.expect_error_prefix("ERR");
+}
+
 // ---------------------------------------------------------------------------
 // ZRANGEBYLEX / ZREVRANGEBYLEX / ZLEXCOUNT / ZREMRANGEBYLEX
 // Lex bounds assume equal scores across members (the canonical Redis use case).
