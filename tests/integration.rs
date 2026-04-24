@@ -152,6 +152,66 @@ async fn select_non_numeric_errors() {
 }
 
 #[tokio::test]
+async fn object_encoding_per_kind() {
+    let state = test_state();
+    call(&state, &[b"SET", b"s", b"v"]).await;
+    call(&state, &[b"OBJECT", b"ENCODING", b"s"]).await.expect_bulk(b"raw");
+    call(&state, &[b"HSET", b"h", b"f", b"v"]).await;
+    call(&state, &[b"OBJECT", b"ENCODING", b"h"]).await.expect_bulk(b"listpack");
+    call(&state, &[b"SADD", b"set", b"x"]).await;
+    call(&state, &[b"OBJECT", b"ENCODING", b"set"]).await.expect_bulk(b"hashtable");
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"OBJECT", b"ENCODING", b"z"]).await.expect_bulk(b"listpack");
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"OBJECT", b"ENCODING", b"l"]).await.expect_bulk(b"listpack");
+}
+
+#[tokio::test]
+async fn object_encoding_missing_key_errors() {
+    let state = test_state();
+    call(&state, &[b"OBJECT", b"ENCODING", b"ghost"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn object_idletime_and_refcount_on_existing_key() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"OBJECT", b"IDLETIME", b"k"]).await.expect_integer(0);
+    call(&state, &[b"OBJECT", b"REFCOUNT", b"k"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn object_idletime_missing_errors() {
+    let state = test_state();
+    call(&state, &[b"OBJECT", b"IDLETIME", b"ghost"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"OBJECT", b"REFCOUNT", b"ghost"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn object_freq_always_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    // Redis returns an LFU-not-selected error even for existing keys.
+    call(&state, &[b"OBJECT", b"FREQ", b"k"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn object_help_returns_bullets() {
+    let state = test_state();
+    let reply = call(&state, &[b"OBJECT", b"HELP"]).await.into_bulk_array();
+    assert!(!reply.is_empty());
+    let joined: Vec<String> = reply.iter().map(|b| String::from_utf8_lossy(b).to_string()).collect();
+    assert!(joined.iter().any(|s| s.contains("ENCODING")), "help should mention ENCODING: {joined:?}");
+}
+
+#[tokio::test]
+async fn object_unknown_subcommand_errors() {
+    let state = test_state();
+    call(&state, &[b"OBJECT", b"WEIRD", b"k"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"OBJECT"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn malformed_body_returns_parse_error() {
     let state = test_state();
     let resp = handle(
