@@ -214,6 +214,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "HSTRLEN" => handle_hstrlen(state, args).await,
         "HMGET" => handle_hmget(state, args).await,
         "HINCRBY" => handle_hincrby(state, args).await,
+        "HINCRBYFLOAT" => handle_hincrbyfloat(state, args).await,
         "HSCAN" => handle_hscan(state, args).await,
         // Lists
         "LPUSH" => handle_push(state, args, true).await,
@@ -1415,6 +1416,20 @@ async fn handle_hincrby(state: &State, args: Vec<Bytes>) -> Result<RespReply, Ru
     let delta = parse_i64(&args[2], "increment")?;
     let new_val = state.storage.hincr_by(key, field, delta).await?;
     Ok(RespReply::Integer(new_val))
+}
+
+/// Redis `HINCRBYFLOAT key field increment`. Reply is the new value as a
+/// bulk string, matching Redis. Rejects NaN / infinity deltas and results.
+async fn handle_hincrbyfloat(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("HINCRBYFLOAT", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let field = arg_as_str(&args[1])?;
+    let delta = parse_f64(&args[2], "increment")?;
+    if delta.is_nan() || delta.is_infinite() {
+        return Err(RustyAntError::Parse("increment would produce NaN or infinity".into()));
+    }
+    let new_val = state.storage.hincr_by_float(key, field, delta).await?;
+    Ok(RespReply::BulkString(Some(Bytes::from(format_score(new_val).into_bytes()))))
 }
 
 async fn handle_srem(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {

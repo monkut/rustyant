@@ -1022,6 +1022,42 @@ async fn hincrby_on_non_integer_field_errors() {
 }
 
 #[tokio::test]
+async fn hincrbyfloat_creates_field_at_zero() {
+    let state = test_state();
+    call(&state, &[b"HINCRBYFLOAT", b"h", b"bal", b"10.5"]).await.expect_bulk(b"10.5");
+    call(&state, &[b"HINCRBYFLOAT", b"h", b"bal", b"0.1"]).await.expect_bulk(b"10.6");
+    call(&state, &[b"HINCRBYFLOAT", b"h", b"bal", b"-10.6"]).await.expect_bulk(b"0");
+}
+
+#[tokio::test]
+async fn hincrbyfloat_on_existing_integer_field_works() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"count", b"5"]).await;
+    call(&state, &[b"HINCRBYFLOAT", b"h", b"count", b"0.5"]).await.expect_bulk(b"5.5");
+}
+
+#[tokio::test]
+async fn hincrbyfloat_on_non_float_field_errors() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"h", b"name", b"alice"]).await;
+    call(&state, &[b"HINCRBYFLOAT", b"h", b"name", b"1.0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn hincrbyfloat_rejects_nan_or_inf_increment() {
+    let state = test_state();
+    call(&state, &[b"HINCRBYFLOAT", b"h", b"f", b"nan"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"HINCRBYFLOAT", b"h", b"f", b"inf"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn hincrbyfloat_on_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"HINCRBYFLOAT", b"k", b"f", b"1.0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn srem_returns_count_removed() {
     let state = test_state();
     call(&state, &[b"SADD", b"s", b"a", b"b", b"c"]).await;

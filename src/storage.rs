@@ -585,6 +585,7 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn hstrlen(&self, key: &str, field: &str) -> Result<i64, RustyAntError>;
     async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<Bytes>>, RustyAntError>;
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError>;
+    async fn hincr_by_float(&self, key: &str, field: &str, delta: f64) -> Result<f64, RustyAntError>;
     /// Incremental iteration over a hash's `(field, value)` pairs. `cursor=0`
     /// starts a fresh scan; a non-zero return cursor means more pages remain,
     /// `0` means the scan is exhausted. `count` bounds the batch size; `MATCH`
@@ -2071,6 +2072,34 @@ impl Storage for S3Storage {
             let new_val =
                 current.checked_add(delta).ok_or_else(|| RustyAntError::Parse("increment overflow".into()))?;
             map.insert(field.clone(), new_val.to_string().into_bytes());
+            let new_entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
+            Ok(CasAction::Write(new_entry, new_val))
+        })
+        .await
+    }
+
+    async fn hincr_by_float(&self, key: &str, field: &str, delta: f64) -> Result<f64, RustyAntError> {
+        let field = field.to_string();
+        self.cas(key, move |entry| {
+            let (mut map, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Hash(m), expires_at_ms }) => (m.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => (BTreeMap::new(), None),
+            };
+            let current: f64 = map
+                .get(&field)
+                .map(|v| {
+                    let s =
+                        std::str::from_utf8(v).map_err(|_| RustyAntError::Parse("hash value is not a float".into()))?;
+                    s.parse::<f64>().map_err(|_| RustyAntError::Parse("hash value is not a float".into()))
+                })
+                .transpose()?
+                .unwrap_or(0.0);
+            let new_val = current + delta;
+            if new_val.is_nan() || new_val.is_infinite() {
+                return Err(RustyAntError::Parse("increment would produce NaN or infinity".into()));
+            }
+            map.insert(field.clone(), format_float(new_val).into_bytes());
             let new_entry = StoredValue { expires_at_ms, value: Value::Hash(map) };
             Ok(CasAction::Write(new_entry, new_val))
         })
