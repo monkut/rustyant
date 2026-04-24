@@ -674,6 +674,12 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// `"list"`, `"set"`, `"zset"`) or `None` when the key is missing/expired.
     async fn kind(&self, key: &str) -> Result<Option<&'static str>, RustyAntError>;
 
+    /// Approximate byte size of the value for `MEMORY USAGE`. `None` for
+    /// missing / expired keys. Returns the serialized-JSON byte length on
+    /// the S3 backend (what the object actually occupies), which is the
+    /// closest honest signal we have without an in-process allocator.
+    async fn mem_usage(&self, key: &str) -> Result<Option<i64>, RustyAntError>;
+
     async fn get_string(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
     /// `GETEX`: return the string value (`None` when missing / wrong type is an
     /// error) and atomically adjust its TTL per `op` in the same read-modify-
@@ -1264,6 +1270,16 @@ impl Storage for S3Storage {
 
     async fn kind(&self, key: &str) -> Result<Option<&'static str>, RustyAntError> {
         Ok(self.load(key).await?.map(|v| value_kind(&v.value)))
+    }
+
+    async fn mem_usage(&self, key: &str) -> Result<Option<i64>, RustyAntError> {
+        let Some(entry) = self.load(key).await? else { return Ok(None) };
+        // Serialize the value to JSON — the same shape written to S3 — and
+        // report its byte length. Not a perfect analog of Redis's
+        // `MEMORY USAGE` (which tallies in-process allocations) but an
+        // honest "bytes this key occupies on the backend".
+        let serialized = serde_json::to_vec(&entry.value)?;
+        Ok(Some(i64::try_from(serialized.len()).unwrap_or(i64::MAX)))
     }
 
     async fn expire_at(&self, key: &str, expires_at_ms: i64) -> Result<bool, RustyAntError> {
