@@ -131,6 +131,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
             Ok(RespReply::Integer(state.started_at_ms / 1000))
         }
         "LATENCY" => handle_latency(&args),
+        "MEMORY" => handle_memory(state, args).await,
         "DEBUG" => handle_debug(&args).await,
         "MULTI" => handle_multi(&args),
         "EXEC" => handle_exec(&args),
@@ -3065,6 +3066,41 @@ fn handle_bgsave(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
 /// the `LATENCY` command family itself is stubbed. `HISTORY` / `LATEST` /
 /// `GRAPH` return empty results, `RESET` returns `0`, `DOCTOR` returns a
 /// bland all-clear string.
+/// Redis `MEMORY` — subcommand router.
+///
+/// `USAGE key [SAMPLES n]` is the one with real callers (bigkeys scripts,
+/// memory profilers); rustyant reports the serialized byte length of the
+/// value, which is the honest analog on an S3-backed store where there is
+/// no in-process allocator to query. `SAMPLES` is accepted and ignored.
+/// Remaining subcommands (`STATS`, `DOCTOR`, `PURGE`, `MALLOC-STATS`) are
+/// admin / profiler surface without a sensible answer here.
+async fn handle_memory(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "MEMORY".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    match sub.as_str() {
+        "USAGE" => {
+            if !matches!(args.len(), 2 | 4) {
+                return Err(RustyAntError::WrongArity { command: "MEMORY USAGE".into() });
+            }
+            let key = arg_as_str(&args[1])?;
+            if args.len() == 4 {
+                if !arg_as_str(&args[2])?.eq_ignore_ascii_case("SAMPLES") {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                // Parse for validation; value is ignored on this backend.
+                let _ = parse_i64(&args[3], "SAMPLES")?;
+            }
+            Ok(state.storage.mem_usage(key).await?.map_or(RespReply::Nil, RespReply::Integer))
+        }
+        "DOCTOR" => Ok(RespReply::BulkString(Some(Bytes::from_static(
+            b"Sam, I detected a few issues in this Redis instance memory implants:\n\n * rustyant runs on S3, so no in-process heap signals are collected.\n",
+        )))),
+        "PURGE" => Ok(RespReply::ok()),
+        "STATS" | "MALLOC-STATS" => Ok(RespReply::Array(Vec::new())),
+        other => Err(RustyAntError::Parse(format!("unsupported MEMORY subcommand: {other}"))),
+    }
+}
+
 fn handle_latency(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
     let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "LATENCY".into() })?;
     let sub = arg_as_str(sub)?.to_ascii_uppercase();

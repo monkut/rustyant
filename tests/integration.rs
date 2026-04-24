@@ -258,6 +258,54 @@ async fn object_unknown_subcommand_errors() {
 }
 
 #[tokio::test]
+async fn memory_usage_missing_key_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"MEMORY", b"USAGE", b"ghost"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn memory_usage_returns_positive_for_existing_key() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"hello"]).await;
+    let reply = call(&state, &[b"MEMORY", b"USAGE", b"k"]).await;
+    let body = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(body.starts_with(':'), "expected integer reply, got {body}");
+    // Serialized JSON for the string value includes the bytes; just assert > 0.
+    let n: i64 = body.trim_start_matches(':').trim_end().parse().expect("integer");
+    assert!(n > 0, "expected positive byte count, got {n}");
+}
+
+#[tokio::test]
+async fn memory_usage_samples_is_accepted_and_ignored() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"hello"]).await;
+    // Any non-negative SAMPLES value is fine.
+    let a = call(&state, &[b"MEMORY", b"USAGE", b"k"]).await;
+    let b = call(&state, &[b"MEMORY", b"USAGE", b"k", b"SAMPLES", b"5"]).await;
+    assert_eq!(a.raw, b.raw, "SAMPLES should not change the computed size");
+}
+
+#[tokio::test]
+async fn memory_usage_non_samples_option_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"MEMORY", b"USAGE", b"k", b"BOGUS", b"1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn memory_purge_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"MEMORY", b"PURGE"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn memory_unknown_subcommand_errors() {
+    let state = test_state();
+    call(&state, &[b"MEMORY", b"ELSE"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"MEMORY"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn malformed_body_returns_parse_error() {
     let state = test_state();
     let resp = handle(
