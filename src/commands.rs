@@ -652,15 +652,243 @@ async fn handle_zadd(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     Ok(RespReply::Integer(count))
 }
 
+/// Redis's unified `ZRANGE`:
+/// `ZRANGE key start stop [BYSCORE | BYLEX] [REV] [LIMIT offset count] [WITHSCORES]`.
+///
+/// Default mode treats `start` / `stop` as rank indices. `BYSCORE` / `BYLEX`
+/// reinterpret them as score / lex bounds (mutually exclusive with each
+/// other). `LIMIT` is only legal with `BYSCORE` or `BYLEX`. `WITHSCORES`
+/// is rejected with `BYLEX` (Redis rule — scores make no sense there).
+/// `REV` reverses iteration; with `BYSCORE` it flips argument order to
+/// `(max, min)`, with `BYLEX` to `(max, min)`, matching Redis.
 async fn handle_zrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
-    arity("ZRANGE", args.len() == 3)?;
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "ZRANGE".into() });
+    }
     let key = arg_as_str(&args[0])?;
-    let start = parse_i64(&args[1], "start")?;
-    let stop = parse_i64(&args[2], "stop")?;
-    let members = state.storage.zrange(key, start, stop).await?;
-    Ok(RespReply::Array(
-        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
-    ))
+    let opts = parse_zrange_opts("ZRANGE", &args[3..])?;
+    execute_zrange(state, key, &args[1], &args[2], &opts).await
+}
+
+async fn handle_zrevrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    // ZREVRANGE accepts the same WITHSCORES tail as ZRANGE REV — but not
+    // BYSCORE / BYLEX / LIMIT (those are unified-form-only).
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "ZREVRANGE".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let tail = &args[3..];
+    let with_scores = match tail.len() {
+        0 => false,
+        1 if arg_as_str(&tail[0])?.eq_ignore_ascii_case("WITHSCORES") => true,
+        _ => return Err(RustyAntError::Parse("syntax error".into())),
+    };
+    let opts = ZRangeOpts { mode: ZRangeMode::Rank, rev: true, limit: None, with_scores };
+    execute_zrange(state, key, &args[1], &args[2], &opts).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ZRangeMode {
+    Rank,
+    Score,
+    Lex,
+}
+
+#[derive(Debug)]
+struct ZRangeOpts {
+    mode: ZRangeMode,
+    rev: bool,
+    limit: Option<(i64, i64)>,
+    with_scores: bool,
+}
+
+/// Parse the modifier tail for the unified ZRANGE form. Enforces Redis's
+/// mutual-exclusion rules (`BYSCORE`/`BYLEX`, `LIMIT` requires one of them,
+/// `WITHSCORES` incompatible with `BYLEX`).
+fn parse_zrange_opts(cmd_name: &str, tail: &[Bytes]) -> Result<ZRangeOpts, RustyAntError> {
+    let mut mode = ZRangeMode::Rank;
+    let mut rev = false;
+    let mut limit: Option<(i64, i64)> = None;
+    let mut with_scores = false;
+    let mut i = 0;
+    while i < tail.len() {
+        match arg_as_str(&tail[i])?.to_ascii_uppercase().as_str() {
+            "BYSCORE" => {
+                if matches!(mode, ZRangeMode::Lex) {
+                    return Err(RustyAntError::Parse("syntax error, BYSCORE and BYLEX are mutually exclusive".into()));
+                }
+                mode = ZRangeMode::Score;
+                i += 1;
+            }
+            "BYLEX" => {
+                if matches!(mode, ZRangeMode::Score) {
+                    return Err(RustyAntError::Parse("syntax error, BYSCORE and BYLEX are mutually exclusive".into()));
+                }
+                mode = ZRangeMode::Lex;
+                i += 1;
+            }
+            "REV" => {
+                rev = true;
+                i += 1;
+            }
+            "LIMIT" => {
+                if i + 2 >= tail.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let offset = parse_i64(&tail[i + 1], "offset")?;
+                let count = parse_i64(&tail[i + 2], "count")?;
+                limit = Some((offset, count));
+                i += 3;
+            }
+            "WITHSCORES" => {
+                with_scores = true;
+                i += 1;
+            }
+            _ => return Err(RustyAntError::Parse(format!("syntax error in {cmd_name}"))),
+        }
+    }
+    if limit.is_some() && matches!(mode, ZRangeMode::Rank) {
+        return Err(RustyAntError::Parse(
+            "syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX".into(),
+        ));
+    }
+    if with_scores && matches!(mode, ZRangeMode::Lex) {
+        return Err(RustyAntError::Parse("syntax error, WITHSCORES not supported in combination with BYLEX".into()));
+    }
+    Ok(ZRangeOpts { mode, rev, limit, with_scores })
+}
+
+async fn execute_zrange(
+    state: &State,
+    key: &str,
+    lo: &Bytes,
+    hi: &Bytes,
+    opts: &ZRangeOpts,
+) -> Result<RespReply, RustyAntError> {
+    let pairs = match opts.mode {
+        ZRangeMode::Rank => {
+            let start = parse_i64(lo, "start")?;
+            let stop = parse_i64(hi, "stop")?;
+            range_by_rank(state, key, start, stop, opts.rev).await?
+        }
+        ZRangeMode::Score => {
+            // REV + BYSCORE swaps the semantic order (first arg is max, second is min).
+            let (min, max) = if opts.rev {
+                (ScoreBound::parse(arg_as_str(hi)?)?, ScoreBound::parse(arg_as_str(lo)?)?)
+            } else {
+                (ScoreBound::parse(arg_as_str(lo)?)?, ScoreBound::parse(arg_as_str(hi)?)?)
+            };
+            range_by_score(state, key, min, max, opts.rev, opts.limit).await?
+        }
+        ZRangeMode::Lex => {
+            let (min, max) = if opts.rev {
+                (LexBound::parse(arg_as_str(hi)?)?, LexBound::parse(arg_as_str(lo)?)?)
+            } else {
+                (LexBound::parse(arg_as_str(lo)?)?, LexBound::parse(arg_as_str(hi)?)?)
+            };
+            range_by_lex(state, key, min, max, opts.rev, opts.limit).await?
+        }
+    };
+    Ok(pairs_to_reply(pairs, opts.with_scores))
+}
+
+fn pairs_to_reply(pairs: Vec<(String, f64)>, with_scores: bool) -> RespReply {
+    let mut out: Vec<RespReply> = Vec::with_capacity(pairs.len() * if with_scores { 2 } else { 1 });
+    for (member, score) in pairs {
+        out.push(RespReply::BulkString(Some(Bytes::from(member.into_bytes()))));
+        if with_scores {
+            out.push(RespReply::BulkString(Some(Bytes::from(format_score(score).into_bytes()))));
+        }
+    }
+    RespReply::Array(out)
+}
+
+/// Sort by `(score asc, member asc)`, optionally reverse, then slice by
+/// rank indices. Negative indices are normalised against the sorted length.
+async fn range_by_rank(
+    state: &State,
+    key: &str,
+    start: i64,
+    stop: i64,
+    rev: bool,
+) -> Result<Vec<(String, f64)>, RustyAntError> {
+    let mut sorted = state.storage.zitems(key).await?;
+    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    if rev {
+        sorted.reverse();
+    }
+    let len = i64::try_from(sorted.len()).unwrap_or(i64::MAX);
+    let Some((s, e)) = normalize_rank_range(len, start, stop) else {
+        return Ok(Vec::new());
+    };
+    Ok(sorted[s..=e].to_vec())
+}
+
+/// Clone of the private `resolve_range` helper in storage.rs, kept local to
+/// avoid exposing storage-internal range normalisation.
+fn normalize_rank_range(len: i64, start: i64, stop: i64) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let norm = |i: i64| -> i64 { if i < 0 { (len + i).max(0) } else { i.min(len - 1) } };
+    let s = norm(start);
+    let e = norm(stop);
+    if s > e {
+        return None;
+    }
+    Some((usize::try_from(s).unwrap_or(0), usize::try_from(e).unwrap_or(0)))
+}
+
+async fn range_by_score(
+    state: &State,
+    key: &str,
+    min: ScoreBound,
+    max: ScoreBound,
+    rev: bool,
+    limit: Option<(i64, i64)>,
+) -> Result<Vec<(String, f64)>, RustyAntError> {
+    let items = state.storage.zitems(key).await?;
+    let mut pairs: Vec<(String, f64)> = items.into_iter().filter(|(_, s)| min.ge_min(*s) && max.le_max(*s)).collect();
+    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    if rev {
+        pairs.reverse();
+    }
+    Ok(apply_limit_pairs(pairs, limit))
+}
+
+async fn range_by_lex(
+    state: &State,
+    key: &str,
+    min: LexBound,
+    max: LexBound,
+    rev: bool,
+    limit: Option<(i64, i64)>,
+) -> Result<Vec<(String, f64)>, RustyAntError> {
+    let items = state.storage.zitems(key).await?;
+    let mut pairs: Vec<(String, f64)> =
+        items.into_iter().filter(|(m, _)| min.ge_min(m.as_str()) && max.le_max(m.as_str())).collect();
+    // Lex walk assumes equal scores; order by member for determinism.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    if rev {
+        pairs.reverse();
+    }
+    Ok(apply_limit_pairs(pairs, limit))
+}
+
+/// Apply `(offset, count)` LIMIT to a pre-ordered pair list. Mirrors
+/// `apply_lex_limit`'s semantics (negative `count` = no cap).
+fn apply_limit_pairs(mut pairs: Vec<(String, f64)>, limit: Option<(i64, i64)>) -> Vec<(String, f64)> {
+    let Some((offset, count)) = limit else { return pairs };
+    let offset_usize = usize::try_from(offset.max(0)).unwrap_or(0);
+    if offset_usize >= pairs.len() {
+        return Vec::new();
+    }
+    pairs.drain(..offset_usize);
+    if count >= 0 {
+        let cap = usize::try_from(count).unwrap_or(0);
+        pairs.truncate(cap);
+    }
+    pairs
 }
 
 // ---- Additional read-only commands ----------------------------------------
@@ -1666,14 +1894,57 @@ async fn handle_zrandmember(state: &State, args: Vec<Bytes>) -> Result<RespReply
 }
 
 async fn handle_zrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
-    arity("ZRANGEBYSCORE", args.len() == 3)?;
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "ZRANGEBYSCORE".into() });
+    }
     let key = arg_as_str(&args[0])?;
     let min = ScoreBound::parse(arg_as_str(&args[1])?)?;
     let max = ScoreBound::parse(arg_as_str(&args[2])?)?;
-    let members = state.storage.zrangebyscore(key, min, max).await?;
-    Ok(RespReply::Array(
-        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
-    ))
+    let (with_scores, limit) = parse_zrangebyscore_tail(&args[3..])?;
+    let pairs = range_by_score(state, key, min, max, false, limit).await?;
+    Ok(pairs_to_reply(pairs, with_scores))
+}
+
+async fn handle_zrevrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "ZREVRANGEBYSCORE".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    // ZREVRANGEBYSCORE takes (max, min) — the reverse of ZRANGEBYSCORE — to
+    // match the Redis CLI convention.
+    let max = ScoreBound::parse(arg_as_str(&args[1])?)?;
+    let min = ScoreBound::parse(arg_as_str(&args[2])?)?;
+    let (with_scores, limit) = parse_zrangebyscore_tail(&args[3..])?;
+    let pairs = range_by_score(state, key, min, max, true, limit).await?;
+    Ok(pairs_to_reply(pairs, with_scores))
+}
+
+/// Parse the `[WITHSCORES] [LIMIT offset count]` tail shared by
+/// ZRANGEBYSCORE / ZREVRANGEBYSCORE. Either may appear, in either order
+/// (matching Redis); the parser just consumes tokens greedily.
+fn parse_zrangebyscore_tail(tail: &[Bytes]) -> Result<(bool, Option<(i64, i64)>), RustyAntError> {
+    let mut with_scores = false;
+    let mut limit: Option<(i64, i64)> = None;
+    let mut i = 0;
+    while i < tail.len() {
+        match arg_as_str(&tail[i])?.to_ascii_uppercase().as_str() {
+            "WITHSCORES" => {
+                with_scores = true;
+                i += 1;
+            }
+            "LIMIT" => {
+                if i + 2 >= tail.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let offset = parse_i64(&tail[i + 1], "offset")?;
+                let count = parse_i64(&tail[i + 2], "count")?;
+                limit = Some((offset, count));
+                i += 3;
+            }
+            _ => return Err(RustyAntError::Parse("syntax error".into())),
+        }
+    }
+    Ok((with_scores, limit))
 }
 
 /// Parse a trailing `LIMIT offset count` tail at `args[start..]`. Returns
@@ -1984,30 +2255,6 @@ async fn handle_msetnx(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
 }
 
 // ---- New sorted-set commands ----------------------------------------------
-
-async fn handle_zrevrange(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
-    arity("ZREVRANGE", args.len() == 3)?;
-    let key = arg_as_str(&args[0])?;
-    let start = parse_i64(&args[1], "start")?;
-    let stop = parse_i64(&args[2], "stop")?;
-    let members = state.storage.zrevrange(key, start, stop).await?;
-    Ok(RespReply::Array(
-        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
-    ))
-}
-
-async fn handle_zrevrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
-    arity("ZREVRANGEBYSCORE", args.len() == 3)?;
-    let key = arg_as_str(&args[0])?;
-    // Note: argument order is (max, min) — the reverse of ZRANGEBYSCORE —
-    // to match Redis's CLI convention.
-    let max = ScoreBound::parse(arg_as_str(&args[1])?)?;
-    let min = ScoreBound::parse(arg_as_str(&args[2])?)?;
-    let members = state.storage.zrevrangebyscore(key, max, min).await?;
-    Ok(RespReply::Array(
-        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
-    ))
-}
 
 async fn handle_zremrangebyrank(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
     arity("ZREMRANGEBYRANK", args.len() == 3)?;
