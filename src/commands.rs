@@ -103,6 +103,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "TIME" => handle_time(&args),
         "INFO" => handle_info(state, args).await,
         "COMMAND" => handle_command(&args),
+        "CONFIG" => handle_config(&args),
         "HELLO" => handle_hello(&args),
         "CLIENT" => handle_client(&args),
         "OBJECT" => handle_object(state, args).await,
@@ -2875,6 +2876,60 @@ fn hello_info_reply() -> RespReply {
 /// call on connect (SETINFO, SETNAME, ID, GETNAME) are accepted quietly;
 /// the rest return `+OK` too, with an explicit error only for genuinely
 /// unknown subcommand names.
+/// Redis `CONFIG` — subcommand router.
+///
+/// `GET pattern [pattern ...]` returns a flat `[key, value, key, value]`
+/// reply matching Redis's wire format. Supported keys are stubbed with
+/// honest values: rustyant has no in-process config, so `maxmemory` is
+/// `"0"`, `save` is empty, `appendonly` is `"no"`, etc. Unknown keys
+/// simply don't appear in the reply (matching Redis when a pattern has
+/// no matches). `SET` / `RESETSTAT` / `REWRITE` accept-and-no-op.
+fn handle_config(args: &[Bytes]) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "CONFIG".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    match sub.as_str() {
+        "GET" => {
+            if args.len() < 2 {
+                return Err(RustyAntError::WrongArity { command: "CONFIG GET".into() });
+            }
+            let mut out: Vec<RespReply> = Vec::new();
+            // One pass per pattern, matching Redis's behavior when multiple
+            // patterns are given (Redis de-duplicates but order isn't
+            // specified; we accumulate in known-key order per pattern).
+            for arg in &args[1..] {
+                let pattern = arg_as_str(arg)?;
+                let wm = wildmatch::WildMatch::new(pattern);
+                for (key, value) in CONFIG_STUB {
+                    if wm.matches(key) {
+                        out.push(RespReply::BulkString(Some(Bytes::from_static(key.as_bytes()))));
+                        out.push(RespReply::BulkString(Some(Bytes::from_static(value.as_bytes()))));
+                    }
+                }
+            }
+            Ok(RespReply::Array(out))
+        }
+        "SET" | "RESETSTAT" | "REWRITE" => Ok(RespReply::ok()),
+        other => Err(RustyAntError::Parse(format!("unsupported CONFIG subcommand: {other}"))),
+    }
+}
+
+/// Minimum-viable `CONFIG GET` surface. Honest values for rustyant:
+/// no in-process memory cap, no persistence (S3 is authoritative), single
+/// namespace. Covers what redis-py / Laravel / most GUI tools probe on
+/// connection setup.
+const CONFIG_STUB: &[(&str, &str)] = &[
+    ("maxmemory", "0"),
+    ("maxmemory-policy", "noeviction"),
+    ("save", ""),
+    ("appendonly", "no"),
+    ("timeout", "0"),
+    ("tcp-keepalive", "0"),
+    ("databases", "1"),
+    ("hash-max-listpack-entries", "0"),
+    ("list-max-listpack-size", "0"),
+    ("zset-max-listpack-entries", "0"),
+];
+
 /// Redis `OBJECT` — introspection router that debuggers / GUI tools call.
 ///
 /// `ENCODING` returns an honest fixed encoding per value-kind. rustyant has
