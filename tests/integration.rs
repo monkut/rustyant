@@ -188,6 +188,21 @@ async fn exists_counts_present_keys() {
 }
 
 #[tokio::test]
+async fn touch_counts_existing_keys() {
+    let state = test_state();
+    call(&state, &[b"SET", b"a", b"1"]).await;
+    call(&state, &[b"SET", b"b", b"2"]).await;
+    call(&state, &[b"TOUCH", b"a", b"b", b"missing", b"a"]).await.expect_integer(3);
+    call(&state, &[b"TOUCH", b"missing"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn touch_rejects_empty() {
+    let state = test_state();
+    call(&state, &[b"TOUCH"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn incr_on_missing_key_starts_at_one() {
     let state = test_state();
     call(&state, &[b"INCR", b"counter"]).await.expect_integer(1);

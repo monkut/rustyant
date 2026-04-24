@@ -175,6 +175,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "MSET" => handle_mset(state, args).await,
         "MSETNX" => handle_msetnx(state, args).await,
         "EXISTS" => handle_exists(state, args).await,
+        "TOUCH" => handle_touch(state, args).await,
         "EXPIRE" => handle_expire(state, args).await,
         "EXPIREAT" => handle_expireat(state, args).await,
         "PEXPIRE" => handle_pexpire(state, args).await,
@@ -391,6 +392,25 @@ async fn handle_del(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyA
 
 async fn handle_exists(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
     arity("EXISTS", !args.is_empty())?;
+    let mut count: i64 = 0;
+    for arg in &args {
+        let key = arg_as_str(arg)?;
+        if state.storage.exists(key).await? {
+            count += 1;
+        }
+    }
+    Ok(RespReply::Integer(count))
+}
+
+/// Redis `TOUCH key [key ...]`.
+///
+/// Real Redis bumps LRU / LFU access counters as a side effect; rustyant has
+/// no access-time tracking on S3 (same reason `OBJECT IDLETIME` returns 0),
+/// so the reply is just the count of keys that exist — the externally
+/// observable part of the contract. Duplicates are counted per occurrence,
+/// matching Redis's `EXISTS` sibling.
+async fn handle_touch(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("TOUCH", !args.is_empty())?;
     let mut count: i64 = 0;
     for arg in &args {
         let key = arg_as_str(arg)?;
