@@ -13,7 +13,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 
 use crate::Settings;
 use crate::state::State;
-use crate::storage::S3Storage;
+use crate::storage::{KVStorage, S3Storage};
 
 const DEFAULT_BUCKET: &str = "rustyant-ci";
 
@@ -51,7 +51,8 @@ pub fn floci_state(scope: &str) -> State {
         .force_path_style(true)
         .build();
     let client = S3Client::from_conf(config);
-    let storage = S3Storage::new(client, bucket.clone(), prefix.clone());
+    let backend = S3Storage::new(client, bucket.clone(), prefix.clone());
+    let storage = Arc::new(KVStorage::new(backend));
 
     let settings = Settings {
         bucket,
@@ -60,5 +61,5 @@ pub fn floci_state(scope: &str) -> State {
         aws_endpoint_url: Some(floci_url),
         emf_namespace: None,
     };
-    State::with_storage(settings, Arc::new(storage))
+    State::with_storage(settings, storage)
 }

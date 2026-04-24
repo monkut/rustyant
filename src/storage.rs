@@ -699,10 +699,38 @@ fn pick_random_from_zset(map: &BTreeMap<String, f64>, count: i64, allow_duplicat
 
 const MAX_CAS_RETRIES: u32 = 5;
 
-#[derive(Debug)]
-enum CasCondition {
+/// Conditional-write specification for [`KVBackend::save`].
+///
+/// `Any` writes unconditionally (overwriting any existing entry), `CreateOnly`
+/// requires the key to be absent (maps to `If-None-Match: *` on S3), and
+/// `IfMatch(etag)` requires the current entry to carry `etag` (maps to
+/// `If-Match`).
+#[derive(Debug, Clone)]
+pub enum WriteCondition {
+    Any,
     CreateOnly,
     IfMatch(String),
+}
+
+/// Conditional-delete specification for [`KVBackend::delete`].
+///
+/// `Any` deletes unconditionally (no-op if the key is missing);
+/// `IfMatch(etag)` requires the current entry to carry `etag` — used to drop
+/// collections that have been emptied by a CAS loop without stomping a
+/// racing writer's new value.
+#[derive(Debug, Clone)]
+pub enum DeleteCondition {
+    Any,
+    IfMatch(String),
+}
+
+/// One page of keys emitted by [`KVBackend::list_page`]. `next_cursor` is
+/// `None` on the last page; clients that want the full keyspace loop until
+/// they see a `None`.
+#[derive(Debug)]
+pub struct ListPage {
+    pub keys: Vec<String>,
+    pub next_cursor: Option<String>,
 }
 
 /// Decision emitted by a CAS modify closure.
@@ -714,6 +742,93 @@ enum CasAction<R> {
     Delete(R),
     /// No write needed; return `R` immediately.
     NoOp(R),
+}
+
+// ---------------------------------------------------------------------------
+// KVBackend — the raw key/value primitives every backend provides.
+//
+// This is the abstraction boundary between rustyant's command logic and its
+// persistence substrate. All the Redis-shaped operations (`HGET`, `LPUSH`,
+// `ZADD`, …) live in the blanket [`Storage`] impl on [`KVStorage`], expressed
+// in terms of just four primitives:
+//
+//   load(key)       -> Option<(entry, version)>
+//   save(key, cond) -> ()                         (CreateOnly / IfMatch / Any)
+//   delete(key, c)  -> ()                         (IfMatch / Any)
+//   list_page(cur)  -> (keys, next_cursor)
+//
+// Add a backend by implementing these four methods — every Redis command
+// comes along for free via the shared [`KVStorage`] wrapper.
+//
+// S3 maps `load` to `GetObject` + `ETag` / `save` to `PutObject` with
+// `If-Match` / `delete` to `DeleteObject` with `If-Match` / `list_page` to
+// `ListObjectsV2`. A future DynamoDB backend maps the same four to
+// `GetItem` / `PutItem` with `ConditionExpression` / `DeleteItem` /
+// `Scan` respectively.
+//
+// Contention: 412 / ConditionalCheckFailed surface as
+// [`RustyAntError::Contention`]. The shared CAS loop in `KVStorage::cas`
+// handles the retry.
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait KVBackend: Send + Sync + std::fmt::Debug {
+    /// Load the entry at `redis_key` and its backend-specific version token
+    /// (an S3 `ETag`, a `DynamoDB` version attribute, etc). Returns `None` for
+    /// missing or expired entries; backends should GC expired entries
+    /// opportunistically on encounter.
+    async fn load(&self, redis_key: &str) -> Result<Option<(StoredValue, String)>, RustyAntError>;
+
+    /// Write `entry` at `redis_key` under `cond`. A failed precondition
+    /// surfaces as `Err(RustyAntError::Contention)`.
+    async fn save(&self, redis_key: &str, entry: &StoredValue, cond: WriteCondition) -> Result<(), RustyAntError>;
+
+    /// Delete `redis_key` under `cond`. `DeleteCondition::Any` is a no-op if
+    /// the key is missing; `IfMatch(etag)` surfaces `Err(Contention)` on a
+    /// version mismatch.
+    async fn delete(&self, redis_key: &str, cond: DeleteCondition) -> Result<(), RustyAntError>;
+
+    /// Paginate the full keyspace. Passing `cursor=None` starts a fresh walk;
+    /// `max_keys` bounds the page size (advisory — backends may return fewer).
+    /// The returned `next_cursor` is `None` when the walk is exhausted.
+    async fn list_page(&self, cursor: Option<String>, max_keys: usize) -> Result<ListPage, RustyAntError>;
+
+    /// Bulk-delete every key in the namespace. Default impl walks `list_page`
+    /// and deletes one-by-one; backends with a native bulk-delete (S3's
+    /// `DeleteObjects`, `DynamoDB`'s `BatchWriteItem`) should override for a
+    /// ~1000x reduction in API calls on large keyspaces.
+    async fn flush_all(&self) -> Result<(), RustyAntError> {
+        let mut cursor = None;
+        loop {
+            let page = self.list_page(cursor, 1000).await?;
+            for k in &page.keys {
+                // Best-effort delete — swallow per-key errors so one missing
+                // key doesn't abort the flush (matches the batched path).
+                let _ = self.delete(k, DeleteCondition::Any).await;
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Count live keys. Default impl walks `list_page`; same caveat as Redis
+    /// `DBSIZE` — recently-expired-but-unGC'd keys still count.
+    async fn count_keys(&self) -> Result<i64, RustyAntError> {
+        let mut count: i64 = 0;
+        let mut cursor = None;
+        loop {
+            let page = self.list_page(cursor, 1000).await?;
+            count = count.saturating_add(i64::try_from(page.keys.len()).unwrap_or(i64::MAX));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(count)
+    }
 }
 
 async fn cas_backoff(attempt: u32) {
@@ -1327,10 +1442,11 @@ impl S3Storage {
     fn key(&self, redis_key: &str) -> String {
         format!("{}{}", self.prefix, redis_key)
     }
+}
 
-    /// Load the current entry and its `ETag`. Returns `None` for missing or
-    /// expired keys (expired keys are deleted best-effort here).
-    async fn load_with_etag(&self, redis_key: &str) -> Result<Option<(StoredValue, String)>, RustyAntError> {
+#[async_trait]
+impl KVBackend for S3Storage {
+    async fn load(&self, redis_key: &str) -> Result<Option<(StoredValue, String)>, RustyAntError> {
         let res = self.client.get_object().bucket(&self.bucket).key(self.key(redis_key)).send().await;
         match res {
             Ok(output) => {
@@ -1345,7 +1461,7 @@ impl S3Storage {
                 if is_expired(&entry) {
                     // Best-effort GC. Swallowing the error is OK — the next
                     // access will notice the expiry and try again.
-                    let _ = self.delete_raw(redis_key).await;
+                    let _ = self.delete(redis_key, DeleteCondition::Any).await;
                     return Ok(None);
                 }
                 Ok(Some((entry, etag)))
@@ -1357,30 +1473,7 @@ impl S3Storage {
         }
     }
 
-    /// Convenience for read-only callers that don't need the `ETag`.
-    async fn load(&self, redis_key: &str) -> Result<Option<StoredValue>, RustyAntError> {
-        Ok(self.load_with_etag(redis_key).await?.map(|(e, _)| e))
-    }
-
-    /// Unconditional PUT. Used for `set_string`, which has overwrite
-    /// semantics and does not need CAS.
-    async fn save(&self, redis_key: &str, entry: &StoredValue) -> Result<(), RustyAntError> {
-        let body = serde_json::to_vec(entry)?;
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(self.key(redis_key))
-            .body(ByteStream::from(body))
-            .content_type("application/json")
-            .send()
-            .await
-            .map_err(|e| RustyAntError::S3(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Conditional PUT. Returns `Err(Contention)` on HTTP 412, which the
-    /// CAS retry loop turns into another read-modify-write attempt.
-    async fn save_cas(&self, redis_key: &str, entry: &StoredValue, cond: CasCondition) -> Result<(), RustyAntError> {
+    async fn save(&self, redis_key: &str, entry: &StoredValue, cond: WriteCondition) -> Result<(), RustyAntError> {
         let body = serde_json::to_vec(entry)?;
         let mut req = self
             .client
@@ -1390,8 +1483,9 @@ impl S3Storage {
             .body(ByteStream::from(body))
             .content_type("application/json");
         match cond {
-            CasCondition::CreateOnly => req = req.if_none_match("*"),
-            CasCondition::IfMatch(etag) => req = req.if_match(etag),
+            WriteCondition::Any => {}
+            WriteCondition::CreateOnly => req = req.if_none_match("*"),
+            WriteCondition::IfMatch(etag) => req = req.if_match(etag),
         }
         match req.send().await {
             Ok(_) => Ok(()),
@@ -1406,24 +1500,12 @@ impl S3Storage {
         }
     }
 
-    async fn delete_raw(&self, redis_key: &str) -> Result<(), RustyAntError> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(self.key(redis_key))
-            .send()
-            .await
-            .map_err(|e| RustyAntError::S3(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Conditional DELETE. Returns `Err(Contention)` on HTTP 412, which the
-    /// CAS retry loop turns into another read-modify-write attempt. Used when
-    /// a mutation empties a collection (HDEL/LPOP/RPOP/SREM/ZREM of the last
-    /// member) so an unrelated concurrent writer's new value isn't clobbered.
-    async fn delete_if_match(&self, redis_key: &str, etag: &str) -> Result<(), RustyAntError> {
-        let res = self.client.delete_object().bucket(&self.bucket).key(self.key(redis_key)).if_match(etag).send().await;
-        match res {
+    async fn delete(&self, redis_key: &str, cond: DeleteCondition) -> Result<(), RustyAntError> {
+        let mut req = self.client.delete_object().bucket(&self.bucket).key(self.key(redis_key));
+        if let DeleteCondition::IfMatch(etag) = cond {
+            req = req.if_match(etag);
+        }
+        match req.send().await {
             Ok(_) => Ok(()),
             Err(e) => {
                 let is_412 = e.raw_response().is_some_and(|r| r.status().as_u16() == 412);
@@ -1434,6 +1516,133 @@ impl S3Storage {
                 }
             }
         }
+    }
+
+    async fn list_page(&self, cursor: Option<String>, max_keys: usize) -> Result<ListPage, RustyAntError> {
+        let mut req = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&self.prefix)
+            .max_keys(i32::try_from(max_keys).unwrap_or(i32::MAX));
+        if let Some(c) = cursor {
+            req = req.continuation_token(c);
+        }
+        let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
+        let keys: Vec<String> = resp
+            .contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .filter_map(|k| k.strip_prefix(self.prefix.as_str()).map(str::to_string))
+            .collect();
+        let next_cursor = resp.next_continuation_token().map(String::from);
+        Ok(ListPage { keys, next_cursor })
+    }
+
+    /// Override the default `flush_all` with S3's batch-delete — up to 1000
+    /// keys per `DeleteObjects` call, matching `ListObjectsV2`'s page size.
+    async fn flush_all(&self) -> Result<(), RustyAntError> {
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(&self.prefix);
+            if let Some(c) = &cursor {
+                req = req.continuation_token(c);
+            }
+            let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
+            let ids: Vec<aws_sdk_s3::types::ObjectIdentifier> = resp
+                .contents()
+                .iter()
+                .filter_map(|o| o.key())
+                .map(|k| {
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(k)
+                        .build()
+                        .map_err(|e| RustyAntError::S3(format!("object id: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+            if !ids.is_empty() {
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(ids))
+                    .quiet(true)
+                    .build()
+                    .map_err(|e| RustyAntError::S3(format!("delete payload: {e}")))?;
+                self.client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .map_err(|e| RustyAntError::S3(e.to_string()))?;
+            }
+            match resp.next_continuation_token() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KVStorage<K> — one shared [`Storage`] impl that turns a [`KVBackend`] into
+// a full Redis-shaped surface. Every command's logic lives here exactly once
+// and works against any backend that can answer the four [`KVBackend`]
+// primitives.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct KVStorage<K: KVBackend> {
+    backend: K,
+}
+
+impl<K: KVBackend> KVStorage<K> {
+    pub const fn new(backend: K) -> Self {
+        Self { backend }
+    }
+
+    /// Load the entry and discard the version token — for read-only paths
+    /// that don't need CAS.
+    async fn load(&self, redis_key: &str) -> Result<Option<StoredValue>, RustyAntError> {
+        Ok(self.backend.load(redis_key).await?.map(|(e, _)| e))
+    }
+
+    /// Read-modify-write helper: runs `modify` against the latest entry,
+    /// writes the result back under version-based optimistic locking,
+    /// retrying up to `MAX_CAS_RETRIES` times on contention. Backend-agnostic
+    /// — S3 resolves the version as `ETag`, `DynamoDB` will resolve it as a
+    /// version attribute; the loop itself is identical.
+    async fn cas<F, R>(&self, redis_key: &str, mut modify: F) -> Result<R, RustyAntError>
+    where
+        F: FnMut(Option<&StoredValue>) -> Result<CasAction<R>, RustyAntError>,
+    {
+        for attempt in 0..MAX_CAS_RETRIES {
+            cas_backoff(attempt).await;
+            let loaded = self.backend.load(redis_key).await?;
+            let (existing, etag) = match &loaded {
+                Some((e, t)) => (Some(e), Some(t.clone())),
+                None => (None, None),
+            };
+            match modify(existing)? {
+                CasAction::NoOp(r) => return Ok(r),
+                CasAction::Delete(r) => match etag {
+                    Some(e) => match self.backend.delete(redis_key, DeleteCondition::IfMatch(e)).await {
+                        Ok(()) => return Ok(r),
+                        Err(RustyAntError::Contention) => (),
+                        Err(err) => return Err(err),
+                    },
+                    None => return Ok(r),
+                },
+                CasAction::Write(new_entry, r) => {
+                    let cond = etag.map_or(WriteCondition::CreateOnly, WriteCondition::IfMatch);
+                    match self.backend.save(redis_key, &new_entry, cond).await {
+                        Ok(()) => return Ok(r),
+                        Err(RustyAntError::Contention) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        Err(RustyAntError::Contention)
     }
 
     /// Shared `ZPOPMIN` / `ZPOPMAX` implementation. `from_max=true` pops the
@@ -1462,51 +1671,14 @@ impl S3Storage {
         })
         .await
     }
-
-    /// Read-modify-write helper: runs `modify` against the latest entry,
-    /// writes the result back under ETag-based optimistic locking, retrying
-    /// up to `MAX_CAS_RETRIES` times on contention.
-    async fn cas<F, R>(&self, redis_key: &str, mut modify: F) -> Result<R, RustyAntError>
-    where
-        F: FnMut(Option<&StoredValue>) -> Result<CasAction<R>, RustyAntError>,
-    {
-        for attempt in 0..MAX_CAS_RETRIES {
-            cas_backoff(attempt).await;
-            let loaded = self.load_with_etag(redis_key).await?;
-            let (existing, etag) = match &loaded {
-                Some((e, t)) => (Some(e), Some(t.clone())),
-                None => (None, None),
-            };
-            match modify(existing)? {
-                CasAction::NoOp(r) => return Ok(r),
-                CasAction::Delete(r) => match etag {
-                    Some(e) => match self.delete_if_match(redis_key, &e).await {
-                        Ok(()) => return Ok(r),
-                        Err(RustyAntError::Contention) => (),
-                        Err(err) => return Err(err),
-                    },
-                    None => return Ok(r),
-                },
-                CasAction::Write(new_entry, r) => {
-                    let cond = etag.map_or(CasCondition::CreateOnly, CasCondition::IfMatch);
-                    match self.save_cas(redis_key, &new_entry, cond).await {
-                        Ok(()) => return Ok(r),
-                        Err(RustyAntError::Contention) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-        }
-        Err(RustyAntError::Contention)
-    }
 }
 
 #[async_trait]
-impl Storage for S3Storage {
+impl<K: KVBackend> Storage for KVStorage<K> {
     async fn delete(&self, redis_key: &str) -> Result<bool, RustyAntError> {
         let existed = self.load(redis_key).await?.is_some();
         if existed {
-            self.delete_raw(redis_key).await?;
+            self.backend.delete(redis_key, DeleteCondition::Any).await?;
         }
         Ok(existed)
     }
@@ -1584,15 +1756,17 @@ impl Storage for S3Storage {
     }
 
     async fn set_string(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<(), RustyAntError> {
-        self.save(key, &StoredValue { expires_at_ms, value: Value::String(value.to_vec()) }).await
+        self.backend
+            .save(key, &StoredValue { expires_at_ms, value: Value::String(value.to_vec()) }, WriteCondition::Any)
+            .await
     }
 
     async fn set_string_nx(&self, key: &str, value: Bytes, expires_at_ms: Option<i64>) -> Result<bool, RustyAntError> {
         // Surface any expired entry so `If-None-Match: *` doesn't reject
         // a legitimate create because the zombie object hasn't been swept yet.
-        let _ = self.load_with_etag(key).await?;
+        let _ = self.backend.load(key).await?;
         let entry = StoredValue { expires_at_ms, value: Value::String(value.to_vec()) };
-        match self.save_cas(key, &entry, CasCondition::CreateOnly).await {
+        match self.backend.save(key, &entry, WriteCondition::CreateOnly).await {
             Ok(()) => Ok(true),
             Err(RustyAntError::Contention) => Ok(false),
             Err(e) => Err(e),
@@ -3062,22 +3236,14 @@ impl Storage for S3Storage {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(&self.prefix);
-            if let Some(c) = &cursor {
-                req = req.continuation_token(c);
-            }
-            let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
-            for obj in resp.contents() {
-                if let Some(full) = obj.key() {
-                    if let Some(rel) = full.strip_prefix(self.prefix.as_str()) {
-                        if wm.matches(rel) {
-                            out.push(rel.to_string());
-                        }
-                    }
+            let page = self.backend.list_page(cursor, 1000).await?;
+            for k in page.keys {
+                if wm.matches(&k) {
+                    out.push(k);
                 }
             }
-            match resp.next_continuation_token() {
-                Some(next) => cursor = Some(next.to_string()),
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
                 None => break,
             }
         }
@@ -3091,28 +3257,9 @@ impl Storage for S3Storage {
         count: usize,
     ) -> Result<(Vec<String>, Option<String>), RustyAntError> {
         let wm = pattern.map(wildmatch::WildMatch::new);
-        let mut req = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&self.prefix)
-            .max_keys(i32::try_from(count).unwrap_or(i32::MAX));
-        if let Some(c) = cursor {
-            req = req.continuation_token(c);
-        }
-        let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
-        let mut matched: Vec<String> = Vec::new();
-        for obj in resp.contents() {
-            if let Some(full) = obj.key() {
-                if let Some(rel) = full.strip_prefix(self.prefix.as_str()) {
-                    if wm.as_ref().is_none_or(|w| w.matches(rel)) {
-                        matched.push(rel.to_string());
-                    }
-                }
-            }
-        }
-        let next = resp.next_continuation_token().map(String::from);
-        Ok((matched, next))
+        let page = self.backend.list_page(cursor.map(str::to_string), count).await?;
+        let matched: Vec<String> = page.keys.into_iter().filter(|k| wm.as_ref().is_none_or(|w| w.matches(k))).collect();
+        Ok((matched, page.next_cursor))
     }
 
     async fn hincr_by(&self, key: &str, field: &str, delta: i64) -> Result<i64, RustyAntError> {
@@ -3464,9 +3611,9 @@ impl Storage for S3Storage {
         // on a concurrent writer; create-only otherwise. Two-object ops aren't
         // atomic over S3, but either half can still fail safely.
         let cond =
-            self.load_with_etag(to).await?.map_or(CasCondition::CreateOnly, |(_, etag)| CasCondition::IfMatch(etag));
-        self.save_cas(to, &entry, cond).await?;
-        self.delete_raw(from).await?;
+            self.backend.load(to).await?.map_or(WriteCondition::CreateOnly, |(_, etag)| WriteCondition::IfMatch(etag));
+        self.backend.save(to, &entry, cond).await?;
+        self.backend.delete(from, DeleteCondition::Any).await?;
         Ok(())
     }
 
@@ -3482,9 +3629,9 @@ impl Storage for S3Storage {
         }
         // CreateOnly guards against a racing writer populating the destination
         // between the existence check and this write.
-        match self.save_cas(to, &entry, CasCondition::CreateOnly).await {
+        match self.backend.save(to, &entry, WriteCondition::CreateOnly).await {
             Ok(()) => {
-                self.delete_raw(from).await?;
+                self.backend.delete(from, DeleteCondition::Any).await?;
                 Ok(true)
             }
             Err(RustyAntError::Contention) => Ok(false),
@@ -3493,70 +3640,16 @@ impl Storage for S3Storage {
     }
 
     async fn dbsize(&self) -> Result<i64, RustyAntError> {
-        let mut count: i64 = 0;
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(&self.prefix);
-            if let Some(c) = &cursor {
-                req = req.continuation_token(c);
-            }
-            let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
-            count = count.saturating_add(i64::try_from(resp.contents().len()).unwrap_or(i64::MAX));
-            match resp.next_continuation_token() {
-                Some(next) => cursor = Some(next.to_string()),
-                None => break,
-            }
-        }
-        Ok(count)
+        self.backend.count_keys().await
     }
 
     async fn flushall(&self) -> Result<(), RustyAntError> {
-        let mut cursor: Option<String> = None;
-        loop {
-            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(&self.prefix);
-            if let Some(c) = &cursor {
-                req = req.continuation_token(c);
-            }
-            let resp = req.send().await.map_err(|e| RustyAntError::S3(e.to_string()))?;
-            // S3 batch DeleteObjects accepts up to 1000 keys per request,
-            // exactly matching ListObjectsV2's page size, so one delete
-            // call per list page is the natural batching.
-            let ids: Vec<aws_sdk_s3::types::ObjectIdentifier> = resp
-                .contents()
-                .iter()
-                .filter_map(|o| o.key())
-                .map(|k| {
-                    aws_sdk_s3::types::ObjectIdentifier::builder()
-                        .key(k)
-                        .build()
-                        .map_err(|e| RustyAntError::S3(format!("object id: {e}")))
-                })
-                .collect::<Result<_, _>>()?;
-            if !ids.is_empty() {
-                let delete = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(ids))
-                    .quiet(true)
-                    .build()
-                    .map_err(|e| RustyAntError::S3(format!("delete payload: {e}")))?;
-                self.client
-                    .delete_objects()
-                    .bucket(&self.bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                    .map_err(|e| RustyAntError::S3(e.to_string()))?;
-            }
-            match resp.next_continuation_token() {
-                Some(next) => cursor = Some(next.to_string()),
-                None => break,
-            }
-        }
-        Ok(())
+        self.backend.flush_all().await
     }
 
     async fn random_key(&self) -> Result<Option<String>, RustyAntError> {
-        // Walk the full keyspace then pick — S3 has no native random sampling.
-        // Documented as O(n) in the README.
+        // Walk the full keyspace then pick — same O(n) caveat as Redis
+        // without a native random-sampling primitive. Documented in README.
         let all = self.keys("*").await?;
         if all.is_empty() {
             return Ok(None);
@@ -3572,13 +3665,13 @@ impl Storage for S3Storage {
         let Some(entry) = self.load(from).await? else {
             return Ok(false);
         };
-        let dest = self.load_with_etag(to).await?;
+        let dest = self.backend.load(to).await?;
         let cond = match (&dest, replace) {
             (Some(_), false) => return Ok(false),
-            (Some((_, etag)), true) => CasCondition::IfMatch(etag.clone()),
-            (None, _) => CasCondition::CreateOnly,
+            (Some((_, etag)), true) => WriteCondition::IfMatch(etag.clone()),
+            (None, _) => WriteCondition::CreateOnly,
         };
-        match self.save_cas(to, &entry, cond).await {
+        match self.backend.save(to, &entry, cond).await {
             Ok(()) => Ok(true),
             // CAS race: a concurrent writer beat us. Surface as "not copied"
             // rather than retrying — Redis COPY is a one-shot, not an RMW.
@@ -3625,12 +3718,12 @@ impl Storage for S3Storage {
         let new_entry = StoredValue { expires_at_ms, value };
         if replace {
             // Overwrite unconditionally — REPLACE is explicit permission.
-            self.save(key, &new_entry).await?;
+            self.backend.save(key, &new_entry, WriteCondition::Any).await?;
             return Ok(());
         }
         // Guard against existing-key: try create-only first; on Contention
-        // (something already exists at the S3 key), translate to BUSYKEY.
-        match self.save_cas(key, &new_entry, CasCondition::CreateOnly).await {
+        // (something already exists at the backend), translate to BUSYKEY.
+        match self.backend.save(key, &new_entry, WriteCondition::CreateOnly).await {
             Ok(()) => Ok(()),
             Err(RustyAntError::Contention) => {
                 Err(RustyAntError::Parse("BUSYKEY Target key name already exists.".into()))
