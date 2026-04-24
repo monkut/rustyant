@@ -161,6 +161,8 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         // freer thread, so it folds into the same synchronous DEL path.
         "DEL" | "UNLINK" => handle_del(state, args).await,
         "COPY" => handle_copy(state, args).await,
+        "DUMP" => handle_dump(state, args).await,
+        "RESTORE" => handle_restore(state, args).await,
         // Bit ops on Strings
         "GETBIT" => handle_getbit(state, args).await,
         "SETBIT" => handle_setbit(state, args).await,
@@ -2850,6 +2852,57 @@ async fn handle_copy(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rusty
     }
     let copied = state.storage.copy(from, to, replace).await?;
     Ok(RespReply::Integer(i64::from(copied)))
+}
+
+/// Redis `DUMP key` — serialize the value at `key` as a Redis-compatible
+/// binary payload. Returns `nil` for missing keys; errors on value kinds
+/// whose RDB encoding is not yet supported (currently: streams).
+async fn handle_dump(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("DUMP", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    Ok(state.storage.dump(key).await?.map_or(RespReply::Nil, |b| RespReply::BulkString(Some(b))))
+}
+
+/// Redis `RESTORE key ttl serialized [REPLACE] [ABSTTL] [IDLETIME sec] [FREQ freq]`
+/// — decode a DUMP payload and store at `key`. `ttl` in ms; `0` means no
+/// expiry. Without REPLACE, an existing `key` causes a `BUSYKEY` error.
+/// IDLETIME and FREQ are accepted and ignored — rustyant has no LRU/LFU
+/// tracking.
+async fn handle_restore(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "RESTORE".into() });
+    }
+    let key = arg_as_string(&args[0])?;
+    let ttl_ms = parse_i64(&args[1], "ttl")?;
+    if ttl_ms < 0 {
+        return Err(RustyAntError::Parse("Invalid TTL value, must be >= 0".into()));
+    }
+    let payload = args[2].clone();
+    let mut replace = false;
+    let mut abs_ttl = false;
+    let mut i = 3;
+    while i < args.len() {
+        let opt = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match opt.as_str() {
+            "REPLACE" => {
+                replace = true;
+                i += 1;
+            }
+            "ABSTTL" => {
+                abs_ttl = true;
+                i += 1;
+            }
+            "IDLETIME" | "FREQ" => {
+                // Accept + validate the numeric argument, then ignore — rustyant has no LRU/LFU.
+                let v = args.get(i + 1).ok_or_else(|| RustyAntError::Parse(format!("{opt} requires a value")))?;
+                let _ = parse_i64(v, opt.as_str())?;
+                i += 2;
+            }
+            other => return Err(RustyAntError::Parse(format!("unsupported RESTORE option: {other}"))),
+        }
+    }
+    state.storage.restore(&key, &payload, ttl_ms, replace, abs_ttl).await?;
+    Ok(RespReply::ok())
 }
 
 // ---------------------------------------------------------------------------

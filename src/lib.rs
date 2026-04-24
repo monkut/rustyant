@@ -4,6 +4,7 @@ pub mod geo;
 pub mod handler;
 pub mod hll;
 pub mod metrics;
+pub mod rdb;
 pub mod resp;
 pub mod settings;
 pub mod state;
