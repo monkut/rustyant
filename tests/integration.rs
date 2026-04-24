@@ -121,6 +121,18 @@ async fn unknown_command_returns_error() {
 }
 
 #[tokio::test]
+async fn quit_returns_ok() {
+    let state = test_state();
+    call(&state, &[b"QUIT"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn quit_rejects_args() {
+    let state = test_state();
+    call(&state, &[b"QUIT", b"extra"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn malformed_body_returns_parse_error() {
     let state = test_state();
     let resp = handle(
