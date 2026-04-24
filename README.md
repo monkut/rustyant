@@ -77,7 +77,6 @@ Implemented:
 rustyant targets the **most commonly used** Redis features — what a typical application workload on Lambda/S3 actually reaches for. Edge features and deprecated surface are not goals:
 
 - **Explicitly out of scope** (will not be added): Lua scripting (`EVAL` / `EVALSHA` / `SCRIPT *` / `FUNCTION *`), and deprecated commands superseded by modern equivalents (e.g. `GEORADIUS` / `GEORADIUSBYMEMBER` — use `GEOSEARCH` instead).
-- **Not yet implemented, PRs welcome**: streams consumer groups (`XGROUP` / `XREADGROUP` / `XACK` / `XCLAIM` / `XPENDING` / `XAUTOCLAIM`) — the base stream surface is in, groups are the next layer.
 
 Transactions (`MULTI` / `EXEC` / `DISCARD` / `WATCH`) and subscribe-side pub/sub (`SUBSCRIBE` / `PSUBSCRIBE` / `UNSUBSCRIBE` / `PUNSUBSCRIBE`) return explicit errors — rustyant processes one command per HTTP request with no connection-level state, so cross-request queueing, optimistic CAS, and server-pushed pub/sub messages cannot be honored honestly. `UNWATCH`, `PUBLISH`, and the `PUBSUB` introspection subcommands do reply successfully: clearing a never-populated watch set is a trivial no-op; `PUBLISH` returns `:0` because zero subscribers is the literal truth on a no-substrate server; `PUBSUB CHANNELS` / `NUMSUB` / `NUMPAT` return correspondingly empty / zero results.
 

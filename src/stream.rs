@@ -10,6 +10,7 @@
 //! CAS loop in `S3Storage`.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -102,6 +103,186 @@ pub struct StreamValue {
     /// Total entries ever added (including those since trimmed / deleted).
     #[serde(default)]
     pub entries_added: u64,
+    /// Per-group state (consumers + pending entries list). Empty for
+    /// streams with no groups.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, ConsumerGroup>,
+}
+
+/// Per-group state.
+///
+/// `last_delivered_id` advances on every `XREADGROUP > ...` call. The
+/// `pel` (pending entries list) tracks entries that have been delivered
+/// but not yet `XACK`ed; each consumer additionally records when it
+/// last claimed an entry, used by `XCLAIM` / `XAUTOCLAIM` to find
+/// stalled work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerGroup {
+    pub last_delivered_id: StreamId,
+    /// Consumers known to this group, by name.
+    #[serde(default)]
+    pub consumers: BTreeMap<String, Consumer>,
+    /// Pending entries: id → (consumer, `delivery_time_ms`, `delivery_count`).
+    /// Serializes as a flat list of `[id, entry]` pairs so JSON can carry
+    /// it (object keys must be strings, but `StreamId` is a struct).
+    #[serde(default, with = "pel_serde")]
+    pub pel: BTreeMap<StreamId, PendingEntry>,
+}
+
+mod pel_serde {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{PendingEntry, StreamId};
+
+    pub fn serialize<S: Serializer>(map: &BTreeMap<StreamId, PendingEntry>, s: S) -> Result<S::Ok, S::Error> {
+        let pairs: Vec<(StreamId, PendingEntry)> = map.iter().map(|(k, v)| (*k, v.clone())).collect();
+        pairs.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<StreamId, PendingEntry>, D::Error> {
+        let pairs: Vec<(StreamId, PendingEntry)> = Vec::deserialize(d)?;
+        Ok(pairs.into_iter().collect())
+    }
+}
+
+/// A single consumer within a group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Consumer {
+    /// Wall-clock ms of the most recent delivery attributed to this consumer.
+    pub seen_ms: i64,
+}
+
+/// One row of the pending-entries list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEntry {
+    pub consumer: String,
+    pub delivery_time_ms: i64,
+    pub delivery_count: u64,
+}
+
+// ---------------------------------------------------------------------------
+// XGROUP — subcommand router payload, plus per-op metadata.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum XGroupOp {
+    /// Create a new group at `start_id` (Redis: `<id> | $`). `mkstream`
+    /// auto-creates the key as an empty stream when missing. `entries_read`
+    /// is a Redis 7+ optimization hint; rustyant accepts it but ignores.
+    Create { group: String, start_id: GroupStartId, mkstream: bool },
+    /// Reset the group's `last_delivered_id`.
+    SetId { group: String, start_id: GroupStartId },
+    /// Drop the group. Returns 1 if removed, 0 otherwise.
+    Destroy { group: String },
+    /// Force-add a consumer (returns 1 if created, 0 if it already existed).
+    CreateConsumer { group: String, consumer: String },
+    /// Remove a consumer; returns the number of pending entries that were
+    /// owned by it (matching Redis's reply).
+    DelConsumer { group: String, consumer: String },
+}
+
+/// `XGROUP CREATE` / `XGROUP SETID` accept either a concrete id or `$`,
+/// which means "the current `last_generated_id` of the stream".
+#[derive(Debug, Clone, Copy)]
+pub enum GroupStartId {
+    Concrete(StreamId),
+    Latest,
+}
+
+impl GroupStartId {
+    pub fn parse(s: &str) -> Result<Self, RustyAntError> {
+        if s == "$" { Ok(Self::Latest) } else { Ok(Self::Concrete(StreamId::parse(s)?)) }
+    }
+}
+
+/// Each `id` arg to `XREADGROUP` — `>` means "new entries", anything
+/// else is a concrete id from the PEL.
+#[derive(Debug, Clone, Copy)]
+pub enum XReadGroupId {
+    NewEntries,
+    Pending(StreamId),
+}
+
+impl XReadGroupId {
+    pub fn parse(s: &str) -> Result<Self, RustyAntError> {
+        if s == ">" { Ok(Self::NewEntries) } else { Ok(Self::Pending(StreamId::parse(s)?)) }
+    }
+}
+
+/// Options for `XCLAIM`.
+///
+/// `idle_ms` / `time_ms` override the default "set to current time"
+/// behavior; `retry_count` overrides the default "increment by 1".
+/// `force` adds the entry to the PEL even when not already pending.
+/// `just_id` returns just the ids, not full entries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XClaimOpts {
+    pub idle_ms: Option<i64>,
+    pub time_ms: Option<i64>,
+    pub retry_count: Option<u64>,
+    pub force: bool,
+    pub just_id: bool,
+    /// Wall-clock used when `idle_ms` and `time_ms` are unset — caller
+    /// supplies this so the storage layer doesn't need to read a clock.
+    pub now_ms: i64,
+}
+
+/// One entry returned by `XCLAIM`. Holds the full entry body unless
+/// `just_id` was requested in the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XClaimResult {
+    pub id: StreamId,
+    pub fields: Option<Vec<(String, Vec<u8>)>>,
+}
+
+/// `XPENDING <key> <group>` summary form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XPendingSummary {
+    pub count: u64,
+    pub min: StreamId,
+    pub max: StreamId,
+    /// (consumer, count) pairs for every consumer with at least one
+    /// pending entry.
+    pub per_consumer: Vec<(String, u64)>,
+}
+
+/// One row of the `XPENDING <key> <group> [...] start end count` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XPendingDetailRow {
+    pub id: StreamId,
+    pub consumer: String,
+    pub idle_ms: i64,
+    pub delivery_count: u64,
+}
+
+/// Result tuple for `XAUTOCLAIM`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XAutoClaimResult {
+    /// Next id to resume from (`0-0` when the sweep finished).
+    pub next_cursor: StreamId,
+    pub claimed: Vec<XClaimResult>,
+    /// Ids that were in the PEL but no longer in the stream (Redis 7
+    /// added this — XAUTOCLAIM "delete" ids).
+    pub deleted_ids: Vec<StreamId>,
+}
+
+/// `XINFO GROUPS` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XInfoGroup {
+    pub name: String,
+    pub consumers: u64,
+    pub pending: u64,
+    pub last_delivered_id: StreamId,
+}
+
+/// `XINFO CONSUMERS` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XInfoConsumer {
+    pub name: String,
+    pub pending: u64,
+    pub idle_ms: i64,
 }
 
 /// Parsed id argument for `XADD` — either auto (`*`), an auto-seq within

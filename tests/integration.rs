@@ -615,6 +615,200 @@ async fn type_of_stream_reports_stream() {
     call(&state, &[b"TYPE", b"s"]).await.expect_simple("stream");
 }
 
+// ---------------------------------------------------------------------------
+// Streams consumer groups — XGROUP / XREADGROUP / XACK / XCLAIM / XPENDING / XAUTOCLAIM
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn xgroup_create_requires_existing_stream_or_mkstream() {
+    let state = test_state();
+    // No stream + no MKSTREAM → error.
+    call(&state, &[b"XGROUP", b"CREATE", b"ghost", b"g", b"$"]).await.expect_error_prefix("ERR");
+    // Same with MKSTREAM → ok.
+    call(&state, &[b"XGROUP", b"CREATE", b"newstream", b"g", b"$", b"MKSTREAM"]).await.expect_simple("OK");
+    call(&state, &[b"TYPE", b"newstream"]).await.expect_simple("stream");
+    call(&state, &[b"XLEN", b"newstream"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn xgroup_create_dollar_starts_at_last_generated_id() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"v"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"f", b"v"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"$"]).await.expect_simple("OK");
+    // > delivery should yield 0 entries (group caught up to 2-0).
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await.expect_nil();
+    // After XADD, > should deliver the new entry.
+    call(&state, &[b"XADD", b"s", b"3-0", b"f", b"v"]).await;
+    let reply = call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("3-0"), "expected new entry 3-0 in reply: {raw}");
+}
+
+#[tokio::test]
+async fn xgroup_create_busygroup_on_duplicate() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"*", b"f", b"v"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"$"]).await.expect_simple("OK");
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"$"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn xgroup_destroy_removes_group() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"*", b"f", b"v"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"$"]).await.expect_simple("OK");
+    call(&state, &[b"XGROUP", b"DESTROY", b"s", b"g"]).await.expect_integer(1);
+    call(&state, &[b"XGROUP", b"DESTROY", b"s", b"g"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn xreadgroup_advances_last_delivered_id_and_creates_pel() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"f", b"b"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    let reply = call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"COUNT", b"1", b"STREAMS", b"s", b">"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("1-0"), "first delivery should be 1-0: {raw}");
+    // PEL should now have 1 entry.
+    call(&state, &[b"XPENDING", b"s", b"g"]).await; // for visibility
+}
+
+#[tokio::test]
+async fn xpending_summary_counts_pel() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"f", b"b"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    let reply = call(&state, &[b"XPENDING", b"s", b"g"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    // Summary: [count, min_id, max_id, [[consumer, count]]]
+    assert!(raw.starts_with("*4\r\n:2\r\n"), "expected count 2: {raw}");
+    assert!(raw.contains("1-0"));
+    assert!(raw.contains("2-0"));
+    assert!(raw.contains("c1"));
+}
+
+#[tokio::test]
+async fn xack_removes_from_pel() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    call(&state, &[b"XACK", b"s", b"g", b"1-0"]).await.expect_integer(1);
+    call(&state, &[b"XACK", b"s", b"g", b"1-0"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn xreadgroup_noack_skips_pel() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"NOACK", b"STREAMS", b"s", b">"]).await;
+    // Nothing in PEL.
+    call(&state, &[b"XACK", b"s", b"g", b"1-0"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn xclaim_transfers_ownership() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    // c2 claims with min-idle 0 (immediately ok).
+    let reply = call(&state, &[b"XCLAIM", b"s", b"g", b"c2", b"0", b"1-0"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("1-0"), "claim should return entry: {raw}");
+    // PEL summary now reports c2 instead of c1.
+    let summary = call(&state, &[b"XPENDING", b"s", b"g"]).await;
+    let raw = String::from_utf8_lossy(&summary.raw).to_string();
+    assert!(raw.contains("c2"));
+    assert!(!raw.contains("c1") || raw.split("c2").count() > 1);
+}
+
+#[tokio::test]
+async fn xclaim_justid_returns_only_ids() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    let reply = call(&state, &[b"XCLAIM", b"s", b"g", b"c2", b"0", b"1-0", b"JUSTID"]).await;
+    // Reply should be a flat array of ids — no nested fields.
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.starts_with("*1\r\n$3\r\n1-0"), "expected just-id reply: {raw}");
+}
+
+#[tokio::test]
+async fn xpending_detail_filters_by_consumer() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XADD", b"s", b"2-0", b"f", b"b"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    // c1 takes both initially.
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    // c2 claims 2-0.
+    call(&state, &[b"XCLAIM", b"s", b"g", b"c2", b"0", b"2-0"]).await;
+    // Detail filtered to c2 → 1 row, id 2-0.
+    let reply = call(&state, &[b"XPENDING", b"s", b"g", b"-", b"+", b"10", b"c2"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("2-0") && raw.contains("c2"));
+    assert!(!raw.contains("1-0"));
+}
+
+#[tokio::test]
+async fn xinfo_groups_lists_groups() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"*", b"f", b"v"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g1", b"0"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g2", b"0"]).await;
+    let reply = call(&state, &[b"XINFO", b"GROUPS", b"s"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.starts_with("*2\r\n"), "two groups expected: {raw}");
+    assert!(raw.contains("g1"));
+    assert!(raw.contains("g2"));
+}
+
+#[tokio::test]
+async fn xinfo_consumers_lists_consumers() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"*", b"f", b"v"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    let reply = call(&state, &[b"XINFO", b"CONSUMERS", b"s", b"g"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("c1"), "c1 should appear: {raw}");
+}
+
+#[tokio::test]
+async fn xautoclaim_sweeps_idle_entries() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"a"]).await;
+    call(&state, &[b"XGROUP", b"CREATE", b"s", b"g", b"0"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]).await;
+    // min-idle 0 → c2 claims everything immediately.
+    let reply = call(&state, &[b"XAUTOCLAIM", b"s", b"g", b"c2", b"0", b"0"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("1-0"), "autoclaim should yield 1-0: {raw}");
+}
+
+#[tokio::test]
+async fn xack_with_no_group_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"*", b"f", b"v"]).await;
+    call(&state, &[b"XACK", b"s", b"missing-group", b"1-0"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn xreadgroup_on_missing_group_errors() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"s", b"1-0", b"f", b"v"]).await;
+    call(&state, &[b"XREADGROUP", b"GROUP", b"missing", b"c1", b"STREAMS", b"s", b">"])
+        .await
+        .expect_error_prefix("ERR");
+}
+
 #[tokio::test]
 async fn malformed_body_returns_parse_error() {
     let state = test_state();

@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::RustyAntError;
 use crate::hll;
-use crate::stream::{AddIdSpec, RangeId, StreamEntry, StreamId, StreamValue, TrimBound, resolve_add_id, trim_in_place};
+use crate::stream::{
+    AddIdSpec, ConsumerGroup, GroupStartId, PendingEntry, RangeId, StreamEntry, StreamId, StreamValue, TrimBound,
+    XAutoClaimResult, XClaimOpts, XClaimResult, XGroupOp, XInfoConsumer, XInfoGroup, XPendingDetailRow,
+    XPendingSummary, XReadGroupId, resolve_add_id, trim_in_place,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoredValue {
@@ -219,6 +223,67 @@ fn asc_rank_of(map: &BTreeMap<String, f64>, member: &str) -> Option<i64> {
 
 fn wrong_type(key: &str) -> RustyAntError {
     RustyAntError::WrongType { key: key.to_string() }
+}
+
+/// Variant of `wrong_type` for use inside CAS closures where the `key`
+/// borrow doesn't reach. Reports as a generic WRONGTYPE error.
+const fn wrong_type_error() -> RustyAntError {
+    RustyAntError::WrongType { key: String::new() }
+}
+
+/// Group does not exist on this stream — Redis's exact wording.
+fn no_group_error(group: &str) -> RustyAntError {
+    RustyAntError::Parse(format!("NOGROUP No such consumer group '{group}' for key name. The group does not exist."))
+}
+
+/// Apply an `XGroupOp` to the stream value in-place. Returns the integer
+/// reply value the caller should propagate (Redis: `:1` / `:0` for most
+/// subcommands; the count of pending entries owned by a deleted consumer
+/// for `DELCONSUMER`).
+fn apply_xgroup_op(stream: &mut StreamValue, op: &XGroupOp, existed: bool) -> Result<i64, RustyAntError> {
+    match op {
+        XGroupOp::Create { group, start_id, mkstream } => {
+            if !existed && !*mkstream {
+                return Err(RustyAntError::Parse(
+                    "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.".into(),
+                ));
+            }
+            if stream.groups.contains_key(group) {
+                return Err(RustyAntError::Parse("BUSYGROUP Consumer Group name already exists".into()));
+            }
+            let last_delivered_id = match start_id {
+                GroupStartId::Concrete(id) => *id,
+                GroupStartId::Latest => stream.last_generated_id,
+            };
+            stream.groups.insert(group.clone(), ConsumerGroup { last_delivered_id, ..ConsumerGroup::default() });
+            Ok(1)
+        }
+        XGroupOp::SetId { group, start_id } => {
+            let g = stream.groups.get_mut(group).ok_or_else(|| no_group_error(group))?;
+            g.last_delivered_id = match start_id {
+                GroupStartId::Concrete(id) => *id,
+                GroupStartId::Latest => stream.last_generated_id,
+            };
+            Ok(1)
+        }
+        XGroupOp::Destroy { group } => Ok(i64::from(stream.groups.remove(group).is_some())),
+        XGroupOp::CreateConsumer { group, consumer } => {
+            let g = stream.groups.get_mut(group).ok_or_else(|| no_group_error(group))?;
+            if g.consumers.contains_key(consumer) {
+                return Ok(0);
+            }
+            g.consumers.insert(consumer.clone(), crate::stream::Consumer::default());
+            Ok(1)
+        }
+        XGroupOp::DelConsumer { group, consumer } => {
+            let g = stream.groups.get_mut(group).ok_or_else(|| no_group_error(group))?;
+            g.consumers.remove(consumer);
+            let pending_owned =
+                i64::try_from(g.pel.values().filter(|p| p.consumer == *consumer).count()).unwrap_or(i64::MAX);
+            g.pel.retain(|_, p| p.consumer != *consumer);
+            Ok(pending_owned)
+        }
+    }
 }
 
 /// Redis `TYPE` reply tag for a stored value.
@@ -666,6 +731,7 @@ async fn cas_backoff(attempt: u32) {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)] // xclaim / xreadgroup / xautoclaim mirror Redis's option surface
 pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn delete(&self, key: &str) -> Result<bool, RustyAntError>;
     async fn exists(&self, key: &str) -> Result<bool, RustyAntError>;
@@ -968,6 +1034,89 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
 
     /// Redis `XINFO STREAM key`: headline summary of the stream.
     async fn xinfo_stream(&self, key: &str) -> Result<Option<StreamValue>, RustyAntError>;
+
+    /// Redis `XGROUP CREATE / SETID / DESTROY / CREATECONSUMER / DELCONSUMER`.
+    /// `op` chooses which subcommand to apply; `mkstream` is honored only
+    /// for `Create`. Returns a generic int payload (created? / destroyed?
+    /// / consumer-deleted-pending-count / etc.) — the handler interprets it.
+    async fn xgroup(&self, key: &str, op: XGroupOp) -> Result<i64, RustyAntError>;
+
+    /// Redis `XREADGROUP GROUP <group> <consumer> [COUNT n] [NOACK] STREAMS keys ids`.
+    /// `>` ids fetch new entries (advance the group's `last_delivered_id`
+    /// and add to the PEL unless `noack`); explicit ids re-read from the
+    /// PEL filtering by `consumer`.
+    async fn xreadgroup(
+        &self,
+        group: &str,
+        consumer: &str,
+        keys: &[String],
+        ids: &[XReadGroupId],
+        count: Option<usize>,
+        noack: bool,
+        now_ms_override: i64,
+    ) -> Result<Vec<(String, Vec<StreamEntry>)>, RustyAntError>;
+
+    /// Redis `XACK key group id [id ...]`. Removes acknowledged entries
+    /// from the group's PEL; returns the count actually removed.
+    async fn xack(&self, key: &str, group: &str, ids: &[StreamId]) -> Result<i64, RustyAntError>;
+
+    /// Redis `XCLAIM`. Reassigns ownership of pending entries to
+    /// `consumer` if they have been idle for at least `min_idle_ms`.
+    /// `force` adds entries to the PEL even when not previously pending.
+    /// Returns the entries that were claimed (or just their ids when
+    /// `just_id` is set).
+    #[allow(clippy::too_many_arguments)]
+    async fn xclaim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        min_idle_ms: i64,
+        ids: &[StreamId],
+        opts: XClaimOpts,
+    ) -> Result<Vec<XClaimResult>, RustyAntError>;
+
+    /// Redis `XPENDING key group` — summary form. Returns `(count, min_id,
+    /// max_id, per_consumer_counts)` for the group's PEL.
+    async fn xpending_summary(&self, key: &str, group: &str) -> Result<Option<XPendingSummary>, RustyAntError>;
+
+    /// Redis `XPENDING key group [IDLE ms] start end count [consumer]`.
+    /// Detail form — returns matching PEL rows.
+    async fn xpending_detail(
+        &self,
+        key: &str,
+        group: &str,
+        start: RangeId,
+        end: RangeId,
+        count: usize,
+        consumer: Option<&str>,
+        idle_ms: Option<i64>,
+        now_ms_override: i64,
+    ) -> Result<Vec<XPendingDetailRow>, RustyAntError>;
+
+    /// Redis `XAUTOCLAIM`. Sweeps PEL entries idle ≥ `min_idle_ms` and
+    /// reassigns up to `count` of them to `consumer`. Returns the cursor
+    /// (id to resume from on the next call), the entries claimed (or
+    /// just their ids if `just_id`), and any ids that were dropped
+    /// because they no longer exist in the stream.
+    #[allow(clippy::too_many_arguments)]
+    async fn xautoclaim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        min_idle_ms: i64,
+        start: StreamId,
+        count: usize,
+        just_id: bool,
+        now_ms_override: i64,
+    ) -> Result<XAutoClaimResult, RustyAntError>;
+
+    /// Redis `XINFO GROUPS key`: per-group summary.
+    async fn xinfo_groups(&self, key: &str) -> Result<Vec<XInfoGroup>, RustyAntError>;
+
+    /// Redis `XINFO CONSUMERS key group`: per-consumer summary.
+    async fn xinfo_consumers(&self, key: &str, group: &str) -> Result<Vec<XInfoConsumer>, RustyAntError>;
 
     /// Return every key matching `pattern` (Redis-style glob: `*`, `?`).
     /// On S3 this fans out to repeated `ListObjectsV2` calls until the
@@ -2085,6 +2234,354 @@ impl Storage for S3Storage {
             Some(_) => Err(wrong_type(key)),
             None => Ok(None),
         }
+    }
+
+    async fn xgroup(&self, key: &str, op: XGroupOp) -> Result<i64, RustyAntError> {
+        self.cas(key, move |entry| {
+            let (mut stream, expires_at_ms, existed) = match entry {
+                Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms, true),
+                Some(_) => return Err(wrong_type(key)),
+                None => (StreamValue::default(), None, false),
+            };
+            let result = apply_xgroup_op(&mut stream, &op, existed)?;
+            // CREATE / SETID / DESTROY / etc. all imply a write. CREATE
+            // without MKSTREAM on a missing key is the one path that
+            // bails out early via the helper.
+            let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+            Ok(CasAction::Write(new_entry, result))
+        })
+        .await
+    }
+
+    async fn xreadgroup(
+        &self,
+        group: &str,
+        consumer: &str,
+        keys: &[String],
+        ids: &[XReadGroupId],
+        count: Option<usize>,
+        noack: bool,
+        now_ms_override: i64,
+    ) -> Result<Vec<(String, Vec<StreamEntry>)>, RustyAntError> {
+        let mut out: Vec<(String, Vec<StreamEntry>)> = Vec::new();
+        for (key, id_spec) in keys.iter().zip(ids.iter()) {
+            let group = group.to_string();
+            let consumer = consumer.to_string();
+            let id_spec = *id_spec;
+            let entries: Vec<StreamEntry> = self
+                .cas(key, move |entry| {
+                    let (mut stream, expires_at_ms) = match entry {
+                        Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                        Some(_) => return Err(wrong_type_error()),
+                        None => return Err(no_group_error(&group)),
+                    };
+                    let g = stream.groups.get_mut(&group).ok_or_else(|| no_group_error(&group))?;
+                    let mut delivered: Vec<StreamEntry> = match id_spec {
+                        XReadGroupId::NewEntries => {
+                            let last = g.last_delivered_id;
+                            let mut newish: Vec<StreamEntry> =
+                                stream.entries.iter().filter(|e| e.id > last).cloned().collect();
+                            if let Some(cap) = count {
+                                newish.truncate(cap);
+                            }
+                            // Replay through the PEL bookkeeping.
+                            for entry in &newish {
+                                if !noack {
+                                    g.pel.insert(
+                                        entry.id,
+                                        PendingEntry {
+                                            consumer: consumer.clone(),
+                                            delivery_time_ms: now_ms_override,
+                                            delivery_count: 1,
+                                        },
+                                    );
+                                }
+                                if entry.id > g.last_delivered_id {
+                                    g.last_delivered_id = entry.id;
+                                }
+                            }
+                            g.consumers.entry(consumer.clone()).or_default().seen_ms = now_ms_override;
+                            newish
+                        }
+                        XReadGroupId::Pending(after) => {
+                            // Re-read PEL rows owned by this consumer that are > after.
+                            let mut rows: Vec<StreamId> = g
+                                .pel
+                                .iter()
+                                .filter(|(id, p)| **id > after && p.consumer == consumer)
+                                .map(|(id, _)| *id)
+                                .collect();
+                            if let Some(cap) = count {
+                                rows.truncate(cap);
+                            }
+                            // Bump delivery_count for each re-delivery.
+                            for id in &rows {
+                                if let Some(p) = g.pel.get_mut(id) {
+                                    p.delivery_count = p.delivery_count.saturating_add(1);
+                                    p.delivery_time_ms = now_ms_override;
+                                }
+                            }
+                            // Materialize the entries; drop ones that have
+                            // since been XDELed from the stream.
+                            rows.iter()
+                                .filter_map(|id| stream.entries.iter().find(|e| e.id == *id).cloned())
+                                .collect::<Vec<_>>()
+                        }
+                    };
+                    delivered.sort_by_key(|e| e.id);
+                    let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+                    Ok(CasAction::Write(new_entry, delivered))
+                })
+                .await?;
+            if !entries.is_empty() {
+                out.push((key.clone(), entries));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn xack(&self, key: &str, group: &str, ids: &[StreamId]) -> Result<i64, RustyAntError> {
+        let group = group.to_string();
+        let ids = ids.to_vec();
+        self.cas(key, move |entry| {
+            let (mut stream, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Ok(CasAction::NoOp(0)),
+            };
+            let Some(g) = stream.groups.get_mut(&group) else {
+                return Ok(CasAction::NoOp(0));
+            };
+            let mut acked: i64 = 0;
+            for id in &ids {
+                if g.pel.remove(id).is_some() {
+                    acked += 1;
+                }
+            }
+            if acked == 0 {
+                return Ok(CasAction::NoOp(0));
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+            Ok(CasAction::Write(new_entry, acked))
+        })
+        .await
+    }
+
+    async fn xclaim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        min_idle_ms: i64,
+        ids: &[StreamId],
+        opts: XClaimOpts,
+    ) -> Result<Vec<XClaimResult>, RustyAntError> {
+        let group = group.to_string();
+        let consumer = consumer.to_string();
+        let ids = ids.to_vec();
+        self.cas(key, move |entry| {
+            let (mut stream, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Err(no_group_error(&group)),
+            };
+            let g = stream.groups.get_mut(&group).ok_or_else(|| no_group_error(&group))?;
+            let new_delivery_time = opts.time_ms.unwrap_or_else(|| opts.now_ms - opts.idle_ms.unwrap_or(0));
+            let mut claimed: Vec<XClaimResult> = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let existed_in_pel = g.pel.contains_key(id);
+                if !existed_in_pel && !opts.force {
+                    continue;
+                }
+                let entry_idle_ok =
+                    g.pel.get(id).is_none_or(|p| (opts.now_ms - p.delivery_time_ms).max(0) >= min_idle_ms);
+                if !entry_idle_ok {
+                    continue;
+                }
+                let new_count = match (g.pel.get(id), opts.retry_count) {
+                    (_, Some(rc)) => rc,
+                    (Some(p), None) => p.delivery_count.saturating_add(1),
+                    (None, None) => 1,
+                };
+                g.pel.insert(
+                    *id,
+                    PendingEntry {
+                        consumer: consumer.clone(),
+                        delivery_time_ms: new_delivery_time,
+                        delivery_count: new_count,
+                    },
+                );
+                g.consumers.entry(consumer.clone()).or_default().seen_ms = opts.now_ms;
+                let body = if opts.just_id {
+                    None
+                } else {
+                    stream.entries.iter().find(|e| e.id == *id).map(|e| e.fields.clone())
+                };
+                claimed.push(XClaimResult { id: *id, fields: body });
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+            Ok(CasAction::Write(new_entry, claimed))
+        })
+        .await
+    }
+
+    async fn xpending_summary(&self, key: &str, group: &str) -> Result<Option<XPendingSummary>, RustyAntError> {
+        let stream = match self.load(key).await? {
+            Some(StoredValue { value: Value::Stream(s), .. }) => s,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Err(no_group_error(group)),
+        };
+        let g = stream.groups.get(group).ok_or_else(|| no_group_error(group))?;
+        if g.pel.is_empty() {
+            return Ok(None);
+        }
+        let mut per_consumer: BTreeMap<String, u64> = BTreeMap::new();
+        for p in g.pel.values() {
+            *per_consumer.entry(p.consumer.clone()).or_insert(0) += 1;
+        }
+        let min = *g.pel.keys().next().expect("non-empty");
+        let max = *g.pel.keys().next_back().expect("non-empty");
+        Ok(Some(XPendingSummary {
+            count: g.pel.len() as u64,
+            min,
+            max,
+            per_consumer: per_consumer.into_iter().collect(),
+        }))
+    }
+
+    async fn xpending_detail(
+        &self,
+        key: &str,
+        group: &str,
+        start: RangeId,
+        end: RangeId,
+        count: usize,
+        consumer: Option<&str>,
+        idle_ms: Option<i64>,
+        now_ms_override: i64,
+    ) -> Result<Vec<XPendingDetailRow>, RustyAntError> {
+        let stream = match self.load(key).await? {
+            Some(StoredValue { value: Value::Stream(s), .. }) => s,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Err(no_group_error(group)),
+        };
+        let g = stream.groups.get(group).ok_or_else(|| no_group_error(group))?;
+        let mut rows: Vec<XPendingDetailRow> = Vec::new();
+        for (id, p) in &g.pel {
+            if !start.ge_min(*id) || !end.le_max(*id) {
+                continue;
+            }
+            if let Some(c) = consumer {
+                if p.consumer != c {
+                    continue;
+                }
+            }
+            let idle = (now_ms_override - p.delivery_time_ms).max(0);
+            if let Some(min_idle) = idle_ms {
+                if idle < min_idle {
+                    continue;
+                }
+            }
+            rows.push(XPendingDetailRow {
+                id: *id,
+                consumer: p.consumer.clone(),
+                idle_ms: idle,
+                delivery_count: p.delivery_count,
+            });
+            if rows.len() >= count {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn xautoclaim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        min_idle_ms: i64,
+        start: StreamId,
+        count: usize,
+        just_id: bool,
+        now_ms_override: i64,
+    ) -> Result<XAutoClaimResult, RustyAntError> {
+        let group = group.to_string();
+        let consumer = consumer.to_string();
+        self.cas(key, move |entry| {
+            let (mut stream, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::Stream(s), expires_at_ms }) => (s.clone(), *expires_at_ms),
+                Some(_) => return Err(wrong_type(key)),
+                None => return Err(no_group_error(&group)),
+            };
+            let g = stream.groups.get_mut(&group).ok_or_else(|| no_group_error(&group))?;
+            let mut claimed: Vec<XClaimResult> = Vec::new();
+            let mut deleted: Vec<StreamId> = Vec::new();
+            let mut next_cursor = StreamId::MIN;
+            let candidates: Vec<StreamId> = g
+                .pel
+                .range(start..)
+                .filter(|(_, p)| (now_ms_override - p.delivery_time_ms).max(0) >= min_idle_ms)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in candidates {
+                if claimed.len() >= count {
+                    next_cursor = id;
+                    break;
+                }
+                if !stream.entries.iter().any(|e| e.id == id) {
+                    g.pel.remove(&id);
+                    deleted.push(id);
+                    continue;
+                }
+                if let Some(p) = g.pel.get_mut(&id) {
+                    p.consumer.clone_from(&consumer);
+                    p.delivery_time_ms = now_ms_override;
+                    p.delivery_count = p.delivery_count.saturating_add(1);
+                }
+                let body =
+                    if just_id { None } else { stream.entries.iter().find(|e| e.id == id).map(|e| e.fields.clone()) };
+                claimed.push(XClaimResult { id, fields: body });
+            }
+            g.consumers.entry(consumer.clone()).or_default().seen_ms = now_ms_override;
+            let new_entry = StoredValue { expires_at_ms, value: Value::Stream(stream) };
+            Ok(CasAction::Write(new_entry, XAutoClaimResult { next_cursor, claimed, deleted_ids: deleted }))
+        })
+        .await
+    }
+
+    async fn xinfo_groups(&self, key: &str) -> Result<Vec<XInfoGroup>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::Stream(s), .. }) => Ok(s
+                .groups
+                .into_iter()
+                .map(|(name, g)| XInfoGroup {
+                    name,
+                    consumers: g.consumers.len() as u64,
+                    pending: g.pel.len() as u64,
+                    last_delivered_id: g.last_delivered_id,
+                })
+                .collect()),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn xinfo_consumers(&self, key: &str, group: &str) -> Result<Vec<XInfoConsumer>, RustyAntError> {
+        let stream = match self.load(key).await? {
+            Some(StoredValue { value: Value::Stream(s), .. }) => s,
+            Some(_) => return Err(wrong_type(key)),
+            None => return Err(no_group_error(group)),
+        };
+        let g = stream.groups.get(group).ok_or_else(|| no_group_error(group))?;
+        let now = now_ms();
+        Ok(g.consumers
+            .iter()
+            .map(|(name, c)| {
+                let pending = g.pel.values().filter(|p| p.consumer == *name).count() as u64;
+                XInfoConsumer { name: name.clone(), pending, idle_ms: (now - c.seen_ms).max(0) }
+            })
+            .collect())
     }
 
     async fn getset(&self, key: &str, value: Bytes) -> Result<Option<Bytes>, RustyAntError> {

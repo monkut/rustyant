@@ -9,7 +9,10 @@ use crate::metrics;
 use crate::resp::RespReply;
 use crate::state::State;
 use crate::storage::{GetExOp, LexBound, ScoreBound, TtlResult, ZAddFlags, bit_at, now_ms};
-use crate::stream::{AddIdSpec, RangeId, StreamEntry, StreamId, parse_trim};
+use crate::stream::{
+    AddIdSpec, GroupStartId, RangeId, StreamEntry, StreamId, XClaimOpts, XClaimResult, XGroupOp, XReadGroupId,
+    parse_trim,
+};
 
 /// Coarse classification of a dispatch result, emitted as a structured log
 /// field so `CloudWatch` queries can count/alert by outcome without string
@@ -303,6 +306,13 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "XTRIM" => handle_xtrim(state, args).await,
         "XREAD" => handle_xread(state, args).await,
         "XINFO" => handle_xinfo(state, args).await,
+        // Streams consumer groups
+        "XGROUP" => handle_xgroup(state, args).await,
+        "XREADGROUP" => handle_xreadgroup(state, args).await,
+        "XACK" => handle_xack(state, args).await,
+        "XCLAIM" => handle_xclaim(state, args).await,
+        "XPENDING" => handle_xpending(state, args).await,
+        "XAUTOCLAIM" => handle_xautoclaim(state, args).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
     }
 }
@@ -4168,8 +4178,9 @@ async fn handle_xread(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
 
 /// Redis `XINFO STREAM key [FULL [COUNT n]]`.
 /// The FULL form is accepted syntactically but renders the same summary
-/// here — rustyant has no consumer-groups surface yet (#50), so there is
-/// nothing to emit under `groups`.
+/// here — STREAM, GROUPS, and CONSUMERS each have their own assembly
+/// path, all routed from this single entry point.
+#[allow(clippy::too_many_lines)] // four subcommands in one router
 async fn handle_xinfo(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
     let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "XINFO".into() })?;
     let sub = arg_as_str(sub)?.to_ascii_uppercase();
@@ -4201,6 +4212,7 @@ async fn handle_xinfo(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
             let length = i64::try_from(stream.entries.len()).unwrap_or(i64::MAX);
             let first_entry = stream.entries.first().cloned().map_or(RespReply::Nil, entry_to_reply);
             let last_entry = stream.entries.last().cloned().map_or(RespReply::Nil, entry_to_reply);
+            let groups_count = i64::try_from(stream.groups.len()).unwrap_or(i64::MAX);
             Ok(RespReply::Array(vec![
                 RespReply::BulkString(Some(Bytes::from_static(b"length"))),
                 RespReply::Integer(length),
@@ -4211,21 +4223,426 @@ async fn handle_xinfo(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
                 RespReply::BulkString(Some(Bytes::from_static(b"entries-added"))),
                 RespReply::Integer(i64::try_from(stream.entries_added).unwrap_or(i64::MAX)),
                 RespReply::BulkString(Some(Bytes::from_static(b"groups"))),
-                RespReply::Integer(0),
+                RespReply::Integer(groups_count),
                 RespReply::BulkString(Some(Bytes::from_static(b"first-entry"))),
                 first_entry,
                 RespReply::BulkString(Some(Bytes::from_static(b"last-entry"))),
                 last_entry,
             ]))
         }
-        "GROUPS" | "CONSUMERS" => {
-            // Consumer-group surface — empty array is the honest answer
-            // until #50 ships. Real Redis returns the same shape here.
-            Ok(RespReply::Array(Vec::new()))
+        "GROUPS" => {
+            if args.len() != 2 {
+                return Err(RustyAntError::WrongArity { command: "XINFO GROUPS".into() });
+            }
+            let key = arg_as_str(&args[1])?;
+            let groups = state.storage.xinfo_groups(key).await?;
+            Ok(RespReply::Array(
+                groups
+                    .into_iter()
+                    .map(|g| {
+                        RespReply::Array(vec![
+                            RespReply::BulkString(Some(Bytes::from_static(b"name"))),
+                            RespReply::BulkString(Some(Bytes::from(g.name.into_bytes()))),
+                            RespReply::BulkString(Some(Bytes::from_static(b"consumers"))),
+                            RespReply::Integer(i64::try_from(g.consumers).unwrap_or(i64::MAX)),
+                            RespReply::BulkString(Some(Bytes::from_static(b"pending"))),
+                            RespReply::Integer(i64::try_from(g.pending).unwrap_or(i64::MAX)),
+                            RespReply::BulkString(Some(Bytes::from_static(b"last-delivered-id"))),
+                            stream_id_bulk(g.last_delivered_id),
+                        ])
+                    })
+                    .collect(),
+            ))
         }
-        "HELP" => Ok(RespReply::Array(vec![RespReply::BulkString(Some(Bytes::from_static(
-            b"XINFO STREAM <key> [FULL [COUNT n]] -- summary for the stream at <key>.",
-        )))])),
+        "CONSUMERS" => {
+            if args.len() != 3 {
+                return Err(RustyAntError::WrongArity { command: "XINFO CONSUMERS".into() });
+            }
+            let key = arg_as_str(&args[1])?;
+            let group = arg_as_str(&args[2])?;
+            let consumers = state.storage.xinfo_consumers(key, group).await?;
+            Ok(RespReply::Array(
+                consumers
+                    .into_iter()
+                    .map(|c| {
+                        RespReply::Array(vec![
+                            RespReply::BulkString(Some(Bytes::from_static(b"name"))),
+                            RespReply::BulkString(Some(Bytes::from(c.name.into_bytes()))),
+                            RespReply::BulkString(Some(Bytes::from_static(b"pending"))),
+                            RespReply::Integer(i64::try_from(c.pending).unwrap_or(i64::MAX)),
+                            RespReply::BulkString(Some(Bytes::from_static(b"idle"))),
+                            RespReply::Integer(c.idle_ms),
+                        ])
+                    })
+                    .collect(),
+            ))
+        }
+        "HELP" => Ok(RespReply::Array(vec![
+            RespReply::BulkString(Some(Bytes::from_static(
+                b"XINFO STREAM <key> [FULL [COUNT n]] -- summary for the stream at <key>.",
+            ))),
+            RespReply::BulkString(Some(Bytes::from_static(b"XINFO GROUPS <key> -- groups defined on <key>."))),
+            RespReply::BulkString(Some(Bytes::from_static(
+                b"XINFO CONSUMERS <key> <group> -- consumers in <group> on <key>.",
+            ))),
+        ])),
         other => Err(RustyAntError::Parse(format!("unsupported XINFO subcommand: {other}"))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streams consumer groups — XGROUP / XREADGROUP / XACK / XCLAIM / XPENDING / XAUTOCLAIM
+// ---------------------------------------------------------------------------
+
+/// Redis `XGROUP <subcmd> <key> <group> ...`.
+async fn handle_xgroup(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity { command: "XGROUP".into() });
+    }
+    let sub = arg_as_str(&args[0])?.to_ascii_uppercase();
+    let key = arg_as_str(&args[1])?;
+    let op = match sub.as_str() {
+        "CREATE" => {
+            if args.len() < 4 {
+                return Err(RustyAntError::WrongArity { command: "XGROUP CREATE".into() });
+            }
+            let group = arg_as_string(&args[2])?;
+            let start_id = GroupStartId::parse(arg_as_str(&args[3])?)?;
+            let mut mkstream = false;
+            // Optional MKSTREAM and ENTRIESREAD trailing tokens.
+            let mut i = 4;
+            while i < args.len() {
+                let tok = arg_as_str(&args[i])?.to_ascii_uppercase();
+                match tok.as_str() {
+                    "MKSTREAM" => {
+                        mkstream = true;
+                        i += 1;
+                    }
+                    "ENTRIESREAD" => {
+                        // Accept and ignore — Redis 7 optimisation hint.
+                        if i + 1 >= args.len() {
+                            return Err(RustyAntError::Parse("syntax error".into()));
+                        }
+                        let _ = parse_i64(&args[i + 1], "ENTRIESREAD")?;
+                        i += 2;
+                    }
+                    _ => return Err(RustyAntError::Parse("syntax error".into())),
+                }
+            }
+            XGroupOp::Create { group, start_id, mkstream }
+        }
+        "SETID" => {
+            if args.len() < 4 {
+                return Err(RustyAntError::WrongArity { command: "XGROUP SETID".into() });
+            }
+            XGroupOp::SetId { group: arg_as_string(&args[2])?, start_id: GroupStartId::parse(arg_as_str(&args[3])?)? }
+        }
+        "DESTROY" => {
+            if args.len() != 3 {
+                return Err(RustyAntError::WrongArity { command: "XGROUP DESTROY".into() });
+            }
+            XGroupOp::Destroy { group: arg_as_string(&args[2])? }
+        }
+        "CREATECONSUMER" => {
+            if args.len() != 4 {
+                return Err(RustyAntError::WrongArity { command: "XGROUP CREATECONSUMER".into() });
+            }
+            XGroupOp::CreateConsumer { group: arg_as_string(&args[2])?, consumer: arg_as_string(&args[3])? }
+        }
+        "DELCONSUMER" => {
+            if args.len() != 4 {
+                return Err(RustyAntError::WrongArity { command: "XGROUP DELCONSUMER".into() });
+            }
+            XGroupOp::DelConsumer { group: arg_as_string(&args[2])?, consumer: arg_as_string(&args[3])? }
+        }
+        "HELP" => {
+            return Ok(RespReply::Array(vec![RespReply::BulkString(Some(Bytes::from_static(
+                b"XGROUP CREATE | SETID | DESTROY | CREATECONSUMER | DELCONSUMER",
+            )))]));
+        }
+        other => return Err(RustyAntError::Parse(format!("unsupported XGROUP subcommand: {other}"))),
+    };
+    let n = state.storage.xgroup(key, op).await?;
+    // CREATE / SETID return +OK; DELCONSUMER returns the pending count;
+    // others return :0 / :1.
+    match sub.as_str() {
+        "CREATE" | "SETID" => Ok(RespReply::ok()),
+        _ => Ok(RespReply::Integer(n)),
+    }
+}
+
+/// Redis `XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] [NOACK] STREAMS keys ids`.
+async fn handle_xreadgroup(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 6 {
+        return Err(RustyAntError::WrongArity { command: "XREADGROUP".into() });
+    }
+    if !arg_as_str(&args[0])?.eq_ignore_ascii_case("GROUP") {
+        return Err(RustyAntError::Parse("syntax error".into()));
+    }
+    let group = arg_as_string(&args[1])?;
+    let consumer = arg_as_string(&args[2])?;
+    let mut i = 3;
+    let mut count: Option<usize> = None;
+    let mut noack = false;
+    loop {
+        let tok = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match tok.as_str() {
+            "COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let n = parse_i64(&args[i + 1], "COUNT")?;
+                if n < 0 {
+                    return Err(RustyAntError::Parse("COUNT must be non-negative".into()));
+                }
+                count = Some(usize::try_from(n).unwrap_or(0));
+                i += 2;
+            }
+            "BLOCK" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let _ = parse_i64(&args[i + 1], "BLOCK")?;
+                i += 2;
+            }
+            "NOACK" => {
+                noack = true;
+                i += 1;
+            }
+            "STREAMS" => {
+                i += 1;
+                break;
+            }
+            _ => return Err(RustyAntError::Parse("syntax error".into())),
+        }
+    }
+    let remaining = args.len() - i;
+    if remaining == 0 || remaining % 2 != 0 {
+        return Err(RustyAntError::Parse(
+            "Unbalanced XREADGROUP list of streams: for each stream key an ID or '>' must be specified.".into(),
+        ));
+    }
+    let half = remaining / 2;
+    let keys: Vec<String> = (i..i + half).map(|idx| arg_as_string(&args[idx])).collect::<Result<_, _>>()?;
+    let ids: Vec<XReadGroupId> =
+        (i + half..i + remaining).map(|idx| XReadGroupId::parse(arg_as_str(&args[idx])?)).collect::<Result<_, _>>()?;
+    let now = now_ms();
+    let per_stream = state.storage.xreadgroup(&group, &consumer, &keys, &ids, count, noack, now).await?;
+    if per_stream.is_empty() {
+        return Ok(RespReply::Nil);
+    }
+    Ok(RespReply::Array(
+        per_stream
+            .into_iter()
+            .map(|(key, entries)| {
+                RespReply::Array(vec![
+                    RespReply::BulkString(Some(Bytes::from(key.into_bytes()))),
+                    RespReply::Array(entries.into_iter().map(entry_to_reply).collect()),
+                ])
+            })
+            .collect(),
+    ))
+}
+
+/// Redis `XACK key group id [id ...]`.
+async fn handle_xack(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "XACK".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let group = arg_as_str(&args[1])?;
+    let ids: Vec<StreamId> = args.iter().skip(2).map(|a| StreamId::parse(arg_as_str(a)?)).collect::<Result<_, _>>()?;
+    Ok(RespReply::Integer(state.storage.xack(key, group, &ids).await?))
+}
+
+/// Redis `XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms] [RETRYCOUNT n] [FORCE] [JUSTID]`.
+async fn handle_xclaim(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 5 {
+        return Err(RustyAntError::WrongArity { command: "XCLAIM".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let group = arg_as_str(&args[1])?;
+    let consumer = arg_as_str(&args[2])?;
+    let min_idle = parse_i64(&args[3], "min-idle-time")?;
+
+    // Walk ids until we hit an option keyword.
+    let mut ids: Vec<StreamId> = Vec::new();
+    let mut i = 4;
+    while i < args.len() {
+        let tok = arg_as_str(&args[i])?;
+        let upper = tok.to_ascii_uppercase();
+        if matches!(upper.as_str(), "IDLE" | "TIME" | "RETRYCOUNT" | "FORCE" | "JUSTID") {
+            break;
+        }
+        ids.push(StreamId::parse(tok)?);
+        i += 1;
+    }
+    let mut opts = XClaimOpts { now_ms: now_ms(), ..XClaimOpts::default() };
+    while i < args.len() {
+        let tok = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match tok.as_str() {
+            "IDLE" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                opts.idle_ms = Some(parse_i64(&args[i + 1], "IDLE")?);
+                i += 2;
+            }
+            "TIME" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                opts.time_ms = Some(parse_i64(&args[i + 1], "TIME")?);
+                i += 2;
+            }
+            "RETRYCOUNT" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let n = parse_i64(&args[i + 1], "RETRYCOUNT")?;
+                if n < 0 {
+                    return Err(RustyAntError::Parse("RETRYCOUNT must be non-negative".into()));
+                }
+                opts.retry_count = Some(u64::try_from(n).unwrap_or(0));
+                i += 2;
+            }
+            "FORCE" => {
+                opts.force = true;
+                i += 1;
+            }
+            "JUSTID" => {
+                opts.just_id = true;
+                i += 1;
+            }
+            _ => return Err(RustyAntError::Parse("syntax error".into())),
+        }
+    }
+
+    let claimed = state.storage.xclaim(key, group, consumer, min_idle, &ids, opts).await?;
+    Ok(RespReply::Array(claimed.into_iter().map(claim_result_to_reply).collect()))
+}
+
+fn claim_result_to_reply(result: XClaimResult) -> RespReply {
+    match result.fields {
+        Some(fields) => {
+            let mut fields_arr = Vec::with_capacity(fields.len() * 2);
+            for (f, v) in fields {
+                fields_arr.push(RespReply::BulkString(Some(Bytes::from(f.into_bytes()))));
+                fields_arr.push(RespReply::BulkString(Some(Bytes::from(v))));
+            }
+            RespReply::Array(vec![stream_id_bulk(result.id), RespReply::Array(fields_arr)])
+        }
+        None => stream_id_bulk(result.id),
+    }
+}
+
+/// Redis `XPENDING key group [[IDLE ms] start end count [consumer]]`.
+async fn handle_xpending(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity { command: "XPENDING".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let group = arg_as_str(&args[1])?;
+    if args.len() == 2 {
+        // Summary form.
+        let summary = state.storage.xpending_summary(key, group).await?;
+        let Some(s) = summary else {
+            return Ok(RespReply::Array(vec![RespReply::Integer(0), RespReply::Nil, RespReply::Nil, RespReply::Nil]));
+        };
+        let consumers_arr: Vec<RespReply> = s
+            .per_consumer
+            .into_iter()
+            .map(|(c, n)| {
+                RespReply::Array(vec![
+                    RespReply::BulkString(Some(Bytes::from(c.into_bytes()))),
+                    RespReply::BulkString(Some(Bytes::from(n.to_string().into_bytes()))),
+                ])
+            })
+            .collect();
+        return Ok(RespReply::Array(vec![
+            RespReply::Integer(i64::try_from(s.count).unwrap_or(i64::MAX)),
+            stream_id_bulk(s.min),
+            stream_id_bulk(s.max),
+            RespReply::Array(consumers_arr),
+        ]));
+    }
+    // Detail form: [IDLE ms] start end count [consumer]
+    let mut i = 2;
+    let mut idle_ms: Option<i64> = None;
+    if arg_as_str(&args[i])?.eq_ignore_ascii_case("IDLE") {
+        if i + 1 >= args.len() {
+            return Err(RustyAntError::Parse("syntax error".into()));
+        }
+        idle_ms = Some(parse_i64(&args[i + 1], "IDLE")?);
+        i += 2;
+    }
+    if i + 3 > args.len() {
+        return Err(RustyAntError::Parse("syntax error".into()));
+    }
+    let start = RangeId::parse(arg_as_str(&args[i])?)?;
+    let end = RangeId::parse(arg_as_str(&args[i + 1])?)?;
+    let count_n = parse_i64(&args[i + 2], "count")?;
+    if count_n < 0 {
+        return Err(RustyAntError::Parse("count must be non-negative".into()));
+    }
+    let count = usize::try_from(count_n).unwrap_or(0);
+    i += 3;
+    let consumer = if i < args.len() { Some(arg_as_str(&args[i])?) } else { None };
+    let now = now_ms();
+    let rows = state.storage.xpending_detail(key, group, start, end, count, consumer, idle_ms, now).await?;
+    Ok(RespReply::Array(
+        rows.into_iter()
+            .map(|r| {
+                RespReply::Array(vec![
+                    stream_id_bulk(r.id),
+                    RespReply::BulkString(Some(Bytes::from(r.consumer.into_bytes()))),
+                    RespReply::Integer(r.idle_ms),
+                    RespReply::Integer(i64::try_from(r.delivery_count).unwrap_or(i64::MAX)),
+                ])
+            })
+            .collect(),
+    ))
+}
+
+/// Redis `XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]`.
+async fn handle_xautoclaim(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 5 {
+        return Err(RustyAntError::WrongArity { command: "XAUTOCLAIM".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let group = arg_as_str(&args[1])?;
+    let consumer = arg_as_str(&args[2])?;
+    let min_idle = parse_i64(&args[3], "min-idle-time")?;
+    let start = StreamId::parse(arg_as_str(&args[4])?)?;
+    let mut count: usize = 100;
+    let mut just_id = false;
+    let mut i = 5;
+    while i < args.len() {
+        let tok = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match tok.as_str() {
+            "COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let n = parse_i64(&args[i + 1], "COUNT")?;
+                if n < 0 {
+                    return Err(RustyAntError::Parse("COUNT must be non-negative".into()));
+                }
+                count = usize::try_from(n).unwrap_or(0);
+                i += 2;
+            }
+            "JUSTID" => {
+                just_id = true;
+                i += 1;
+            }
+            _ => return Err(RustyAntError::Parse("syntax error".into())),
+        }
+    }
+    let now = now_ms();
+    let result = state.storage.xautoclaim(key, group, consumer, min_idle, start, count, just_id, now).await?;
+    Ok(RespReply::Array(vec![
+        stream_id_bulk(result.next_cursor),
+        RespReply::Array(result.claimed.into_iter().map(claim_result_to_reply).collect()),
+        RespReply::Array(result.deleted_ids.into_iter().map(stream_id_bulk).collect()),
+    ]))
 }
