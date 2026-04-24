@@ -1176,6 +1176,31 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// string if needed. Returns the previous bit value (0 or 1). Mutates
     /// under CAS on the S3 backend.
     async fn setbit(&self, key: &str, offset: u64, value: bool) -> Result<i64, RustyAntError>;
+
+    /// Redis `DUMP`: return the key's value encoded as a DUMP binary payload.
+    /// `None` for missing / expired keys. Errors on value kinds whose RDB
+    /// encoding is not yet supported (currently: streams).
+    async fn dump(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
+
+    /// Redis `RESTORE`: decode `payload` and store it at `key`.
+    ///
+    /// * `ttl_ms` — 0 means "no expiry"; otherwise the TTL to stamp on the
+    ///   new entry. If `abs_ttl` is true the value is already absolute
+    ///   epoch-ms; otherwise it's a delta from "now".
+    /// * `replace` — false rejects the write if `key` already exists (Redis
+    ///   returns `BUSYKEY Target key name already exists`). True overwrites.
+    ///
+    /// Returns `Err(Parse)` for malformed / wrong-version / bad-CRC payloads.
+    /// `idletime` and `freq` are accepted by the handler and ignored here —
+    /// rustyant has no LRU/LFU tracking on the S3 backend.
+    async fn restore(
+        &self,
+        key: &str,
+        payload: &[u8],
+        ttl_ms: i64,
+        replace: bool,
+        abs_ttl: bool,
+    ) -> Result<(), RustyAntError>;
 }
 
 /// Read bit `offset` (Redis bit numbering: bit 0 = MSB of byte 0) from `data`.
@@ -3574,6 +3599,44 @@ impl Storage for S3Storage {
             Ok(CasAction::Write(new_entry, i64::from(prev)))
         })
         .await
+    }
+
+    async fn dump(&self, key: &str) -> Result<Option<Bytes>, RustyAntError> {
+        let Some(entry) = self.load(key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::rdb::dump_value(&entry.value)?))
+    }
+
+    async fn restore(
+        &self,
+        key: &str,
+        payload: &[u8],
+        ttl_ms: i64,
+        replace: bool,
+        abs_ttl: bool,
+    ) -> Result<(), RustyAntError> {
+        let value = crate::rdb::restore_value(payload)?;
+        let expires_at_ms = match ttl_ms {
+            0 => None,
+            n if abs_ttl => Some(n),
+            n => Some(now_ms().saturating_add(n)),
+        };
+        let new_entry = StoredValue { expires_at_ms, value };
+        if replace {
+            // Overwrite unconditionally — REPLACE is explicit permission.
+            self.save(key, &new_entry).await?;
+            return Ok(());
+        }
+        // Guard against existing-key: try create-only first; on Contention
+        // (something already exists at the S3 key), translate to BUSYKEY.
+        match self.save_cas(key, &new_entry, CasCondition::CreateOnly).await {
+            Ok(()) => Ok(()),
+            Err(RustyAntError::Contention) => {
+                Err(RustyAntError::Parse("BUSYKEY Target key name already exists.".into()))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

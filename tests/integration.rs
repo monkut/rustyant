@@ -5839,3 +5839,158 @@ async fn geosearch_stubs_registered_in_command_meta() {
         assert!(s.starts_with("*1\r\n*6\r\n"), "{name:?} not in COMMAND INFO:\n{s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// DUMP / RESTORE
+// ---------------------------------------------------------------------------
+
+/// Extract the payload bytes from a single-bulk-string reply. Panics if the
+/// reply isn't a bulk string (i.e. the DUMP call failed).
+fn bulk_payload(reply: DecodedReply) -> Bytes {
+    let parts = reply.into_bulk_array();
+    assert_eq!(parts.len(), 1, "expected one bulk string");
+    parts.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn dump_missing_key_returns_nil() {
+    let state = test_state();
+    call(&state, &[b"DUMP", b"dump-missing"]).await.expect_nil();
+}
+
+#[tokio::test]
+async fn dump_wrong_arity_errors() {
+    let state = test_state();
+    call(&state, &[b"DUMP"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"DUMP", b"a", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn dump_restore_string_round_trip() {
+    let state = test_state();
+    call(&state, &[b"SET", b"dump-str-src", b"hello world"]).await.expect_simple("OK");
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-str-src"]).await);
+    assert!(payload.len() > 10);
+    call(&state, &[b"RESTORE", b"dump-str-dst", b"0", &payload]).await.expect_simple("OK");
+    call(&state, &[b"GET", b"dump-str-dst"]).await.expect_bulk(b"hello world");
+}
+
+#[tokio::test]
+async fn dump_restore_hash_round_trip() {
+    let state = test_state();
+    call(&state, &[b"HSET", b"dump-h-src", b"a", b"1", b"b", b"hello"]).await.expect_integer(2);
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-h-src"]).await);
+    call(&state, &[b"RESTORE", b"dump-h-dst", b"0", &payload]).await.expect_simple("OK");
+    call(&state, &[b"HGET", b"dump-h-dst", b"a"]).await.expect_bulk(b"1");
+    call(&state, &[b"HGET", b"dump-h-dst", b"b"]).await.expect_bulk(b"hello");
+    call(&state, &[b"HLEN", b"dump-h-dst"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn dump_restore_list_round_trip() {
+    let state = test_state();
+    call(&state, &[b"RPUSH", b"dump-l-src", b"a", b"bb", b"ccc"]).await.expect_integer(3);
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-l-src"]).await);
+    call(&state, &[b"RESTORE", b"dump-l-dst", b"0", &payload]).await.expect_simple("OK");
+    call(&state, &[b"LLEN", b"dump-l-dst"]).await.expect_integer(3);
+    call(&state, &[b"LINDEX", b"dump-l-dst", b"0"]).await.expect_bulk(b"a");
+    call(&state, &[b"LINDEX", b"dump-l-dst", b"2"]).await.expect_bulk(b"ccc");
+}
+
+#[tokio::test]
+async fn dump_restore_set_round_trip() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"dump-s-src", b"alpha", b"beta", b"42"]).await.expect_integer(3);
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-s-src"]).await);
+    call(&state, &[b"RESTORE", b"dump-s-dst", b"0", &payload]).await.expect_simple("OK");
+    call(&state, &[b"SCARD", b"dump-s-dst"]).await.expect_integer(3);
+    call(&state, &[b"SISMEMBER", b"dump-s-dst", b"alpha"]).await.expect_integer(1);
+    call(&state, &[b"SISMEMBER", b"dump-s-dst", b"42"]).await.expect_integer(1);
+    call(&state, &[b"SISMEMBER", b"dump-s-dst", b"ghost"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn dump_restore_zset_round_trip() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"dump-z-src", b"1", b"alpha", b"3.14", b"beta", b"-42", b"gamma"]).await.expect_integer(3);
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-z-src"]).await);
+    call(&state, &[b"RESTORE", b"dump-z-dst", b"0", &payload]).await.expect_simple("OK");
+    call(&state, &[b"ZCARD", b"dump-z-dst"]).await.expect_integer(3);
+    call(&state, &[b"ZSCORE", b"dump-z-dst", b"alpha"]).await.expect_bulk(b"1");
+    call(&state, &[b"ZSCORE", b"dump-z-dst", b"beta"]).await.expect_bulk(b"3.14");
+    call(&state, &[b"ZSCORE", b"dump-z-dst", b"gamma"]).await.expect_bulk(b"-42");
+}
+
+#[tokio::test]
+async fn restore_with_ttl_sets_expiry() {
+    let state = test_state();
+    call(&state, &[b"SET", b"dump-ttl-src", b"v"]).await.expect_simple("OK");
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-ttl-src"]).await);
+    call(&state, &[b"RESTORE", b"dump-ttl-dst", b"60000", &payload]).await.expect_simple("OK");
+    let ttl_reply = call(&state, &[b"PTTL", b"dump-ttl-dst"]).await;
+    let s = String::from_utf8_lossy(&ttl_reply.raw);
+    assert!(s.starts_with(':'), "PTTL reply not integer: {s:?}");
+    let val: i64 = s.trim_start_matches(':').trim_end_matches("\r\n").parse().expect("int");
+    assert!(val > 0 && val <= 60_000, "unexpected pttl: {val}");
+}
+
+#[tokio::test]
+async fn restore_without_replace_rejects_existing_key() {
+    // Floci does not enforce conditional writes, so the BUSYKEY path is only
+    // exercised when pointed at a real S3 endpoint (RUSTYANT_S3_CAS=1).
+    if std::env::var("RUSTYANT_S3_CAS").is_err() {
+        eprintln!("SKIP: RUSTYANT_S3_CAS not set (floci does not enforce If-None-Match)");
+        return;
+    }
+    let state = test_state();
+    call(&state, &[b"SET", b"dump-exist-src", b"v"]).await.expect_simple("OK");
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-exist-src"]).await);
+    call(&state, &[b"SET", b"dump-exist-dst", b"old"]).await.expect_simple("OK");
+    call(&state, &[b"RESTORE", b"dump-exist-dst", b"0", &payload]).await.expect_error_prefix("BUSYKEY");
+}
+
+#[tokio::test]
+async fn restore_with_replace_overwrites_existing_key() {
+    let state = test_state();
+    call(&state, &[b"SET", b"dump-rep-src", b"new"]).await.expect_simple("OK");
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-rep-src"]).await);
+    call(&state, &[b"SET", b"dump-rep-dst", b"old"]).await.expect_simple("OK");
+    call(&state, &[b"RESTORE", b"dump-rep-dst", b"0", &payload, b"REPLACE"]).await.expect_simple("OK");
+    call(&state, &[b"GET", b"dump-rep-dst"]).await.expect_bulk(b"new");
+}
+
+#[tokio::test]
+async fn restore_with_idletime_and_freq_accepted() {
+    let state = test_state();
+    call(&state, &[b"SET", b"dump-meta-src", b"v"]).await.expect_simple("OK");
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-meta-src"]).await);
+    call(&state, &[b"RESTORE", b"dump-meta-dst", b"0", &payload, b"REPLACE", b"IDLETIME", b"100", b"FREQ", b"5"])
+        .await
+        .expect_simple("OK");
+    call(&state, &[b"GET", b"dump-meta-dst"]).await.expect_bulk(b"v");
+}
+
+#[tokio::test]
+async fn restore_rejects_bad_crc() {
+    let state = test_state();
+    call(&state, &[b"SET", b"dump-crc-src", b"v"]).await.expect_simple("OK");
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-crc-src"]).await);
+    let mut tampered = payload.to_vec();
+    *tampered.last_mut().unwrap() ^= 0x01;
+    call(&state, &[b"RESTORE", b"dump-crc-dst", b"0", &tampered]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn restore_rejects_negative_ttl() {
+    let state = test_state();
+    call(&state, &[b"SET", b"dump-neg-src", b"v"]).await.expect_simple("OK");
+    let payload = bulk_payload(call(&state, &[b"DUMP", b"dump-neg-src"]).await);
+    call(&state, &[b"RESTORE", b"dump-neg-dst", b"-1", &payload]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn dump_stream_errors() {
+    let state = test_state();
+    call(&state, &[b"XADD", b"dump-x-src", b"*", b"field", b"val"]).await;
+    call(&state, &[b"DUMP", b"dump-x-src"]).await.expect_error_prefix("ERR");
+}
