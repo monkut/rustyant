@@ -252,6 +252,9 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "SSCAN" => handle_sscan(state, args).await,
         // Sorted sets
         "ZADD" => handle_zadd(state, args).await,
+        "ZINTER" => handle_zinter(state, args).await,
+        "ZUNION" => handle_zunion(state, args).await,
+        "ZDIFF" => handle_zdiff(state, args).await,
         "ZINTERSTORE" => handle_zstore(state, args, ZStoreOp::Inter).await,
         "ZUNIONSTORE" => handle_zstore(state, args, ZStoreOp::Union).await,
         "ZDIFFSTORE" => handle_zstore(state, args, ZStoreOp::Diff).await,
@@ -1174,19 +1177,56 @@ async fn handle_zstore(state: &State, args: Vec<Bytes>, op: ZStoreOp) -> Result<
         return Err(RustyAntError::WrongArity { command: cmd_name.into() });
     }
     let dest = arg_as_string(&args[0])?;
-    let numkeys_i = parse_i64(&args[1], "numkeys")?;
+    // The rest — from numkeys on — is the same shape as the non-store form.
+    let pairs = compute_zset_aggregate(state, &args[1..], op, cmd_name, false).await?;
+    state.storage.delete(&dest).await?;
+    if pairs.is_empty() {
+        return Ok(RespReply::Integer(0));
+    }
+    let count = state.storage.zadd(&dest, pairs).await?;
+    Ok(RespReply::Integer(count))
+}
+
+/// Shared compute for `ZINTER(STORE)` / `ZUNION(STORE)` / `ZDIFF(STORE)`.
+///
+/// `args` starts at `numkeys`; the caller strips the destination for the
+/// STORE variants. `allow_withscores` lets the non-STORE form accept a
+/// trailing `WITHSCORES` literal (consumed here so the handler only needs
+/// to remember whether it was present).
+///
+/// Matches Redis: `ZDIFF(STORE)` rejects `WEIGHTS` / `AGGREGATE`, and any
+/// non-set / non-zset input is `WRONGTYPE`.
+async fn compute_zset_aggregate(
+    state: &State,
+    args: &[Bytes],
+    op: ZStoreOp,
+    cmd_name: &str,
+    allow_withscores: bool,
+) -> Result<Vec<(f64, String)>, RustyAntError> {
+    if args.is_empty() {
+        return Err(RustyAntError::WrongArity { command: cmd_name.into() });
+    }
+    let numkeys_i = parse_i64(&args[0], "numkeys")?;
     if numkeys_i <= 0 {
         return Err(RustyAntError::Parse("at least 1 input key is needed for this command".into()));
     }
     let numkeys = usize::try_from(numkeys_i).unwrap_or(0);
-    if args.len() < 2 + numkeys {
+    if args.len() < 1 + numkeys {
         return Err(RustyAntError::Parse("Number of keys can't be greater than number of args".into()));
     }
-    let src_keys: Vec<String> = args.iter().skip(2).take(numkeys).map(arg_as_string).collect::<Result<_, _>>()?;
+    let src_keys: Vec<String> = args.iter().skip(1).take(numkeys).map(arg_as_string).collect::<Result<_, _>>()?;
 
-    // Trailing options: WEIGHTS w1 w2 ... / AGGREGATE SUM|MIN|MAX.
-    // ZDIFFSTORE does not accept either — surface an error per Redis.
-    let tail = &args[2 + numkeys..];
+    // Strip an optional trailing WITHSCORES for the non-STORE form before
+    // handing what's left to the existing WEIGHTS / AGGREGATE parser.
+    let mut tail: &[Bytes] = &args[1 + numkeys..];
+    if allow_withscores {
+        if let Some(last) = tail.last() {
+            if arg_as_str(last)?.eq_ignore_ascii_case("WITHSCORES") {
+                tail = &tail[..tail.len() - 1];
+            }
+        }
+    }
+
     let (weights, aggregate) = if op == ZStoreOp::Diff {
         if !tail.is_empty() {
             return Err(RustyAntError::Parse(format!("syntax error near '{}'", arg_as_str(&tail[0])?)));
@@ -1196,25 +1236,59 @@ async fn handle_zstore(state: &State, args: Vec<Bytes>, op: ZStoreOp) -> Result<
         parse_weights_aggregate(tail, numkeys)?
     };
 
-    // Load each source, applying its weight to produce (member, weighted score).
     let mut per_input: Vec<Vec<(String, f64)>> = Vec::with_capacity(numkeys);
     for (k, w) in src_keys.iter().zip(weights.iter()) {
         let items = load_zset_or_set(state, k).await?;
         per_input.push(items.into_iter().map(|(m, s)| (m, s * w)).collect());
     }
 
-    let pairs = match op {
+    Ok(match op {
         ZStoreOp::Inter => aggregate_intersection(&per_input, aggregate),
         ZStoreOp::Union => aggregate_union(per_input, aggregate),
         ZStoreOp::Diff => aggregate_difference(per_input),
-    };
+    })
+}
 
-    state.storage.delete(&dest).await?;
-    if pairs.is_empty() {
-        return Ok(RespReply::Integer(0));
+/// Shared driver for the non-STORE forms — parses args, delegates to the
+/// aggregate compute, then formats the reply with optional `WITHSCORES`.
+async fn handle_zset_aggregate(
+    state: &State,
+    args: Vec<Bytes>,
+    op: ZStoreOp,
+    cmd_name: &str,
+) -> Result<RespReply, RustyAntError> {
+    // WITHSCORES is a trailing literal that doesn't count against the 2-arg
+    // minimum; the compute helper strips it, so we inspect a copy to decide
+    // how to serialize.
+    let with_scores = args.last().is_some_and(|b| arg_as_str(b).is_ok_and(|s| s.eq_ignore_ascii_case("WITHSCORES")));
+    let pairs = compute_zset_aggregate(state, &args, op, cmd_name, true).await?;
+
+    // Sort ascending by (score, member) for deterministic output — matches
+    // how Redis returns these for the non-STORE forms.
+    let mut pairs = pairs;
+    pairs
+        .sort_by(|(s1, m1), (s2, m2)| s1.partial_cmp(s2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| m1.cmp(m2)));
+
+    let mut out: Vec<RespReply> = Vec::with_capacity(pairs.len() * if with_scores { 2 } else { 1 });
+    for (score, member) in pairs {
+        out.push(RespReply::BulkString(Some(Bytes::from(member.into_bytes()))));
+        if with_scores {
+            out.push(RespReply::BulkString(Some(Bytes::from(format_score(score).into_bytes()))));
+        }
     }
-    let count = state.storage.zadd(&dest, pairs).await?;
-    Ok(RespReply::Integer(count))
+    Ok(RespReply::Array(out))
+}
+
+async fn handle_zinter(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    handle_zset_aggregate(state, args, ZStoreOp::Inter, "ZINTER").await
+}
+
+async fn handle_zunion(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    handle_zset_aggregate(state, args, ZStoreOp::Union, "ZUNION").await
+}
+
+async fn handle_zdiff(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    handle_zset_aggregate(state, args, ZStoreOp::Diff, "ZDIFF").await
 }
 
 fn parse_weights_aggregate(tail: &[Bytes], numkeys: usize) -> Result<(Vec<f64>, Aggregate), RustyAntError> {
