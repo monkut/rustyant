@@ -167,6 +167,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "GETRANGE" => handle_getrange(state, args).await,
         "SETRANGE" => handle_setrange(state, args).await,
         "STRLEN" => handle_strlen(state, args).await,
+        "LCS" => handle_lcs(state, args).await,
         "APPEND" => handle_append(state, args).await,
         "SET" => handle_set(state, args).await,
         "SETNX" => handle_setnx(state, args).await,
@@ -805,6 +806,169 @@ async fn handle_strlen(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
     let key = arg_as_str(&args[0])?;
     let len = state.storage.strlen(key).await?;
     Ok(RespReply::Integer(len))
+}
+
+/// Redis `LCS key1 key2 [LEN] [IDX [MINMATCHLEN n] [WITHMATCHLEN]]`.
+///
+/// Three reply modes — default (the subsequence as a bulk string), `LEN`
+/// (just the length as an integer), and `IDX` (a map-style reply of
+/// `{matches, len}` where matches is a list of `[[a0,a1],[b0,b1]]` index
+/// pairs, plus optional per-match lengths). `LEN` and `IDX` are mutually
+/// exclusive. Missing keys are treated as empty strings; WRONGTYPE is
+/// surfaced when either key exists but isn't a string.
+async fn handle_lcs(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity { command: "LCS".into() });
+    }
+    let key_a = arg_as_str(&args[0])?;
+    let key_b = arg_as_str(&args[1])?;
+
+    // Parse option tail.
+    let mut want_len = false;
+    let mut want_idx = false;
+    let mut min_match_len: usize = 0;
+    let mut with_match_len = false;
+    let mut i = 2;
+    while i < args.len() {
+        let opt = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match opt.as_str() {
+            "LEN" => {
+                want_len = true;
+                i += 1;
+            }
+            "IDX" => {
+                want_idx = true;
+                i += 1;
+            }
+            "MINMATCHLEN" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let n = parse_i64(&args[i + 1], "MINMATCHLEN")?;
+                min_match_len = usize::try_from(n.max(0)).unwrap_or(0);
+                i += 2;
+            }
+            "WITHMATCHLEN" => {
+                with_match_len = true;
+                i += 1;
+            }
+            _ => return Err(RustyAntError::Parse("syntax error".into())),
+        }
+    }
+    if want_len && want_idx {
+        return Err(RustyAntError::Parse("If you want both the length and indexes, please just use IDX.".into()));
+    }
+    if !want_idx && (min_match_len > 0 || with_match_len) {
+        return Err(RustyAntError::Parse("syntax error".into()));
+    }
+
+    let a = state.storage.get_string(key_a).await?.map(|b| b.to_vec()).unwrap_or_default();
+    let b = state.storage.get_string(key_b).await?.map(|b| b.to_vec()).unwrap_or_default();
+
+    let dp = lcs_dp_table(&a, &b);
+    let len = dp[a.len()][b.len()];
+
+    if want_len {
+        return Ok(RespReply::Integer(i64::try_from(len).unwrap_or(i64::MAX)));
+    }
+
+    if want_idx {
+        let matches = lcs_matches(&a, &b, &dp, min_match_len);
+        let total_len = matches.iter().map(|(al, ar, _, _)| ar - al + 1).sum::<usize>();
+        let mut matches_reply: Vec<RespReply> = Vec::with_capacity(matches.len());
+        for (a_lo, a_hi, b_lo, b_hi) in matches {
+            let a_pair = RespReply::Array(vec![
+                RespReply::Integer(i64::try_from(a_lo).unwrap_or(i64::MAX)),
+                RespReply::Integer(i64::try_from(a_hi).unwrap_or(i64::MAX)),
+            ]);
+            let b_pair = RespReply::Array(vec![
+                RespReply::Integer(i64::try_from(b_lo).unwrap_or(i64::MAX)),
+                RespReply::Integer(i64::try_from(b_hi).unwrap_or(i64::MAX)),
+            ]);
+            let mut entry = vec![a_pair, b_pair];
+            if with_match_len {
+                entry.push(RespReply::Integer(i64::try_from(a_hi - a_lo + 1).unwrap_or(i64::MAX)));
+            }
+            matches_reply.push(RespReply::Array(entry));
+        }
+        // Redis returns a map-ish flat array: ["matches", <array>, "len", <int>].
+        return Ok(RespReply::Array(vec![
+            RespReply::BulkString(Some(Bytes::from_static(b"matches"))),
+            RespReply::Array(matches_reply),
+            RespReply::BulkString(Some(Bytes::from_static(b"len"))),
+            RespReply::Integer(i64::try_from(total_len).unwrap_or(i64::MAX)),
+        ]));
+    }
+
+    // Default: the subsequence as bulk.
+    let seq = lcs_sequence(&a, &b, &dp);
+    Ok(RespReply::BulkString(Some(Bytes::from(seq))))
+}
+
+/// Standard O(n*m) dynamic-programming table. `dp[i][j]` = LCS length of
+/// `a[..i]` and `b[..j]`. The extra row / column simplifies the recurrence
+/// so we can skip boundary checks.
+fn lcs_dp_table(a: &[u8], b: &[u8]) -> Vec<Vec<usize>> {
+    let mut dp = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in 0..a.len() {
+        for j in 0..b.len() {
+            if a[i] == b[j] {
+                dp[i + 1][j + 1] = dp[i][j] + 1;
+            } else {
+                dp[i + 1][j + 1] = dp[i][j + 1].max(dp[i + 1][j]);
+            }
+        }
+    }
+    dp
+}
+
+/// Backtrack the dp table to reconstruct the actual subsequence bytes.
+fn lcs_sequence(a: &[u8], b: &[u8], dp: &[Vec<usize>]) -> Vec<u8> {
+    let mut i = a.len();
+    let mut j = b.len();
+    let mut out = Vec::with_capacity(dp[a.len()][b.len()]);
+    while i > 0 && j > 0 {
+        if a[i - 1] == b[j - 1] {
+            out.push(a[i - 1]);
+            i -= 1;
+            j -= 1;
+        } else if dp[i - 1][j] >= dp[i][j - 1] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// Extract contiguous matching runs from the dp table, filtered by
+/// `min_match_len`. Returns `(a_lo, a_hi, b_lo, b_hi)` tuples. Matches are
+/// returned in the same "last-match-first" order Redis emits.
+fn lcs_matches(a: &[u8], b: &[u8], dp: &[Vec<usize>], min_len: usize) -> Vec<(usize, usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = a.len();
+    let mut j = b.len();
+    while i > 0 && j > 0 {
+        if a[i - 1] == b[j - 1] {
+            let a_hi = i - 1;
+            let b_hi = j - 1;
+            while i > 0 && j > 0 && a[i - 1] == b[j - 1] {
+                i -= 1;
+                j -= 1;
+            }
+            let a_lo = i;
+            let b_lo = j;
+            if a_hi - a_lo + 1 >= min_len {
+                out.push((a_lo, a_hi, b_lo, b_hi));
+            }
+        } else if dp[i - 1][j] >= dp[i][j - 1] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    out
 }
 
 async fn handle_append(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
