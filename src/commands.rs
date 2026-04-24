@@ -279,6 +279,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZREVRANK" => handle_zrank(state, args, true).await,
         "ZCOUNT" => handle_zcount(state, args).await,
         "ZMSCORE" => handle_zmscore(state, args).await,
+        "ZRANDMEMBER" => handle_zrandmember(state, args).await,
         "ZSCAN" => handle_zscan(state, args).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
     }
@@ -1613,6 +1614,52 @@ async fn handle_srandmember(state: &State, args: Vec<Bytes>) -> Result<RespReply
     } else {
         let mut picked = state.storage.srandmember(key, 1, false).await?;
         Ok(picked.pop().map_or(RespReply::Nil, |m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))))
+    }
+}
+
+/// Redis `ZRANDMEMBER key [count [WITHSCORES]]`.
+///
+/// No-count form: one random member as a bulk string, or nil for missing
+/// key. With `count`, returns an array — positive count means distinct
+/// members (capped at zset size), negative means exactly `|count|` with
+/// duplicates allowed. `WITHSCORES` interleaves `member, score` pairs;
+/// requires an explicit count. Scores use the same formatter as ZRANGE.
+async fn handle_zrandmember(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZRANDMEMBER", matches!(args.len(), 1..=3))?;
+    let key = arg_as_str(&args[0])?;
+
+    // No-count form: single-member bulk reply (nil on missing key).
+    if args.len() == 1 {
+        let mut picked = state.storage.zrandmember(key, 1, false).await?;
+        return Ok(picked
+            .pop()
+            .map_or(RespReply::Nil, |(m, _)| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))));
+    }
+
+    let count = parse_i64(&args[1], "count")?;
+    let with_scores = if args.len() == 3 {
+        if !arg_as_str(&args[2])?.eq_ignore_ascii_case("WITHSCORES") {
+            return Err(RustyAntError::Parse("syntax error".into()));
+        }
+        true
+    } else {
+        false
+    };
+
+    let allow_duplicates = count < 0;
+    let abs_count = count.checked_abs().ok_or_else(|| RustyAntError::Parse("count overflow".into()))?;
+    let picked = state.storage.zrandmember(key, abs_count, allow_duplicates).await?;
+    if with_scores {
+        let mut out = Vec::with_capacity(picked.len() * 2);
+        for (m, s) in picked {
+            out.push(RespReply::BulkString(Some(Bytes::from(m.into_bytes()))));
+            out.push(RespReply::BulkString(Some(Bytes::from(format_score(s).into_bytes()))));
+        }
+        Ok(RespReply::Array(out))
+    } else {
+        Ok(RespReply::Array(
+            picked.into_iter().map(|(m, _)| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+        ))
     }
 }
 

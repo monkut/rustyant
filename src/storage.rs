@@ -547,6 +547,36 @@ fn pick_random(set: &BTreeSet<String>, count: i64, allow_duplicates: bool) -> Ve
         .collect()
 }
 
+/// `ZRANDMEMBER` sampler: uniform over members (Redis ignores scores for
+/// weighting). Returns `(member, score)` pairs so the handler can format
+/// with or without scores. Mirrors `pick_random`'s positive/negative count
+/// semantics.
+fn pick_random_from_zset(map: &BTreeMap<String, f64>, count: i64, allow_duplicates: bool) -> Vec<(String, f64)> {
+    if map.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    let ordered: Vec<(&String, &f64)> = map.iter().collect();
+    let len = ordered.len();
+    if !allow_duplicates {
+        // Positive count: up to `count` distinct members.
+        let take = usize::try_from(count).unwrap_or(0).min(len);
+        let start = usize::try_from(pseudo_rand_u64() % (len as u64)).unwrap_or(0);
+        return (0..take).map(|i| (ordered[(start + i) % len].0.clone(), *ordered[(start + i) % len].1)).collect();
+    }
+    // Negative count: exactly |count| samples, duplicates allowed.
+    let take = usize::try_from(count.unsigned_abs()).unwrap_or(0);
+    let mut rng = pseudo_rand_u64();
+    (0..take)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let idx = usize::try_from(rng % (len as u64)).unwrap_or(0);
+            (ordered[idx].0.clone(), *ordered[idx].1)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // S3 optimistic-locking primitives.
 //
@@ -791,6 +821,17 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn zrevrank(&self, key: &str, member: &str) -> Result<Option<i64>, RustyAntError>;
     async fn zcount(&self, key: &str, min: ScoreBound, max: ScoreBound) -> Result<i64, RustyAntError>;
     async fn zmscore(&self, key: &str, members: &[String]) -> Result<Vec<Option<f64>>, RustyAntError>;
+    /// Redis `ZRANDMEMBER` sampler: uniform over members (scores do not bias
+    /// the pick, per Redis). Positive `count` returns up to `count` distinct
+    /// members; negative `count` returns exactly `|count|` with duplicates
+    /// allowed. Returns `(member, score)` pairs — the handler decides whether
+    /// to serialize scores.
+    async fn zrandmember(
+        &self,
+        key: &str,
+        count: i64,
+        allow_duplicates: bool,
+    ) -> Result<Vec<(String, f64)>, RustyAntError>;
     /// See [`Self::hscan`] for pagination semantics. Iteration order follows
     /// member lex order under the backing `BTreeMap`; Redis doesn't pin an
     /// order, so callers that care must sort the accumulated result.
@@ -1730,6 +1771,19 @@ impl Storage for S3Storage {
             }
             Some(_) => Err(wrong_type(key)),
             None => Ok(members.iter().map(|_| None).collect()),
+        }
+    }
+
+    async fn zrandmember(
+        &self,
+        key: &str,
+        count: i64,
+        allow_duplicates: bool,
+    ) -> Result<Vec<(String, f64)>, RustyAntError> {
+        match self.load(key).await? {
+            Some(StoredValue { value: Value::ZSet(m), .. }) => Ok(pick_random_from_zset(&m, count, allow_duplicates)),
+            Some(_) => Err(wrong_type(key)),
+            None => Ok(Vec::new()),
         }
     }
 
