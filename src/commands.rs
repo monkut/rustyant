@@ -246,6 +246,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "SINTER" => handle_sinter(state, args).await,
         "SUNION" => handle_sunion(state, args).await,
         "SDIFF" => handle_sdiff(state, args).await,
+        "SINTERCARD" => handle_sintercard(state, args).await,
         "SINTERSTORE" => handle_sstore(state, args, SetOp::Inter).await,
         "SUNIONSTORE" => handle_sstore(state, args, SetOp::Union).await,
         "SDIFFSTORE" => handle_sstore(state, args, SetOp::Diff).await,
@@ -258,6 +259,7 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZINTER" => handle_zinter(state, args).await,
         "ZUNION" => handle_zunion(state, args).await,
         "ZDIFF" => handle_zdiff(state, args).await,
+        "ZINTERCARD" => handle_zintercard(state, args).await,
         "ZINTERSTORE" => handle_zstore(state, args, ZStoreOp::Inter).await,
         "ZUNIONSTORE" => handle_zstore(state, args, ZStoreOp::Union).await,
         "ZDIFFSTORE" => handle_zstore(state, args, ZStoreOp::Diff).await,
@@ -1267,6 +1269,82 @@ async fn handle_sdiff(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rust
     Ok(RespReply::Array(
         members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
     ))
+}
+
+/// Redis `SINTERCARD numkeys key [key ...] [LIMIT limit]`.
+///
+/// Returns the cardinality of the intersection without materializing the
+/// result array. `LIMIT 0` (or no LIMIT) means no cap. Because the S3
+/// backend already has to load each set fully, the saving here is wire-size
+/// (integer reply vs `N`-element array) plus `LIMIT` short-circuiting.
+async fn handle_sintercard(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() {
+        return Err(RustyAntError::WrongArity { command: "SINTERCARD".into() });
+    }
+    let numkeys_i = parse_i64(&args[0], "numkeys")?;
+    if numkeys_i <= 0 {
+        return Err(RustyAntError::Parse("numkeys should be greater than 0".into()));
+    }
+    let numkeys = usize::try_from(numkeys_i).unwrap_or(0);
+    if args.len() < 1 + numkeys {
+        return Err(RustyAntError::Parse("Number of keys can't be greater than number of args".into()));
+    }
+    let keys: Vec<String> = args.iter().skip(1).take(numkeys).map(arg_as_string).collect::<Result<_, _>>()?;
+    let tail = &args[1 + numkeys..];
+    let limit = parse_optional_limit(tail)?;
+
+    let members = state.storage.sinter(&keys).await?;
+    let count = limit.map_or(members.len(), |cap| members.len().min(cap));
+    Ok(RespReply::Integer(i64::try_from(count).unwrap_or(i64::MAX)))
+}
+
+/// Redis `ZINTERCARD numkeys key [key ...] [LIMIT limit]`.
+///
+/// Same shape as SINTERCARD, but accepts both set and zset inputs (a set
+/// contributes each member with score 1.0, matching ZINTER / ZINTERSTORE).
+async fn handle_zintercard(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() {
+        return Err(RustyAntError::WrongArity { command: "ZINTERCARD".into() });
+    }
+    let numkeys_i = parse_i64(&args[0], "numkeys")?;
+    if numkeys_i <= 0 {
+        return Err(RustyAntError::Parse("at least 1 input key is needed for this command".into()));
+    }
+    let numkeys = usize::try_from(numkeys_i).unwrap_or(0);
+    if args.len() < 1 + numkeys {
+        return Err(RustyAntError::Parse("Number of keys can't be greater than number of args".into()));
+    }
+    let keys: Vec<String> = args.iter().skip(1).take(numkeys).map(arg_as_string).collect::<Result<_, _>>()?;
+    let tail = &args[1 + numkeys..];
+    let limit = parse_optional_limit(tail)?;
+
+    // Build per-input (member, score) lists — same helper ZINTER uses so set
+    // inputs get score 1.0 normalization.
+    let mut per_input: Vec<Vec<(String, f64)>> = Vec::with_capacity(numkeys);
+    for k in &keys {
+        per_input.push(load_zset_or_set(state, k).await?);
+    }
+    // We only need member-set intersection — score aggregation is irrelevant.
+    let pairs = aggregate_intersection(&per_input, Aggregate::Sum);
+    let count = limit.map_or(pairs.len(), |cap| pairs.len().min(cap));
+    Ok(RespReply::Integer(i64::try_from(count).unwrap_or(i64::MAX)))
+}
+
+/// Parse an optional trailing `LIMIT n` (n must be >= 0). `LIMIT 0` means
+/// no cap, matching Redis — represented here as `None`. Returns `None` for
+/// empty tail.
+fn parse_optional_limit(tail: &[Bytes]) -> Result<Option<usize>, RustyAntError> {
+    if tail.is_empty() {
+        return Ok(None);
+    }
+    if tail.len() != 2 || !arg_as_str(&tail[0])?.eq_ignore_ascii_case("LIMIT") {
+        return Err(RustyAntError::Parse("syntax error".into()));
+    }
+    let n = parse_i64(&tail[1], "LIMIT")?;
+    if n < 0 {
+        return Err(RustyAntError::Parse("LIMIT can't be negative".into()));
+    }
+    if n == 0 { Ok(None) } else { Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))) }
 }
 
 // ---------------------------------------------------------------------------
