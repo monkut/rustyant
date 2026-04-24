@@ -305,6 +305,125 @@ async fn memory_unknown_subcommand_errors() {
     call(&state, &[b"MEMORY"]).await.expect_error_prefix("ERR");
 }
 
+// ---------------------------------------------------------------------------
+// HyperLogLog — PFADD / PFCOUNT / PFMERGE
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pfadd_creates_and_counts() {
+    let state = test_state();
+    // New key → create + report 1.
+    call(&state, &[b"PFADD", b"h", b"a"]).await.expect_integer(1);
+    // Duplicate add on same element → no change.
+    call(&state, &[b"PFADD", b"h", b"a"]).await.expect_integer(0);
+    // Additional distinct element → change.
+    call(&state, &[b"PFADD", b"h", b"b", b"c"]).await.expect_integer(1);
+    call(&state, &[b"PFCOUNT", b"h"]).await.expect_integer(3);
+}
+
+#[tokio::test]
+async fn pfadd_zero_elements_creates_empty_key() {
+    let state = test_state();
+    call(&state, &[b"PFADD", b"h"]).await.expect_integer(1);
+    // Second PFADD with no elements on an existing key → 0.
+    call(&state, &[b"PFADD", b"h"]).await.expect_integer(0);
+    call(&state, &[b"PFCOUNT", b"h"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn pfcount_missing_key_is_zero() {
+    let state = test_state();
+    call(&state, &[b"PFCOUNT", b"missing"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn pfcount_estimates_within_tolerance() {
+    let state = test_state();
+    // Add 1000 distinct elements in a batch.
+    let mut elements: Vec<Vec<u8>> = Vec::with_capacity(1001);
+    elements.push(b"PFADD".to_vec());
+    elements.push(b"big".to_vec());
+    for i in 0..1000u32 {
+        elements.push(format!("e-{i}").into_bytes());
+    }
+    let args: Vec<&[u8]> = elements.iter().map(Vec::as_slice).collect();
+    call(&state, &args).await;
+    // HLL is probabilistic — allow 2% error on 1000 elements (spec says 0.81%).
+    let reply = call(&state, &[b"PFCOUNT", b"big"]).await;
+    let body = String::from_utf8_lossy(&reply.raw).to_string();
+    let n: i64 = body.trim_start_matches(':').trim_end().parse().expect("integer");
+    assert!((n - 1000).abs() < 20, "estimate {n} is not within 2% of 1000");
+}
+
+#[tokio::test]
+async fn pfcount_multi_key_returns_union_estimate() {
+    let state = test_state();
+    call(&state, &[b"PFADD", b"a", b"x", b"y", b"z"]).await;
+    call(&state, &[b"PFADD", b"b", b"z", b"w"]).await;
+    // Union: {x, y, z, w} → 4 distinct. PFCOUNT reads both, does not write.
+    call(&state, &[b"PFCOUNT", b"a", b"b"]).await.expect_integer(4);
+    // Original keys unchanged.
+    call(&state, &[b"PFCOUNT", b"a"]).await.expect_integer(3);
+    call(&state, &[b"PFCOUNT", b"b"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn pfmerge_unions_sources_into_dest() {
+    let state = test_state();
+    call(&state, &[b"PFADD", b"a", b"x", b"y"]).await;
+    call(&state, &[b"PFADD", b"b", b"y", b"z"]).await;
+    call(&state, &[b"PFMERGE", b"dest", b"a", b"b"]).await.expect_simple("OK");
+    // Union: {x, y, z} → 3.
+    call(&state, &[b"PFCOUNT", b"dest"]).await.expect_integer(3);
+}
+
+#[tokio::test]
+async fn pfmerge_with_existing_dest_preserves_prior_state() {
+    let state = test_state();
+    call(&state, &[b"PFADD", b"dest", b"x"]).await;
+    call(&state, &[b"PFADD", b"src", b"y"]).await;
+    call(&state, &[b"PFMERGE", b"dest", b"src"]).await.expect_simple("OK");
+    // Original {x} + merged {y} → 2.
+    call(&state, &[b"PFCOUNT", b"dest"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn pfmerge_zero_sources_creates_empty_dest() {
+    let state = test_state();
+    call(&state, &[b"PFMERGE", b"dest"]).await.expect_simple("OK");
+    call(&state, &[b"PFCOUNT", b"dest"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn pfadd_on_non_hll_string_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"not an hll"]).await;
+    call(&state, &[b"PFADD", b"k", b"x"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"PFCOUNT", b"k"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn pfadd_on_non_string_kind_errors() {
+    let state = test_state();
+    call(&state, &[b"LPUSH", b"l", b"x"]).await;
+    call(&state, &[b"PFADD", b"l", b"x"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn pf_stored_as_string_roundtrips_via_get() {
+    // An HLL value lives as a string; GET should retrieve the raw HLL
+    // blob, matching Redis.
+    let state = test_state();
+    call(&state, &[b"PFADD", b"h", b"x"]).await;
+    let reply = call(&state, &[b"GET", b"h"]).await;
+    // Expect a bulk string reply whose body starts with the HYLL magic.
+    let raw = reply.raw;
+    // Find the bulk-string payload between the `$<len>\r\n` header and trailing `\r\n`.
+    let header_end = raw.iter().position(|&b| b == b'\n').expect("header terminator");
+    let body_start = header_end + 1;
+    assert!(raw[body_start..].starts_with(b"HYLL"), "GET on HLL key did not return an HYLL-prefixed blob");
+}
+
 #[tokio::test]
 async fn malformed_body_returns_parse_error() {
     let state = test_state();

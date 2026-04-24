@@ -163,6 +163,10 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "BITCOUNT" => handle_bitcount(state, args).await,
         "BITPOS" => handle_bitpos(state, args).await,
         "BITOP" => handle_bitop(state, args).await,
+        // HyperLogLog
+        "PFADD" => handle_pfadd(state, args).await,
+        "PFCOUNT" => handle_pfcount(state, args).await,
+        "PFMERGE" => handle_pfmerge(state, args).await,
         // Strings
         "GET" => handle_get(state, args).await,
         "GETEX" => handle_getex(state, args).await,
@@ -1053,6 +1057,41 @@ async fn handle_strlen(state: &State, args: Vec<Bytes>) -> Result<RespReply, Rus
 /// pairs, plus optional per-match lengths). `LEN` and `IDX` are mutually
 /// exclusive. Missing keys are treated as empty strings; WRONGTYPE is
 /// surfaced when either key exists but isn't a string.
+/// Redis `PFADD key [element [element ...]]`. Returns `1` if any register
+/// was updated (including when the key was created by this call), else `0`.
+async fn handle_pfadd(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() {
+        return Err(RustyAntError::WrongArity { command: "PFADD".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let changed = state.storage.pfadd(key, &args[1..]).await?;
+    Ok(RespReply::Integer(i64::from(changed)))
+}
+
+/// Redis `PFCOUNT key [key ...]`. Single-key returns the estimate; multi-key
+/// returns the estimate of the in-memory union (does not write).
+async fn handle_pfcount(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() {
+        return Err(RustyAntError::WrongArity { command: "PFCOUNT".into() });
+    }
+    let keys: Vec<String> = args.iter().map(arg_as_string).collect::<Result<_, _>>()?;
+    let n = state.storage.pfcount(&keys).await?;
+    Ok(RespReply::Integer(i64::try_from(n).unwrap_or(i64::MAX)))
+}
+
+/// Redis `PFMERGE destkey [sourcekey [sourcekey ...]]`. Unions sources
+/// into dest (dest's prior HLL participates). Accepts zero sources (no-op
+/// initialise on a missing destination).
+async fn handle_pfmerge(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.is_empty() {
+        return Err(RustyAntError::WrongArity { command: "PFMERGE".into() });
+    }
+    let dest = arg_as_str(&args[0])?;
+    let sources: Vec<String> = args.iter().skip(1).map(arg_as_string).collect::<Result<_, _>>()?;
+    state.storage.pfmerge(dest, &sources).await?;
+    Ok(RespReply::ok())
+}
+
 async fn handle_lcs(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
     if args.len() < 2 {
         return Err(RustyAntError::WrongArity { command: "LCS".into() });
