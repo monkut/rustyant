@@ -1298,6 +1298,97 @@ async fn zrangebyscore_infinity_bounds() {
 }
 
 // ---------------------------------------------------------------------------
+// ZRANGEBYLEX / ZREVRANGEBYLEX / ZLEXCOUNT / ZREMRANGEBYLEX
+// Lex bounds assume equal scores across members (the canonical Redis use case).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn zrangebylex_inclusive_and_exclusive() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d"]).await;
+    // [b ... [c → inclusive both ends → b, c
+    let m = call(&state, &[b"ZRANGEBYLEX", b"z", b"[b", b"[c"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+    // (a ... (d → exclusive → b, c
+    let m = call(&state, &[b"ZRANGEBYLEX", b"z", b"(a", b"(d"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrangebylex_unbounded() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c"]).await;
+    // - ... + → all members in lex order
+    let m = call(&state, &[b"ZRANGEBYLEX", b"z", b"-", b"+"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrangebylex_limit() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d", b"0", b"e"]).await;
+    // offset 1, count 2 → b, c
+    let m = call(&state, &[b"ZRANGEBYLEX", b"z", b"-", b"+", b"LIMIT", b"1", b"2"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+    // Negative count → no cap (returns rest after offset).
+    let m = call(&state, &[b"ZRANGEBYLEX", b"z", b"-", b"+", b"LIMIT", b"2", b"-1"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]);
+}
+
+#[tokio::test]
+async fn zrevrangebylex_reverse_order() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d"]).await;
+    // Reverse: note Redis takes (max, min) in that order.
+    let m = call(&state, &[b"ZREVRANGEBYLEX", b"z", b"[c", b"[a"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()]);
+    // Unbounded reverse.
+    let m = call(&state, &[b"ZREVRANGEBYLEX", b"z", b"+", b"-"]).await.into_bulk_array();
+    assert_eq!(m.len(), 4);
+    assert_eq!(m[0].as_ref(), b"d");
+}
+
+#[tokio::test]
+async fn zlexcount_counts_window() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c"]).await;
+    call(&state, &[b"ZLEXCOUNT", b"z", b"-", b"+"]).await.expect_integer(3);
+    call(&state, &[b"ZLEXCOUNT", b"z", b"[a", b"[b"]).await.expect_integer(2);
+    call(&state, &[b"ZLEXCOUNT", b"z", b"(a", b"(c"]).await.expect_integer(1);
+    call(&state, &[b"ZLEXCOUNT", b"missing", b"-", b"+"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zremrangebylex_removes_and_empties() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a", b"0", b"b", b"0", b"c"]).await;
+    // Remove `b` only.
+    call(&state, &[b"ZREMRANGEBYLEX", b"z", b"[b", b"[b"]).await.expect_integer(1);
+    call(&state, &[b"ZCARD", b"z"]).await.expect_integer(2);
+    // Remove the rest — key should disappear.
+    call(&state, &[b"ZREMRANGEBYLEX", b"z", b"-", b"+"]).await.expect_integer(2);
+    call(&state, &[b"EXISTS", b"z"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn zlex_missing_prefix_errors() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"0", b"a"]).await;
+    // Without a [ ( - + prefix, it's a syntax error.
+    call(&state, &[b"ZRANGEBYLEX", b"z", b"a", b"b"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZLEXCOUNT", b"z", b"a", b"b"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zlex_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZRANGEBYLEX", b"k", b"-", b"+"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZLEXCOUNT", b"k", b"-", b"+"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZREMRANGEBYLEX", b"k", b"-", b"+"]).await.expect_error_prefix("ERR");
+}
+
+// ---------------------------------------------------------------------------
 // KEYS and SCAN
 // ---------------------------------------------------------------------------
 

@@ -8,7 +8,7 @@ use crate::geo::{self, GeoUnit};
 use crate::metrics;
 use crate::resp::RespReply;
 use crate::state::State;
-use crate::storage::{GetExOp, ScoreBound, TtlResult, ZAddFlags, bit_at, now_ms};
+use crate::storage::{GetExOp, LexBound, ScoreBound, TtlResult, ZAddFlags, bit_at, now_ms};
 
 /// Coarse classification of a dispatch result, emitted as a structured log
 /// field so `CloudWatch` queries can count/alert by outcome without string
@@ -261,6 +261,10 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZREVRANGE" => handle_zrevrange(state, args).await,
         "ZRANGEBYSCORE" => handle_zrangebyscore(state, args).await,
         "ZREVRANGEBYSCORE" => handle_zrevrangebyscore(state, args).await,
+        "ZRANGEBYLEX" => handle_zrangebylex(state, args).await,
+        "ZREVRANGEBYLEX" => handle_zrevrangebylex(state, args).await,
+        "ZLEXCOUNT" => handle_zlexcount(state, args).await,
+        "ZREMRANGEBYLEX" => handle_zremrangebylex(state, args).await,
         "ZREMRANGEBYRANK" => handle_zremrangebyrank(state, args).await,
         "ZREMRANGEBYSCORE" => handle_zremrangebyscore(state, args).await,
         "ZPOPMIN" => handle_zpop(state, args, false).await,
@@ -1383,6 +1387,64 @@ async fn handle_zrangebyscore(state: &State, args: Vec<Bytes>) -> Result<RespRep
     Ok(RespReply::Array(
         members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
     ))
+}
+
+/// Parse a trailing `LIMIT offset count` tail at `args[start..]`. Returns
+/// `None` if absent; errors on any other trailing tokens. Validates the
+/// `LIMIT` literal is followed by exactly two integer args.
+fn parse_lex_limit(args: &[Bytes], start: usize) -> Result<Option<(i64, i64)>, RustyAntError> {
+    if args.len() == start {
+        return Ok(None);
+    }
+    if args.len() != start + 3 || !arg_as_str(&args[start])?.eq_ignore_ascii_case("LIMIT") {
+        return Err(RustyAntError::Parse("syntax error".into()));
+    }
+    let offset = parse_i64(&args[start + 1], "offset")?;
+    let count = parse_i64(&args[start + 2], "count")?;
+    Ok(Some((offset, count)))
+}
+
+async fn handle_zrangebylex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZRANGEBYLEX", matches!(args.len(), 3 | 6))?;
+    let key = arg_as_str(&args[0])?;
+    let min = LexBound::parse(arg_as_str(&args[1])?)?;
+    let max = LexBound::parse(arg_as_str(&args[2])?)?;
+    let limit = parse_lex_limit(&args, 3)?;
+    let members = state.storage.zrangebylex(key, min, max, limit).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_zrevrangebylex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZREVRANGEBYLEX", matches!(args.len(), 3 | 6))?;
+    let key = arg_as_str(&args[0])?;
+    // Redis passes `(key, max, min)` to ZREVRANGEBYLEX.
+    let max = LexBound::parse(arg_as_str(&args[1])?)?;
+    let min = LexBound::parse(arg_as_str(&args[2])?)?;
+    let limit = parse_lex_limit(&args, 3)?;
+    let members = state.storage.zrevrangebylex(key, max, min, limit).await?;
+    Ok(RespReply::Array(
+        members.into_iter().map(|m| RespReply::BulkString(Some(Bytes::from(m.into_bytes())))).collect(),
+    ))
+}
+
+async fn handle_zlexcount(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZLEXCOUNT", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let min = LexBound::parse(arg_as_str(&args[1])?)?;
+    let max = LexBound::parse(arg_as_str(&args[2])?)?;
+    let n = state.storage.zlexcount(key, min, max).await?;
+    Ok(RespReply::Integer(n))
+}
+
+async fn handle_zremrangebylex(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("ZREMRANGEBYLEX", args.len() == 3)?;
+    let key = arg_as_str(&args[0])?;
+    let min = LexBound::parse(arg_as_str(&args[1])?)?;
+    let max = LexBound::parse(arg_as_str(&args[2])?)?;
+    let n = state.storage.zremrangebylex(key, min, max).await?;
+    Ok(RespReply::Integer(n))
 }
 
 async fn handle_setnx(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
