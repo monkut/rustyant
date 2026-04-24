@@ -3,7 +3,7 @@ use std::sync::Arc;
 use aws_sdk_s3::Client as S3Client;
 
 use crate::Settings;
-use crate::storage::{S3Storage, Storage, now_ms};
+use crate::storage::{KVStorage, S3Storage, Storage, now_ms};
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -24,8 +24,9 @@ impl State {
             builder = builder.endpoint_url(url).force_path_style(true);
         }
         let s3 = S3Client::from_conf(builder.build());
-        let storage = S3Storage::new(s3, settings.bucket.clone(), settings.key_prefix.clone());
-        Ok(Self { settings: Arc::new(settings), storage: Arc::new(storage), started_at_ms: now_ms() })
+        let backend = S3Storage::new(s3, settings.bucket.clone(), settings.key_prefix.clone());
+        let storage = Arc::new(KVStorage::new(backend));
+        Ok(Self { settings: Arc::new(settings), storage, started_at_ms: now_ms() })
     }
 
     #[must_use]

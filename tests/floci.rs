@@ -13,7 +13,7 @@ use std::sync::Arc;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use bytes::Bytes;
-use rustyant::storage::{S3Storage, Storage};
+use rustyant::storage::{KVStorage, S3Storage, Storage};
 
 const DEFAULT_BUCKET: &str = "rustyant-ci";
 
@@ -37,8 +37,8 @@ fn make_storage(prefix: &str) -> Option<Arc<dyn Storage>> {
         .force_path_style(true)
         .build();
     let client = S3Client::from_conf(config);
-    let storage = S3Storage::new(client, bucket, format!("floci-test/{prefix}/"));
-    Some(Arc::new(storage))
+    let backend = S3Storage::new(client, bucket, format!("floci-test/{prefix}/"));
+    Some(Arc::new(KVStorage::new(backend)))
 }
 
 macro_rules! floci_test {
