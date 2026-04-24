@@ -1592,6 +1592,100 @@ async fn zinterstore_weights_count_mismatch_errors() {
         .expect_error_prefix("ERR");
 }
 
+// ---------------------------------------------------------------------------
+// ZINTER / ZUNION / ZDIFF (non-STORE forms) — share compute with *STORE.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn zinter_returns_common_members_sorted() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"za", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZADD", b"zb", b"10", b"b", b"20", b"c", b"30", b"d"]).await;
+    // Intersection: b, c. Default SUM: b=2+10=12, c=3+20=23. Sort ascending.
+    let m = call(&state, &[b"ZINTER", b"2", b"za", b"zb"]).await.into_bulk_array();
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zinter_with_scores_interleaves_pairs() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"za", b"1", b"a", b"2", b"b"]).await;
+    call(&state, &[b"ZADD", b"zb", b"10", b"b", b"20", b"a"]).await;
+    // SUM: a=21, b=12. Ascending score order: b(12), a(21).
+    let reply = call(&state, &[b"ZINTER", b"2", b"za", b"zb", b"WITHSCORES"]).await;
+    // Raw wire check — parse_command decodes bulk-only arrays.
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains('b'));
+    assert!(raw.contains("12"));
+    assert!(raw.contains('a'));
+    assert!(raw.contains("21"));
+}
+
+#[tokio::test]
+async fn zinter_accepts_set_input_with_score_one() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"10", b"shared"]).await;
+    call(&state, &[b"SADD", b"s", b"shared", b"other"]).await;
+    // Set contributes score 1.0 for each member; SUM: shared = 10+1 = 11.
+    let reply = call(&state, &[b"ZINTER", b"2", b"z", b"s", b"WITHSCORES"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("shared"));
+    assert!(raw.contains("11"));
+}
+
+#[tokio::test]
+async fn zunion_combines_scores_across_sources() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"za", b"1", b"a", b"2", b"b"]).await;
+    call(&state, &[b"ZADD", b"zb", b"10", b"b", b"20", b"c"]).await;
+    let m = call(&state, &[b"ZUNION", b"2", b"za", b"zb"]).await.into_bulk_array();
+    // Members: a (1), b (12), c (20). Ascending.
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zunion_aggregate_min_picks_smaller_score() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"za", b"5", b"shared"]).await;
+    call(&state, &[b"ZADD", b"zb", b"2", b"shared"]).await;
+    let reply = call(&state, &[b"ZUNION", b"2", b"za", b"zb", b"AGGREGATE", b"MIN", b"WITHSCORES"]).await;
+    let raw = String::from_utf8_lossy(&reply.raw).to_string();
+    assert!(raw.contains("shared"));
+    assert!(raw.contains("$1\r\n2\r\n"), "expected MIN=2 in reply: {raw}");
+}
+
+#[tokio::test]
+async fn zdiff_returns_members_not_in_others() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"za", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZADD", b"zb", b"0", b"b"]).await;
+    let m = call(&state, &[b"ZDIFF", b"2", b"za", b"zb"]).await.into_bulk_array();
+    // a and c survive; scores preserved from za — 1 and 3.
+    assert_eq!(m.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"a".to_vec(), b"c".to_vec()]);
+}
+
+#[tokio::test]
+async fn zdiff_rejects_weights_and_aggregate() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"za", b"1", b"a"]).await;
+    call(&state, &[b"ZDIFF", b"1", b"za", b"WEIGHTS", b"2"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"ZDIFF", b"1", b"za", b"AGGREGATE", b"SUM"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zinter_numkeys_zero_errors() {
+    let state = test_state();
+    call(&state, &[b"ZINTER", b"0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zinter_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"ZINTER", b"2", b"z", b"k"]).await.expect_error_prefix("ERR");
+}
+
 #[tokio::test]
 async fn zstore_commands_registered_in_command_meta() {
     let state = test_state();
