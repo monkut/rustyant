@@ -9,6 +9,7 @@ use crate::metrics;
 use crate::resp::RespReply;
 use crate::state::State;
 use crate::storage::{GetExOp, LexBound, ScoreBound, TtlResult, ZAddFlags, bit_at, now_ms};
+use crate::stream::{AddIdSpec, RangeId, StreamEntry, StreamId, parse_trim};
 
 /// Coarse classification of a dispatch result, emitted as a structured log
 /// field so `CloudWatch` queries can count/alert by outcome without string
@@ -293,6 +294,15 @@ async fn run(state: &State, tokens: Vec<Bytes>) -> Result<RespReply, RustyAntErr
         "ZMSCORE" => handle_zmscore(state, args).await,
         "ZRANDMEMBER" => handle_zrandmember(state, args).await,
         "ZSCAN" => handle_zscan(state, args).await,
+        // Streams
+        "XADD" => handle_xadd(state, args).await,
+        "XLEN" => handle_xlen(state, args).await,
+        "XRANGE" => handle_xrange(state, args, false).await,
+        "XREVRANGE" => handle_xrange(state, args, true).await,
+        "XDEL" => handle_xdel(state, args).await,
+        "XTRIM" => handle_xtrim(state, args).await,
+        "XREAD" => handle_xread(state, args).await,
+        "XINFO" => handle_xinfo(state, args).await,
         other => Err(RustyAntError::UnknownCommand(other.to_string())),
     }
 }
@@ -3952,4 +3962,270 @@ fn command_meta_reply(meta: &CommandMeta) -> RespReply {
         RespReply::Integer(last_key),
         RespReply::Integer(step),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Streams — XADD / XLEN / XRANGE / XREVRANGE / XDEL / XTRIM / XREAD / XINFO
+// ---------------------------------------------------------------------------
+
+fn stream_id_bulk(id: StreamId) -> RespReply {
+    RespReply::BulkString(Some(Bytes::from(id.to_string().into_bytes())))
+}
+
+fn entry_to_reply(entry: StreamEntry) -> RespReply {
+    // [id, [field1, value1, field2, value2, ...]]
+    let mut fields_arr = Vec::with_capacity(entry.fields.len() * 2);
+    for (f, v) in entry.fields {
+        fields_arr.push(RespReply::BulkString(Some(Bytes::from(f.into_bytes()))));
+        fields_arr.push(RespReply::BulkString(Some(Bytes::from(v))));
+    }
+    RespReply::Array(vec![stream_id_bulk(entry.id), RespReply::Array(fields_arr)])
+}
+
+/// Redis `XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] n [LIMIT n]] <id|*> field value [field value ...]`.
+async fn handle_xadd(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 4 {
+        return Err(RustyAntError::WrongArity { command: "XADD".into() });
+    }
+    let key = arg_as_string(&args[0])?;
+    let mut i = 1;
+
+    // Optional NOMKSTREAM at the head of the option list.
+    let mut nomkstream = false;
+    if arg_as_str(&args[i])?.eq_ignore_ascii_case("NOMKSTREAM") {
+        nomkstream = true;
+        i += 1;
+    }
+
+    // Optional MAXLEN / MINID trim clause. `parse_trim` wants &str slices.
+    let mut trim: Option<(crate::stream::TrimBound, Option<usize>)> = None;
+    let head = arg_as_str(&args[i])?;
+    if head.eq_ignore_ascii_case("MAXLEN") || head.eq_ignore_ascii_case("MINID") {
+        // Convert the tail up to where the id arg will be into &str — the
+        // parser consumes as many tokens as it needs.
+        let remaining: Vec<&str> = (i..args.len()).map(|idx| arg_as_str(&args[idx])).collect::<Result<_, _>>()?;
+        let (bound, limit, consumed) = parse_trim(&remaining)?;
+        trim = Some((bound, limit));
+        i += consumed;
+    }
+
+    // Now args[i] is the id, and args[i+1..] are field/value pairs.
+    if i >= args.len() {
+        return Err(RustyAntError::WrongArity { command: "XADD".into() });
+    }
+    let id_spec = AddIdSpec::parse(arg_as_str(&args[i])?)?;
+    i += 1;
+    let pairs = &args[i..];
+    if pairs.is_empty() || pairs.len() % 2 != 0 {
+        return Err(RustyAntError::WrongArity { command: "XADD".into() });
+    }
+    let mut fields: Vec<(String, Vec<u8>)> = Vec::with_capacity(pairs.len() / 2);
+    let mut j = 0;
+    while j < pairs.len() {
+        fields.push((arg_as_string(&pairs[j])?, pairs[j + 1].to_vec()));
+        j += 2;
+    }
+
+    let result = state.storage.xadd(&key, id_spec, fields, nomkstream, trim).await?;
+    // `None` only occurs when NOMKSTREAM was set and the key did not exist.
+    Ok(result.map_or(RespReply::Nil, stream_id_bulk))
+}
+
+async fn handle_xlen(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    arity("XLEN", args.len() == 1)?;
+    let key = arg_as_str(&args[0])?;
+    Ok(RespReply::Integer(state.storage.xlen(key).await?))
+}
+
+/// Drives both XRANGE and XREVRANGE. For XREVRANGE, Redis takes
+/// `(key, end, start)` — we swap here so the storage signature stays
+/// `(start, end)`.
+async fn handle_xrange(state: &State, args: Vec<Bytes>, reverse: bool) -> Result<RespReply, RustyAntError> {
+    if !matches!(args.len(), 3 | 5) {
+        return Err(RustyAntError::WrongArity { command: if reverse { "XREVRANGE".into() } else { "XRANGE".into() } });
+    }
+    let key = arg_as_str(&args[0])?;
+    let (start, end) = if reverse {
+        (RangeId::parse(arg_as_str(&args[2])?)?, RangeId::parse(arg_as_str(&args[1])?)?)
+    } else {
+        (RangeId::parse(arg_as_str(&args[1])?)?, RangeId::parse(arg_as_str(&args[2])?)?)
+    };
+    let count = if args.len() == 5 {
+        if !arg_as_str(&args[3])?.eq_ignore_ascii_case("COUNT") {
+            return Err(RustyAntError::Parse("syntax error".into()));
+        }
+        let n = parse_i64(&args[4], "COUNT")?;
+        if n < 0 {
+            return Err(RustyAntError::Parse("COUNT must be non-negative".into()));
+        }
+        Some(usize::try_from(n).unwrap_or(0))
+    } else {
+        None
+    };
+    let entries = state.storage.xrange(key, start, end, count, reverse).await?;
+    Ok(RespReply::Array(entries.into_iter().map(entry_to_reply).collect()))
+}
+
+async fn handle_xdel(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 2 {
+        return Err(RustyAntError::WrongArity { command: "XDEL".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let ids: Vec<StreamId> = args.iter().skip(1).map(|a| StreamId::parse(arg_as_str(a)?)).collect::<Result<_, _>>()?;
+    Ok(RespReply::Integer(state.storage.xdel(key, &ids).await?))
+}
+
+async fn handle_xtrim(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "XTRIM".into() });
+    }
+    let key = arg_as_str(&args[0])?;
+    let remaining: Vec<&str> = (1..args.len()).map(|idx| arg_as_str(&args[idx])).collect::<Result<_, _>>()?;
+    let (bound, limit, consumed) = parse_trim(&remaining)?;
+    // Any leftover tokens are a syntax error — XTRIM has no other args.
+    if consumed != remaining.len() {
+        return Err(RustyAntError::Parse("syntax error".into()));
+    }
+    Ok(RespReply::Integer(state.storage.xtrim(key, bound, limit).await?))
+}
+
+/// Redis `XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]`.
+/// BLOCK ms is accepted syntactically but returns immediately — a
+/// single-request server can't park the connection.
+async fn handle_xread(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    if args.len() < 3 {
+        return Err(RustyAntError::WrongArity { command: "XREAD".into() });
+    }
+    let mut count: Option<usize> = None;
+    let mut i = 0;
+    loop {
+        let tok = arg_as_str(&args[i])?.to_ascii_uppercase();
+        match tok.as_str() {
+            "COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let n = parse_i64(&args[i + 1], "COUNT")?;
+                if n < 0 {
+                    return Err(RustyAntError::Parse("COUNT must be non-negative".into()));
+                }
+                count = Some(usize::try_from(n).unwrap_or(0));
+                i += 2;
+            }
+            "BLOCK" => {
+                // Parse for validation; ignore value — we don't block.
+                if i + 1 >= args.len() {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                let _ = parse_i64(&args[i + 1], "BLOCK")?;
+                i += 2;
+            }
+            "STREAMS" => {
+                i += 1;
+                break;
+            }
+            _ => return Err(RustyAntError::Parse("syntax error".into())),
+        }
+    }
+    let remaining = args.len() - i;
+    if remaining == 0 || remaining % 2 != 0 {
+        return Err(RustyAntError::Parse(
+            "Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.".into(),
+        ));
+    }
+    let half = remaining / 2;
+    let keys: Vec<String> = (i..i + half).map(|idx| arg_as_string(&args[idx])).collect::<Result<_, _>>()?;
+    // `$` on a freshly-read stream means "only entries added after this call"
+    // which rustyant cannot deliver (non-blocking). Treat it as "max id" so
+    // that no historical entries slip through — matches Redis for the
+    // non-blocking case.
+    let mut after_ids: Vec<StreamId> = Vec::with_capacity(half);
+    for k in 0..half {
+        let id_str = arg_as_str(&args[i + half + k])?;
+        if id_str == "$" {
+            after_ids.push(StreamId::MAX);
+        } else {
+            after_ids.push(StreamId::parse(id_str)?);
+        }
+    }
+    let per_stream = state.storage.xread(&keys, &after_ids, count).await?;
+    if per_stream.is_empty() {
+        return Ok(RespReply::Nil);
+    }
+    // Reply shape: [[key, [entry, entry, ...]], ...]
+    Ok(RespReply::Array(
+        per_stream
+            .into_iter()
+            .map(|(key, entries)| {
+                RespReply::Array(vec![
+                    RespReply::BulkString(Some(Bytes::from(key.into_bytes()))),
+                    RespReply::Array(entries.into_iter().map(entry_to_reply).collect()),
+                ])
+            })
+            .collect(),
+    ))
+}
+
+/// Redis `XINFO STREAM key [FULL [COUNT n]]`.
+/// The FULL form is accepted syntactically but renders the same summary
+/// here — rustyant has no consumer-groups surface yet (#50), so there is
+/// nothing to emit under `groups`.
+async fn handle_xinfo(state: &State, args: Vec<Bytes>) -> Result<RespReply, RustyAntError> {
+    let sub = args.first().ok_or_else(|| RustyAntError::WrongArity { command: "XINFO".into() })?;
+    let sub = arg_as_str(sub)?.to_ascii_uppercase();
+    match sub.as_str() {
+        "STREAM" => {
+            if args.len() < 2 {
+                return Err(RustyAntError::WrongArity { command: "XINFO STREAM".into() });
+            }
+            let key = arg_as_str(&args[1])?;
+            // Optional FULL / COUNT tail — accepted but not used beyond
+            // syntactic validation.
+            if args.len() > 2 {
+                let tail_start = 2;
+                if !arg_as_str(&args[tail_start])?.eq_ignore_ascii_case("FULL") {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+                if args.len() == 5 {
+                    if !arg_as_str(&args[3])?.eq_ignore_ascii_case("COUNT") {
+                        return Err(RustyAntError::Parse("syntax error".into()));
+                    }
+                    let _ = parse_i64(&args[4], "COUNT")?;
+                } else if args.len() != 3 {
+                    return Err(RustyAntError::Parse("syntax error".into()));
+                }
+            }
+            let Some(stream) = state.storage.xinfo_stream(key).await? else {
+                return Err(RustyAntError::Parse("no such key".into()));
+            };
+            let length = i64::try_from(stream.entries.len()).unwrap_or(i64::MAX);
+            let first_entry = stream.entries.first().cloned().map_or(RespReply::Nil, entry_to_reply);
+            let last_entry = stream.entries.last().cloned().map_or(RespReply::Nil, entry_to_reply);
+            Ok(RespReply::Array(vec![
+                RespReply::BulkString(Some(Bytes::from_static(b"length"))),
+                RespReply::Integer(length),
+                RespReply::BulkString(Some(Bytes::from_static(b"last-generated-id"))),
+                stream_id_bulk(stream.last_generated_id),
+                RespReply::BulkString(Some(Bytes::from_static(b"max-deleted-entry-id"))),
+                stream_id_bulk(stream.max_deleted_entry_id),
+                RespReply::BulkString(Some(Bytes::from_static(b"entries-added"))),
+                RespReply::Integer(i64::try_from(stream.entries_added).unwrap_or(i64::MAX)),
+                RespReply::BulkString(Some(Bytes::from_static(b"groups"))),
+                RespReply::Integer(0),
+                RespReply::BulkString(Some(Bytes::from_static(b"first-entry"))),
+                first_entry,
+                RespReply::BulkString(Some(Bytes::from_static(b"last-entry"))),
+                last_entry,
+            ]))
+        }
+        "GROUPS" | "CONSUMERS" => {
+            // Consumer-group surface — empty array is the honest answer
+            // until #50 ships. Real Redis returns the same shape here.
+            Ok(RespReply::Array(Vec::new()))
+        }
+        "HELP" => Ok(RespReply::Array(vec![RespReply::BulkString(Some(Bytes::from_static(
+            b"XINFO STREAM <key> [FULL [COUNT n]] -- summary for the stream at <key>.",
+        )))])),
+        other => Err(RustyAntError::Parse(format!("unsupported XINFO subcommand: {other}"))),
+    }
 }
