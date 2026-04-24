@@ -152,6 +152,52 @@ async fn select_non_numeric_errors() {
 }
 
 #[tokio::test]
+async fn config_get_exact_key_returns_pair() {
+    let state = test_state();
+    let reply = call(&state, &[b"CONFIG", b"GET", b"maxmemory"]).await.into_bulk_array();
+    assert_eq!(reply.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), vec![b"maxmemory".to_vec(), b"0".to_vec()]);
+}
+
+#[tokio::test]
+async fn config_get_glob_matches_multiple() {
+    let state = test_state();
+    let reply = call(&state, &[b"CONFIG", b"GET", b"maxmemory*"]).await.into_bulk_array();
+    // Should match "maxmemory" and "maxmemory-policy" → 4 flat entries.
+    assert_eq!(reply.len(), 4);
+    let keys: Vec<Vec<u8>> = reply.iter().step_by(2).map(|b| b.to_vec()).collect();
+    assert!(keys.contains(&b"maxmemory".to_vec()));
+    assert!(keys.contains(&b"maxmemory-policy".to_vec()));
+}
+
+#[tokio::test]
+async fn config_get_unknown_key_returns_empty() {
+    let state = test_state();
+    let reply = call(&state, &[b"CONFIG", b"GET", b"nonexistent"]).await.into_bulk_array();
+    assert!(reply.is_empty());
+}
+
+#[tokio::test]
+async fn config_set_and_resetstat_accept_silently() {
+    let state = test_state();
+    call(&state, &[b"CONFIG", b"SET", b"maxmemory", b"0"]).await.expect_simple("OK");
+    call(&state, &[b"CONFIG", b"RESETSTAT"]).await.expect_simple("OK");
+    call(&state, &[b"CONFIG", b"REWRITE"]).await.expect_simple("OK");
+}
+
+#[tokio::test]
+async fn config_unknown_subcommand_errors() {
+    let state = test_state();
+    call(&state, &[b"CONFIG", b"FOO"]).await.expect_error_prefix("ERR");
+    call(&state, &[b"CONFIG"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn config_get_empty_pattern_list_errors() {
+    let state = test_state();
+    call(&state, &[b"CONFIG", b"GET"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
 async fn object_encoding_per_kind() {
     let state = test_state();
     call(&state, &[b"SET", b"s", b"v"]).await;
