@@ -8,6 +8,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::RustyAntError;
+use crate::hll;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoredValue {
@@ -691,6 +692,20 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     async fn get_and_delete(&self, key: &str) -> Result<Option<Bytes>, RustyAntError>;
     async fn strlen(&self, key: &str) -> Result<i64, RustyAntError>;
     async fn append(&self, key: &str, value: Bytes) -> Result<i64, RustyAntError>;
+    /// Redis `PFADD`: add each element to the HLL at `key`. Returns `true`
+    /// if any register was updated (i.e. at least one element hashed to a
+    /// higher leading-zero run than the current bucket value). Creates an
+    /// empty dense HLL on missing keys. Errors if `key` exists as a
+    /// non-HLL string or a non-string kind.
+    async fn pfadd(&self, key: &str, elements: &[Bytes]) -> Result<bool, RustyAntError>;
+    /// Redis `PFCOUNT`: reads the HLL(s) at `keys`; for a single key
+    /// returns its cardinality, for multiple the cardinality of the
+    /// in-memory register-wise union. Missing keys contribute nothing.
+    async fn pfcount(&self, keys: &[String]) -> Result<u64, RustyAntError>;
+    /// Redis `PFMERGE`: unions `sources` into `dest` (creating `dest` if
+    /// it did not exist). `dest`'s prior HLL participates in the union,
+    /// matching Redis.
+    async fn pfmerge(&self, dest: &str, sources: &[String]) -> Result<(), RustyAntError>;
     async fn incr_by(&self, key: &str, delta: i64) -> Result<i64, RustyAntError>;
     async fn incr_by_float(&self, key: &str, delta: f64) -> Result<f64, RustyAntError>;
     async fn getrange(&self, key: &str, start: i64, end: i64) -> Result<Bytes, RustyAntError>;
@@ -1911,6 +1926,115 @@ impl Storage for S3Storage {
             let len = i64::try_from(data.len()).unwrap_or(i64::MAX);
             let new_entry = StoredValue { expires_at_ms, value: Value::String(data) };
             Ok(CasAction::Write(new_entry, len))
+        })
+        .await
+    }
+
+    async fn pfadd(&self, key: &str, elements: &[Bytes]) -> Result<bool, RustyAntError> {
+        let elements = elements.to_vec();
+        self.cas(key, move |entry| {
+            let (existed, mut buf, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::String(d), expires_at_ms }) => {
+                    if !hll::is_hll(d) {
+                        return Err(RustyAntError::Parse(
+                            "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
+                        ));
+                    }
+                    (true, d.clone(), *expires_at_ms)
+                }
+                Some(_) => return Err(wrong_type(key)),
+                None => (false, hll::empty_dense(), None),
+            };
+            let mut changed = false;
+            for e in &elements {
+                if hll::add(&mut buf, e)? {
+                    changed = true;
+                }
+            }
+            // Creating a new HLL counts as a change (matches Redis's
+            // `PFADD newkey` with no elements → 1).
+            if !existed {
+                let new_entry = StoredValue { expires_at_ms, value: Value::String(buf) };
+                return Ok(CasAction::Write(new_entry, true));
+            }
+            if !changed {
+                return Ok(CasAction::NoOp(false));
+            }
+            let new_entry = StoredValue { expires_at_ms, value: Value::String(buf) };
+            Ok(CasAction::Write(new_entry, true))
+        })
+        .await
+    }
+
+    async fn pfcount(&self, keys: &[String]) -> Result<u64, RustyAntError> {
+        if keys.len() == 1 {
+            return match self.load(&keys[0]).await? {
+                Some(StoredValue { value: Value::String(d), .. }) => {
+                    if !hll::is_hll(&d) {
+                        return Err(RustyAntError::Parse(
+                            "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
+                        ));
+                    }
+                    hll::count(&d)
+                }
+                Some(_) => Err(wrong_type(&keys[0])),
+                None => Ok(0),
+            };
+        }
+        // Multi-key: build an in-memory union and count from that.
+        let mut merged = hll::empty_dense();
+        for k in keys {
+            match self.load(k).await? {
+                Some(StoredValue { value: Value::String(d), .. }) => {
+                    if !hll::is_hll(&d) {
+                        return Err(RustyAntError::Parse(
+                            "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
+                        ));
+                    }
+                    hll::merge_into(&mut merged, &d)?;
+                }
+                Some(_) => return Err(wrong_type(k)),
+                None => {}
+            }
+        }
+        hll::count(&merged)
+    }
+
+    async fn pfmerge(&self, dest: &str, sources: &[String]) -> Result<(), RustyAntError> {
+        // Build the union in memory first — a multi-key PFCOUNT-style
+        // traversal — then CAS it into `dest` (also including dest's
+        // existing HLL if present).
+        let mut merged = hll::empty_dense();
+        for k in sources {
+            match self.load(k).await? {
+                Some(StoredValue { value: Value::String(d), .. }) => {
+                    if !hll::is_hll(&d) {
+                        return Err(RustyAntError::Parse(
+                            "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
+                        ));
+                    }
+                    hll::merge_into(&mut merged, &d)?;
+                }
+                Some(_) => return Err(wrong_type(k)),
+                None => {}
+            }
+        }
+        self.cas(dest, move |entry| {
+            let (mut buf, expires_at_ms) = match entry {
+                Some(StoredValue { value: Value::String(d), expires_at_ms }) => {
+                    if !hll::is_hll(d) {
+                        return Err(RustyAntError::Parse(
+                            "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
+                        ));
+                    }
+                    (d.clone(), *expires_at_ms)
+                }
+                Some(_) => return Err(wrong_type(dest)),
+                None => (hll::empty_dense(), None),
+            };
+            hll::merge_into(&mut buf, &merged)?;
+            let new_entry = StoredValue { expires_at_ms, value: Value::String(buf) };
+            Ok(CasAction::Write(new_entry, ()))
         })
         .await
     }
