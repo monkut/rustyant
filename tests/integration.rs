@@ -2251,6 +2251,81 @@ async fn zinter_wrong_type_errors() {
     call(&state, &[b"ZINTER", b"2", b"z", b"k"]).await.expect_error_prefix("ERR");
 }
 
+// ---------------------------------------------------------------------------
+// SINTERCARD / ZINTERCARD — cardinality-only companions of SINTER / ZINTER.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sintercard_returns_intersection_size() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s1", b"a", b"b", b"c"]).await;
+    call(&state, &[b"SADD", b"s2", b"b", b"c", b"d"]).await;
+    call(&state, &[b"SINTERCARD", b"2", b"s1", b"s2"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn sintercard_limit_caps_count() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s1", b"a", b"b", b"c", b"d"]).await;
+    call(&state, &[b"SADD", b"s2", b"a", b"b", b"c", b"d"]).await;
+    // Limit 2 of intersection-of-4 → 2.
+    call(&state, &[b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT", b"2"]).await.expect_integer(2);
+    // Limit 0 = no cap → full 4.
+    call(&state, &[b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT", b"0"]).await.expect_integer(4);
+}
+
+#[tokio::test]
+async fn sintercard_with_missing_key_returns_zero() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s1", b"a", b"b"]).await;
+    call(&state, &[b"SINTERCARD", b"2", b"s1", b"missing"]).await.expect_integer(0);
+}
+
+#[tokio::test]
+async fn sintercard_numkeys_zero_errors() {
+    let state = test_state();
+    call(&state, &[b"SINTERCARD", b"0"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn sintercard_negative_limit_errors() {
+    let state = test_state();
+    call(&state, &[b"SADD", b"s", b"a"]).await;
+    call(&state, &[b"SINTERCARD", b"1", b"s", b"LIMIT", b"-1"]).await.expect_error_prefix("ERR");
+}
+
+#[tokio::test]
+async fn zintercard_returns_intersection_size() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z1", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZADD", b"z2", b"10", b"b", b"20", b"c", b"30", b"d"]).await;
+    call(&state, &[b"ZINTERCARD", b"2", b"z1", b"z2"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn zintercard_accepts_mixed_set_and_zset() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z", b"1", b"x", b"2", b"y"]).await;
+    call(&state, &[b"SADD", b"s", b"y", b"z"]).await;
+    call(&state, &[b"ZINTERCARD", b"2", b"z", b"s"]).await.expect_integer(1);
+}
+
+#[tokio::test]
+async fn zintercard_limit_caps_count() {
+    let state = test_state();
+    call(&state, &[b"ZADD", b"z1", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZADD", b"z2", b"1", b"a", b"2", b"b", b"3", b"c"]).await;
+    call(&state, &[b"ZINTERCARD", b"2", b"z1", b"z2", b"LIMIT", b"2"]).await.expect_integer(2);
+}
+
+#[tokio::test]
+async fn zintercard_wrong_type_errors() {
+    let state = test_state();
+    call(&state, &[b"SET", b"k", b"v"]).await;
+    call(&state, &[b"ZADD", b"z", b"1", b"a"]).await;
+    call(&state, &[b"ZINTERCARD", b"2", b"z", b"k"]).await.expect_error_prefix("ERR");
+}
+
 #[tokio::test]
 async fn zstore_commands_registered_in_command_meta() {
     let state = test_state();
