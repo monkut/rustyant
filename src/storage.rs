@@ -191,7 +191,7 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn is_expired(v: &StoredValue) -> bool {
+pub(crate) fn is_expired(v: &StoredValue) -> bool {
     v.expires_at_ms.is_some_and(|exp| exp <= now_ms())
 }
 
@@ -288,14 +288,52 @@ fn apply_xgroup_op(stream: &mut StreamValue, op: &XGroupOp, existed: bool) -> Re
 
 /// Redis `TYPE` reply tag for a stored value.
 const fn value_kind(value: &Value) -> &'static str {
-    match value {
-        Value::String(_) => "string",
-        Value::Hash(_) => "hash",
-        Value::List(_) => "list",
-        Value::Set(_) => "set",
-        Value::ZSet(_) => "zset",
-        Value::Stream(_) => "stream",
+    ValueKind::of(value).as_str()
+}
+
+/// Discriminant for [`Value`] used to route per-partition backend reads.
+///
+/// Single-partition backends (S3) ignore the tag; partitioned backends (a
+/// future `DynamoDB` impl with one table per kind) use it to go straight to
+/// the right partition without probing the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueKind {
+    String,
+    Hash,
+    List,
+    Set,
+    ZSet,
+    Stream,
+}
+
+impl ValueKind {
+    #[must_use]
+    pub const fn of(value: &Value) -> Self {
+        match value {
+            Value::String(_) => Self::String,
+            Value::Hash(_) => Self::Hash,
+            Value::List(_) => Self::List,
+            Value::Set(_) => Self::Set,
+            Value::ZSet(_) => Self::ZSet,
+            Value::Stream(_) => Self::Stream,
+        }
     }
+
+    /// Redis `TYPE` reply tag.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Hash => "hash",
+            Self::List => "list",
+            Self::Set => "set",
+            Self::ZSet => "zset",
+            Self::Stream => "stream",
+        }
+    }
+
+    /// Full ordered list, for probe-all backends.
+    pub const ALL: [Self; 6] = [Self::String, Self::Hash, Self::List, Self::Set, Self::ZSet, Self::Stream];
 }
 
 /// Remove up to `count` occurrences of `target` from `list`. Redis semantics:
@@ -508,8 +546,9 @@ fn pop_zset_edge(
 }
 
 /// Time-seeded xorshift — good enough for Redis `SPOP` / `SRANDMEMBER`, which
-/// only require "random-ish" sampling, not cryptographic randomness.
-fn pseudo_rand_u64() -> u64 {
+/// only require "random-ish" sampling, not cryptographic randomness. Also
+/// used by [`crate::dynamodb`] to mint per-write CAS version tokens.
+pub(crate) fn pseudo_rand_u64() -> u64 {
     let nanos: u64 =
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     let mut x = nanos ^ 0x2545_F491_4F6C_DD1D_u64;
@@ -777,6 +816,12 @@ pub trait KVBackend: Send + Sync + std::fmt::Debug {
     /// (an S3 `ETag`, a `DynamoDB` version attribute, etc). Returns `None` for
     /// missing or expired entries; backends should GC expired entries
     /// opportunistically on encounter.
+    ///
+    /// On per-partition backends this probes every partition and resolves
+    /// cross-partition divergence by a deterministic fallback order — a key
+    /// that ended up in multiple kind tables (because a concurrent race or a
+    /// deliberate cross-kind skip-of-cleanup left both rows alive) resolves
+    /// to whichever partition appears first in [`ValueKind::ALL`].
     async fn load(&self, redis_key: &str) -> Result<Option<(StoredValue, String)>, RustyAntError>;
 
     /// Write `entry` at `redis_key` under `cond`. A failed precondition

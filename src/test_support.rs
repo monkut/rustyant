@@ -12,6 +12,7 @@ use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 
 use crate::Settings;
+use crate::settings::BackendKind;
 use crate::state::State;
 use crate::storage::{KVStorage, S3Storage};
 
@@ -55,8 +56,10 @@ pub fn floci_state(scope: &str) -> State {
     let storage = Arc::new(KVStorage::new(backend));
 
     let settings = Settings {
+        backend: BackendKind::S3,
         bucket,
         key_prefix: prefix,
+        dynamodb_table_prefix: "rustyant-".to_string(),
         aws_region: Some("us-east-1".to_string()),
         aws_endpoint_url: Some(floci_url),
         emf_namespace: None,

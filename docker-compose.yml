@@ -1,15 +1,17 @@
-# Floci (https://github.com/floci-io/floci) — MIT-licensed local AWS emulator.
-# Chosen over LocalStack (which moved S3 behind a paid tier) and MiniStack
-# (less mature). Port 4566 matches the familiar LocalStack default, so no
-# Rust-side changes were needed — AWS_ENDPOINT_URL + path-style addressing
-# already works.
+# Local AWS emulators used by the test harness. rustyant itself runs natively
+# via `cargo lambda watch`; the emulators only stand in for the storage
+# backends:
 #
-# rustyant itself runs natively via `cargo lambda watch`; we use floci only
-# for S3.
+# * `floci`   — S3 emulator (https://github.com/floci-io/floci, MIT). Chosen
+#               over LocalStack (which moved S3 behind a paid tier) and
+#               MiniStack (less mature). Listens on port 4566.
+# * `dynamodb` — Amazon's official local DynamoDB image. Listens on port 8000.
 #
-# Start:  just floci-up
-# Stop:   just floci-down
-# Seed:   just floci-seed
+# Each service is independent — bringing one up does not bring up the other.
+#
+# Start:  just floci-up | just dynamodb-up
+# Stop:   just floci-down | just dynamodb-down
+# Seed:   just floci-seed | just dynamodb-seed
 
 services:
   floci:
@@ -29,3 +31,21 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: rustyant-dynamodb
+    # Host networking, same reasoning as floci. DynamoDB Local listens on 8000
+    # and accepts any AWS credentials (the local emulator doesn't validate them).
+    network_mode: host
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb", "-port", "8000"]
+    healthcheck:
+      # The shell-less DynamoDB image lacks `curl` / `wget`; check via a
+      # listing call instead. AWS CLI inside the container would also work
+      # but bloats the image — the SDK we test with handles errors fine,
+      # the `just dynamodb-up` recipe waits on the SDK side.
+      test: ["CMD-SHELL", "/usr/bin/test -d /home/dynamodblocal"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s

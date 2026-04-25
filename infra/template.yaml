@@ -1,27 +1,43 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: rustyant — WebSocket transport (API Gateway WS → Lambda → S3)
+Description: rustyant — WebSocket transport (API Gateway WS → Lambda → S3 or DynamoDB)
 
 # Deploys:
-#   * S3 bucket for KV storage
+#   * Storage layer — exactly one of:
+#       - One S3 bucket (when BackendKind=s3)
+#       - Six per-kind DynamoDB tables (when BackendKind=dynamodb)
 #   * rustyant-ws Lambda (Rust, arm64) built by sam+cargo-lambda
 #   * API Gateway WebSocket API with $connect / $disconnect / $default routes
-#   * IAM policy granting the Lambda execute-api:ManageConnections (so it can
-#     reply via @connections) plus S3 CRUD on the bucket
+#   * IAM policies granting the Lambda backend-appropriate CRUD plus
+#     execute-api:ManageConnections
 #
 # The HTTP variant (Lambda URL) is not provisioned here — deploy it via
 # `just lambda-deploy` against the existing `rustyant` binary.
 
 Parameters:
+  BackendKind:
+    Type: String
+    Description: Storage backend the Lambda speaks to.
+    Default: s3
+    AllowedValues: [s3, dynamodb]
+
   BucketName:
     Type: String
-    Description: S3 bucket holding the KV objects. Will be created by this stack.
+    Description: S3 bucket holding the KV objects (only used when BackendKind=s3).
+                 Pass any valid name when BackendKind=dynamodb — it will be ignored.
+    Default: rustyant-unused
     AllowedPattern: ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$
 
   KeyPrefix:
     Type: String
     Description: Prefix prepended to every Redis key in S3.
     Default: rustyant/
+
+  DynamodbTablePrefix:
+    Type: String
+    Description: Per-kind table-name prefix when BackendKind=dynamodb.
+                 'rustyant-' yields rustyant-string, rustyant-hash, etc.
+    Default: rustyant-
 
   StageName:
     Type: String
@@ -34,6 +50,10 @@ Parameters:
     Default: info
     AllowedValues: [trace, debug, info, warn, error]
 
+Conditions:
+  IsS3Backend: !Equals [!Ref BackendKind, s3]
+  IsDynamodbBackend: !Equals [!Ref BackendKind, dynamodb]
+
 Globals:
   Function:
     Runtime: provided.al2023
@@ -42,16 +62,19 @@ Globals:
     Timeout: 10
     Environment:
       Variables:
+        RUSTYANT_BACKEND: !Ref BackendKind
         BUCKET: !Ref BucketName
         KEY_PREFIX: !Ref KeyPrefix
+        RUSTYANT_DYNAMODB_TABLE_PREFIX: !Ref DynamodbTablePrefix
         LOG_LEVEL: !Ref LogLevel
         RUST_LOG: !Ref LogLevel
         RUSTYANT_EMF_NAMESPACE: rustyant
 
 Resources:
-  # --- Storage ------------------------------------------------------------
+  # --- S3 storage (BackendKind=s3) ---------------------------------------
   Bucket:
     Type: AWS::S3::Bucket
+    Condition: IsS3Backend
     Properties:
       BucketName: !Ref BucketName
       VersioningConfiguration:
@@ -65,6 +88,118 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+
+  # --- DynamoDB storage (BackendKind=dynamodb) ---------------------------
+  # Six per-kind tables. All share the same shape: pk (partition key) +
+  # data + version + ttl. Native TTL is enabled so expired rows get GC'd
+  # asynchronously; lazy expiry on read is the authoritative check.
+  TableString:
+    Type: AWS::DynamoDB::Table
+    Condition: IsDynamodbBackend
+    Properties:
+      TableName: !Sub '${DynamodbTablePrefix}string'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  TableHash:
+    Type: AWS::DynamoDB::Table
+    Condition: IsDynamodbBackend
+    Properties:
+      TableName: !Sub '${DynamodbTablePrefix}hash'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  TableList:
+    Type: AWS::DynamoDB::Table
+    Condition: IsDynamodbBackend
+    Properties:
+      TableName: !Sub '${DynamodbTablePrefix}list'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  TableSet:
+    Type: AWS::DynamoDB::Table
+    Condition: IsDynamodbBackend
+    Properties:
+      TableName: !Sub '${DynamodbTablePrefix}set'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  TableZset:
+    Type: AWS::DynamoDB::Table
+    Condition: IsDynamodbBackend
+    Properties:
+      TableName: !Sub '${DynamodbTablePrefix}zset'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  TableStream:
+    Type: AWS::DynamoDB::Table
+    Condition: IsDynamodbBackend
+    Properties:
+      TableName: !Sub '${DynamodbTablePrefix}stream'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
 
   # --- WebSocket API ------------------------------------------------------
   # $request.body.action is API Gateway's conventional selection expression.
@@ -90,8 +225,39 @@ Resources:
       CodeUri: ../
       Handler: bootstrap
       Policies:
-        - S3CrudPolicy:
-            BucketName: !Ref BucketName
+        # Storage CRUD: S3 OR DynamoDB depending on BackendKind. The two
+        # branches are mutually exclusive via the Conditions above; only
+        # one set of resources actually exists in any given deployment.
+        # Both branches are inline Statement policies — SAM's Fn::If only
+        # allows uniform policy types across both arms.
+        - !If
+          - IsS3Backend
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}'
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+          - Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt TableString.Arn
+                  - !GetAtt TableHash.Arn
+                  - !GetAtt TableList.Arn
+                  - !GetAtt TableSet.Arn
+                  - !GetAtt TableZset.Arn
+                  - !GetAtt TableStream.Arn
+        # WebSocket reply path — needed in both backend modes.
         - Statement:
             - Effect: Allow
               Action:
@@ -172,6 +338,16 @@ Outputs:
     Description: ARN of the rustyant-ws Lambda.
     Value: !GetAtt WsFunction.Arn
 
+  BackendKind:
+    Description: Storage backend the deployed Lambda speaks to.
+    Value: !Ref BackendKind
+
   BucketName:
-    Description: S3 bucket backing KV storage.
+    Description: S3 bucket backing KV storage (only meaningful when BackendKind=s3).
+    Condition: IsS3Backend
     Value: !Ref Bucket
+
+  DynamodbTablePrefix:
+    Description: Per-kind table-name prefix (only meaningful when BackendKind=dynamodb).
+    Condition: IsDynamodbBackend
+    Value: !Ref DynamodbTablePrefix
