@@ -128,13 +128,14 @@ dynamodb-up:
 dynamodb-down:
     docker compose stop dynamodb && docker compose rm -f dynamodb
 
-# Create the six per-kind tables. Idempotent — running twice is a no-op.
+# Create the seven backend tables (index + six per-kind). Idempotent —
+# running twice is a no-op.
 dynamodb-seed PREFIX="rustyant-":
     #!/usr/bin/env bash
     set -euo pipefail
     export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:8000
-    for kind in string hash list set zset stream; do
-      table="{{PREFIX}}${kind}"
+    for suffix in index string hash list set zset stream; do
+      table="{{PREFIX}}${suffix}"
       if aws dynamodb describe-table --table-name "$table" >/dev/null 2>&1; then
         echo "Table exists: $table"
       else
@@ -158,7 +159,7 @@ rustyant-dev-dynamodb PREFIX="rustyant-":
     cargo lambda watch
 
 # Run the DynamoDB-gated integration suite. Brings up DynamoDB Local + seeds
-# the six tables before running tests/dynamodb.rs.
+# the seven tables (index + six per-kind) before running tests/dynamodb.rs.
 test-dynamodb PREFIX="rustyant-": (dynamodb-up) (dynamodb-seed PREFIX)
     #!/usr/bin/env bash
     set -euo pipefail

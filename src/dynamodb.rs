@@ -2,28 +2,37 @@
 //!
 //! # Layout
 //!
-//! Six tables, one per Redis value kind. Picking the right table at write
-//! time is `O(1)` from the value itself; reads probe all six in parallel
-//! when the kind is unknown to the caller. Each table has the same shape:
+//! Seven tables — six per-kind data tables plus a canonical index that maps
+//! the Redis key to its current kind:
 //!
-//! | attribute    | type | role                                            |
-//! |--------------|------|-------------------------------------------------|
-//! | `pk`         | S    | the Redis key (partition key)                   |
-//! | `data`       | B    | `serde_json::to_vec(&StoredValue)`              |
-//! | `version`    | S    | per-write opaque token; powers CAS              |
-//! | `ttl`        | N    | epoch seconds for native `DynamoDB` TTL (best-effort GC) |
+//! | table              | role                                                    |
+//! |--------------------|---------------------------------------------------------|
+//! | `{prefix}index`    | `pk → kind`, the single source of truth for "exists?"   |
+//! | `{prefix}{kind}`   | the actual value, one row per Redis kind                |
 //!
-//! # Cross-kind divergence
+//! Data rows carry `pk` (S, partition key), `data` (B, the JSON-serialized
+//! [`StoredValue`]), `version` (S, the per-write CAS token), and `ttl` (N,
+//! epoch seconds — native `DynamoDB` GC). Index rows carry `pk` + `kind` (S)
+//! + `ttl` (N); they have no `version` because CAS lives on the data row.
 //!
-//! Writes go straight to the target kind table without probing the other
-//! five. A `SET foo "bar"` after `HSET foo x 1` leaves the hashes-table row
-//! alive — see `memory/project_dynamodb_backend.md` and the README scope
-//! section for the full story. The [`KVBackend`] [`load`] surface resolves
-//! divergent keys deterministically by the [`ValueKind::ALL`] order, which
-//! happens to put `string` first so `GET foo` after a cross-kind `SET`
-//! returns the string and `HGET foo x` returns `WRONGTYPE` — close enough
-//! to Redis's "SET overwrote the hash" semantics for the queryable surface,
-//! even though the hashes row is still on disk.
+//! # Atomicity
+//!
+//! Every write goes through `TransactWriteItems` so the data put/delete, the
+//! index put/delete, and any cross-kind orphan cleanup all succeed-or-fail
+//! together. After a `SET foo "bar"` that follows `HSET foo x 1`:
+//!
+//! 1. The hash row in `{prefix}hash` is deleted.
+//! 2. The string row in `{prefix}string` is created.
+//! 3. The index row flips from `kind=hash` to `kind=string`.
+//!
+//! …all in one transaction. There are no leaked rows.
+//!
+//! # Kind-unaware paths
+//!
+//! `EXISTS`, `TYPE`, `DEL`, `KEYS`, and `SCAN` all resolve through the index
+//! table — one `GetItem` (or one `Scan`) instead of probing six tables in
+//! parallel. The cost shows up on writes: every save/delete is a 2-or-3-item
+//! `TransactWriteItems` (~2× WCU vs. an unconditional `PutItem`).
 //!
 //! # Version tokens
 //!
@@ -39,9 +48,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client as DynamoClient;
-use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
-use aws_sdk_dynamodb::operation::put_item::PutItemError;
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+use aws_sdk_dynamodb::types::{AttributeValue, Delete, Put, TransactWriteItem};
 use bytes::Bytes;
 
 use crate::error::RustyAntError;
@@ -49,7 +57,7 @@ use crate::storage::{
     DeleteCondition, KVBackend, ListPage, StoredValue, ValueKind, WriteCondition, is_expired, pseudo_rand_u64,
 };
 
-/// Default prefix prepended to each kind table name when [`TableNames::with_prefix`]
+/// Default prefix prepended to each table name when [`TableNames::with_prefix`]
 /// is the configured constructor. Mirrors the S3 backend's `KEY_PREFIX`
 /// convention.
 pub const DEFAULT_TABLE_PREFIX: &str = "rustyant-";
@@ -60,6 +68,7 @@ pub const DEFAULT_TABLE_PREFIX: &str = "rustyant-";
 pub const ATTR_PK: &str = "pk";
 pub const ATTR_DATA: &str = "data";
 pub const ATTR_VERSION: &str = "version";
+pub const ATTR_KIND: &str = "kind";
 pub const ATTR_TTL: &str = "ttl";
 
 /// `DynamoDB` single-item size limit. We refuse writes that would exceed it
@@ -72,10 +81,12 @@ const MAX_ITEM_BYTES: usize = 380_000;
 // TableNames
 // ---------------------------------------------------------------------------
 
-/// The six per-kind table names. Constructed once at startup from a prefix
-/// (production / floci-style local) or from explicit names (custom infra).
+/// Resolved table names — one per Redis kind plus the cross-kind index.
+/// Constructed once at startup from a prefix (production / floci-style local)
+/// or from explicit names (custom infra).
 #[derive(Debug, Clone)]
 pub struct TableNames {
+    pub index: String,
     pub string: String,
     pub hash: String,
     pub list: String,
@@ -85,11 +96,13 @@ pub struct TableNames {
 }
 
 impl TableNames {
-    /// Build from a shared prefix — `rustyant-` yields `rustyant-string`,
-    /// `rustyant-hash`, etc. Matches the SAM template's default naming.
+    /// Build from a shared prefix — `rustyant-` yields `rustyant-index`,
+    /// `rustyant-string`, `rustyant-hash`, etc. Matches the SAM template's
+    /// default naming.
     #[must_use]
     pub fn with_prefix(prefix: &str) -> Self {
         Self {
+            index: format!("{prefix}index"),
             string: format!("{prefix}string"),
             hash: format!("{prefix}hash"),
             list: format!("{prefix}list"),
@@ -112,9 +125,10 @@ impl TableNames {
         }
     }
 
-    /// Iterate `(kind, table_name)` in [`ValueKind::ALL`] order. Used by
-    /// [`DynamoDbBackend::load`] (probe order), [`flush_all`] (sweep order),
-    /// and [`list_page`] (sequential walk order).
+    /// Iterate `(kind, table_name)` for the six per-kind tables in
+    /// [`ValueKind::ALL`] order. The index table is intentionally absent —
+    /// callers iterating data tables (admin scripts, future bulk-delete
+    /// overrides) don't want to mix the index in.
     pub fn iter(&self) -> impl Iterator<Item = (ValueKind, &str)> {
         [
             (ValueKind::String, self.string.as_str()),
@@ -160,14 +174,36 @@ impl DynamoDbBackend {
         &self.tables
     }
 
-    /// Read one item by partition key. `None` for missing/expired entries;
-    /// expired rows are GC'd best-effort on encounter.
-    async fn get_one(
-        &self,
-        kind: ValueKind,
-        table: &str,
-        key: &str,
-    ) -> Result<Option<(StoredValue, String)>, RustyAntError> {
+    /// Strongly-consistent read of the index row. `Some(kind)` when the key
+    /// is alive somewhere; `None` when it isn't (or the index row was reaped
+    /// by native TTL but the data row is still around — treated as "missing"
+    /// because the index is canonical).
+    async fn read_index_kind(&self, key: &str) -> Result<Option<ValueKind>, RustyAntError> {
+        let res = self
+            .client
+            .get_item()
+            .table_name(&self.tables.index)
+            .key(ATTR_PK, AttributeValue::S(key.to_string()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| RustyAntError::S3(format!("dynamodb get_item (index): {}", e.into_service_error())))?;
+        let Some(item) = res.item else {
+            return Ok(None);
+        };
+        let Some(kind_attr) = item.get(ATTR_KIND) else {
+            return Ok(None);
+        };
+        let kind_str =
+            kind_attr.as_s().map_err(|_| RustyAntError::S3(format!("`{ATTR_KIND}` attribute is not String")))?;
+        parse_kind(kind_str).map(Some)
+    }
+
+    /// Strongly-consistent read of the data row for a known kind. Expired
+    /// rows are GC'd best-effort on encounter (data + index pair, conditional
+    /// on the version we just read so we don't trash a racing writer's data).
+    async fn get_one(&self, kind: ValueKind, key: &str) -> Result<Option<(StoredValue, String)>, RustyAntError> {
+        let table = self.tables.for_kind(kind);
         let res = self
             .client
             .get_item()
@@ -181,32 +217,28 @@ impl DynamoDbBackend {
             return Ok(None);
         };
         let entry = decode_item(&item)?;
+        let version = read_version_attr(&item)?;
         if is_expired(&entry) {
-            // Best-effort GC — drop it on encounter, ignore failures.
-            let _ = self
-                .client
-                .delete_item()
-                .table_name(table)
-                .key(ATTR_PK, AttributeValue::S(key.to_string()))
-                .send()
-                .await;
+            // Best-effort GC under the version we just read. If a racing
+            // writer already replaced the row, the conditional delete fails
+            // harmlessly and the next access will retry.
+            let _ = self.delete(key, DeleteCondition::IfMatch(encode_token(kind, &version))).await;
             return Ok(None);
         }
-        let version = read_version_attr(&item)?;
         Ok(Some((entry, encode_token(kind, &version))))
     }
 
-    /// One Scan against `table`, returning at most `max_keys` partition keys.
-    async fn scan_one_table(
+    /// One `Scan` against the index table. Returns `(keys, last_pk)`; the
+    /// caller wraps `last_pk` into the `next_cursor` field of [`ListPage`].
+    async fn scan_index(
         &self,
-        table: &str,
         start_pk: Option<String>,
         max_keys: usize,
     ) -> Result<(Vec<String>, Option<String>), RustyAntError> {
         let mut req = self
             .client
             .scan()
-            .table_name(table)
+            .table_name(&self.tables.index)
             .projection_expression(ATTR_PK)
             .limit(i32::try_from(max_keys).unwrap_or(i32::MAX));
         if let Some(pk) = start_pk {
@@ -228,22 +260,16 @@ impl DynamoDbBackend {
 #[async_trait]
 impl KVBackend for DynamoDbBackend {
     async fn load(&self, redis_key: &str) -> Result<Option<(StoredValue, String)>, RustyAntError> {
-        // Six parallel GetItems. First non-None hit in fixed `ValueKind::ALL`
-        // order wins on divergent keys.
-        let (s, h, l, se, z, st) = tokio::try_join!(
-            self.get_one(ValueKind::String, &self.tables.string, redis_key),
-            self.get_one(ValueKind::Hash, &self.tables.hash, redis_key),
-            self.get_one(ValueKind::List, &self.tables.list, redis_key),
-            self.get_one(ValueKind::Set, &self.tables.set, redis_key),
-            self.get_one(ValueKind::ZSet, &self.tables.zset, redis_key),
-            self.get_one(ValueKind::Stream, &self.tables.stream, redis_key),
-        )?;
-        Ok(s.or(h).or(l).or(se).or(z).or(st))
+        // Index → kind → one GetItem on the right kind table. Two RTTs in
+        // the worst case, no parallel probe of the other five tables.
+        let Some(kind) = self.read_index_kind(redis_key).await? else {
+            return Ok(None);
+        };
+        self.get_one(kind, redis_key).await
     }
 
     async fn save(&self, redis_key: &str, entry: &StoredValue, cond: WriteCondition) -> Result<(), RustyAntError> {
-        let kind = ValueKind::of(&entry.value);
-        let table = self.tables.for_kind(kind);
+        let new_kind = ValueKind::of(&entry.value);
         let body = serde_json::to_vec(entry)?;
         if body.len() > MAX_ITEM_BYTES {
             return Err(RustyAntError::Parse(format!(
@@ -252,48 +278,95 @@ impl KVBackend for DynamoDbBackend {
             )));
         }
         let new_version = format!("{:016x}", pseudo_rand_u64());
+        let target_table = self.tables.for_kind(new_kind);
 
-        let mut req = self
-            .client
-            .put_item()
-            .table_name(table)
+        // For Any/CreateOnly we read the index up front to learn whether a
+        // cross-kind orphan delete needs to ride along; for IfMatch the
+        // token already names the kind, and a kind-mismatch is auto-Contention.
+        let observed_kind = match &cond {
+            WriteCondition::Any | WriteCondition::CreateOnly => self.read_index_kind(redis_key).await?,
+            WriteCondition::IfMatch(token) => {
+                let (token_kind, _) = parse_token(token)?;
+                if token_kind != new_kind {
+                    return Err(RustyAntError::Contention);
+                }
+                Some(token_kind)
+            }
+        };
+
+        // CreateOnly fast path — index already shows a row, no need to
+        // dispatch a transaction we know will fail.
+        if matches!(cond, WriteCondition::CreateOnly) && observed_kind.is_some() {
+            return Err(RustyAntError::Contention);
+        }
+
+        // Build the data Put.
+        let mut data_put = Put::builder()
+            .table_name(target_table)
             .item(ATTR_PK, AttributeValue::S(redis_key.to_string()))
             .item(ATTR_DATA, AttributeValue::B(body.into()))
             .item(ATTR_VERSION, AttributeValue::S(new_version));
-
-        // Native TTL: epoch seconds. `DynamoDB`'s GC granularity is ~48h; the
-        // authoritative expiry check is the lazy `is_expired` on read.
         if let Some(exp_ms) = entry.expires_at_ms {
-            req = req.item(ATTR_TTL, AttributeValue::N((exp_ms / 1000).to_string()));
+            data_put = data_put.item(ATTR_TTL, AttributeValue::N((exp_ms / 1000).to_string()));
         }
-
-        match cond {
-            WriteCondition::Any => {}
-            WriteCondition::CreateOnly => {
-                req = req.condition_expression(format!("attribute_not_exists({ATTR_PK})"));
-            }
+        match &cond {
+            WriteCondition::Any | WriteCondition::CreateOnly => {}
             WriteCondition::IfMatch(token) => {
-                let (token_kind, old_version) = parse_token(&token)?;
-                if token_kind != kind {
-                    // CAS token came from a different kind's row (a divergent
-                    // key resolved through a different table). Treat as
-                    // contention so the outer CAS loop re-reads.
-                    return Err(RustyAntError::Contention);
-                }
-                req = req
+                let (_, old_version) = parse_token(token)?;
+                data_put = data_put
                     .condition_expression(format!("{ATTR_VERSION} = :old"))
                     .expression_attribute_values(":old", AttributeValue::S(old_version));
             }
         }
+        let data_put = data_put.build().map_err(|e| RustyAntError::S3(format!("dynamodb build put (data): {e}")))?;
 
-        match req.send().await {
+        // Build the index Put. Conditional on the index either being absent
+        // (first write) or still showing the kind we observed (no concurrent
+        // change since the read).
+        let mut index_put = Put::builder()
+            .table_name(&self.tables.index)
+            .item(ATTR_PK, AttributeValue::S(redis_key.to_string()))
+            .item(ATTR_KIND, AttributeValue::S(new_kind.as_str().to_string()));
+        if let Some(exp_ms) = entry.expires_at_ms {
+            index_put = index_put.item(ATTR_TTL, AttributeValue::N((exp_ms / 1000).to_string()));
+        }
+        match observed_kind {
+            None => {
+                index_put = index_put.condition_expression(format!("attribute_not_exists({ATTR_PK})"));
+            }
+            Some(k) => {
+                index_put = index_put
+                    .condition_expression(format!("{ATTR_KIND} = :ok"))
+                    .expression_attribute_values(":ok", AttributeValue::S(k.as_str().to_string()));
+            }
+        }
+        let index_put = index_put.build().map_err(|e| RustyAntError::S3(format!("dynamodb build put (index): {e}")))?;
+
+        let mut items: Vec<TransactWriteItem> = Vec::with_capacity(3);
+        items.push(TransactWriteItem::builder().put(data_put).build());
+        items.push(TransactWriteItem::builder().put(index_put).build());
+        // Cross-kind transition — sweep the orphan row of the old kind so
+        // the index stays the single source of truth.
+        if let Some(old_kind) = observed_kind {
+            if old_kind != new_kind {
+                let old_table = self.tables.for_kind(old_kind);
+                let old_delete = Delete::builder()
+                    .table_name(old_table)
+                    .key(ATTR_PK, AttributeValue::S(redis_key.to_string()))
+                    .build()
+                    .map_err(|e| RustyAntError::S3(format!("dynamodb build delete (orphan): {e}")))?;
+                items.push(TransactWriteItem::builder().delete(old_delete).build());
+            }
+        }
+
+        match self.client.transact_write_items().set_transact_items(Some(items)).send().await {
             Ok(_) => Ok(()),
             Err(e) => {
                 let svc = e.into_service_error();
-                if matches!(svc, PutItemError::ConditionalCheckFailedException(_)) {
+                if matches!(svc, TransactWriteItemsError::TransactionCanceledException(_)) {
                     Err(RustyAntError::Contention)
                 } else {
-                    Err(RustyAntError::S3(format!("dynamodb put_item: {svc}")))
+                    Err(RustyAntError::S3(format!("dynamodb transact_write_items (save): {svc}")))
                 }
             }
         }
@@ -302,77 +375,88 @@ impl KVBackend for DynamoDbBackend {
     async fn delete(&self, redis_key: &str, cond: DeleteCondition) -> Result<(), RustyAntError> {
         match cond {
             DeleteCondition::Any => {
-                // Sweep every kind's table — divergent keys may sit in more
-                // than one. Unconditional DeleteItem is idempotent on
-                // missing rows, so this is safe and cheap to overshoot.
-                let key = redis_key.to_string();
-                tokio::try_join!(
-                    delete_one(&self.client, &self.tables.string, &key, None),
-                    delete_one(&self.client, &self.tables.hash, &key, None),
-                    delete_one(&self.client, &self.tables.list, &key, None),
-                    delete_one(&self.client, &self.tables.set, &key, None),
-                    delete_one(&self.client, &self.tables.zset, &key, None),
-                    delete_one(&self.client, &self.tables.stream, &key, None),
-                )?;
-                Ok(())
+                // Read the index → transact (delete data, delete index).
+                // No-op when the key isn't anywhere; matches Redis `DEL` on
+                // a missing key.
+                let Some(kind) = self.read_index_kind(redis_key).await? else {
+                    return Ok(());
+                };
+                let table = self.tables.for_kind(kind);
+                let data_delete = Delete::builder()
+                    .table_name(table)
+                    .key(ATTR_PK, AttributeValue::S(redis_key.to_string()))
+                    .build()
+                    .map_err(|e| RustyAntError::S3(format!("dynamodb build delete (data): {e}")))?;
+                let index_delete = Delete::builder()
+                    .table_name(&self.tables.index)
+                    .key(ATTR_PK, AttributeValue::S(redis_key.to_string()))
+                    .build()
+                    .map_err(|e| RustyAntError::S3(format!("dynamodb build delete (index): {e}")))?;
+                let items = vec![
+                    TransactWriteItem::builder().delete(data_delete).build(),
+                    TransactWriteItem::builder().delete(index_delete).build(),
+                ];
+                match self.client.transact_write_items().set_transact_items(Some(items)).send().await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        let svc = e.into_service_error();
+                        // A racing writer flipped the kind between our read
+                        // and the transact. The other writer's state is the
+                        // current truth — a `DEL Any` against the value they
+                        // just wrote isn't what the caller asked for, so we
+                        // surface as Contention and let them decide.
+                        if matches!(svc, TransactWriteItemsError::TransactionCanceledException(_)) {
+                            Err(RustyAntError::Contention)
+                        } else {
+                            Err(RustyAntError::S3(format!("dynamodb transact_write_items (delete): {svc}")))
+                        }
+                    }
+                }
             }
             DeleteCondition::IfMatch(token) => {
                 let (token_kind, old_version) = parse_token(&token)?;
                 let table = self.tables.for_kind(token_kind);
-                delete_one(&self.client, table, redis_key, Some(&old_version)).await
+                let data_delete = Delete::builder()
+                    .table_name(table)
+                    .key(ATTR_PK, AttributeValue::S(redis_key.to_string()))
+                    .condition_expression(format!("{ATTR_VERSION} = :old"))
+                    .expression_attribute_values(":old", AttributeValue::S(old_version))
+                    .build()
+                    .map_err(|e| RustyAntError::S3(format!("dynamodb build delete (data): {e}")))?;
+                let index_delete = Delete::builder()
+                    .table_name(&self.tables.index)
+                    .key(ATTR_PK, AttributeValue::S(redis_key.to_string()))
+                    .condition_expression(format!("{ATTR_KIND} = :ok"))
+                    .expression_attribute_values(":ok", AttributeValue::S(token_kind.as_str().to_string()))
+                    .build()
+                    .map_err(|e| RustyAntError::S3(format!("dynamodb build delete (index): {e}")))?;
+                let items = vec![
+                    TransactWriteItem::builder().delete(data_delete).build(),
+                    TransactWriteItem::builder().delete(index_delete).build(),
+                ];
+                match self.client.transact_write_items().set_transact_items(Some(items)).send().await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        let svc = e.into_service_error();
+                        if matches!(svc, TransactWriteItemsError::TransactionCanceledException(_)) {
+                            Err(RustyAntError::Contention)
+                        } else {
+                            Err(RustyAntError::S3(format!("dynamodb transact_write_items (delete): {svc}")))
+                        }
+                    }
+                }
             }
         }
     }
 
     async fn list_page(&self, cursor: Option<String>, max_keys: usize) -> Result<ListPage, RustyAntError> {
-        let (table_idx, start_pk) = parse_cursor(cursor.as_deref());
-        let tables: Vec<&str> = self.tables.iter().map(|(_, t)| t).collect();
-
-        if table_idx >= tables.len() {
-            return Ok(ListPage { keys: Vec::new(), next_cursor: None });
-        }
-        let (keys, next_pk) = self.scan_one_table(tables[table_idx], start_pk, max_keys).await?;
-        let next_cursor = match next_pk {
-            Some(pk) => Some(format_cursor(table_idx, Some(&pk))),
-            None if table_idx + 1 < tables.len() => Some(format_cursor(table_idx + 1, None)),
-            None => None,
-        };
-        // Even an empty page advances the cursor so the caller can drive
-        // the walk to completion.
+        let (keys, next_cursor) = self.scan_index(cursor, max_keys).await?;
         Ok(ListPage { keys, next_cursor })
     }
 }
 
-/// Helper: one `DeleteItem` with optional version condition. Pulled out so
-/// the `Any` branch of [`KVBackend::delete`] can fan out across all six
-/// tables via `tokio::try_join!` without an awkward closure shape.
-async fn delete_one(
-    client: &DynamoClient,
-    table: &str,
-    key: &str,
-    if_match_version: Option<&str>,
-) -> Result<(), RustyAntError> {
-    let mut req = client.delete_item().table_name(table).key(ATTR_PK, AttributeValue::S(key.to_string()));
-    if let Some(v) = if_match_version {
-        req = req
-            .condition_expression(format!("{ATTR_VERSION} = :old"))
-            .expression_attribute_values(":old", AttributeValue::S(v.to_string()));
-    }
-    match req.send().await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let svc = e.into_service_error();
-            if matches!(svc, DeleteItemError::ConditionalCheckFailedException(_)) {
-                Err(RustyAntError::Contention)
-            } else {
-                Err(RustyAntError::S3(format!("dynamodb delete_item: {svc}")))
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Item / token / cursor codec
+// Item / token codec
 // ---------------------------------------------------------------------------
 
 /// Parse a `DynamoDB` item map into a `StoredValue`. The `data` attribute
@@ -405,33 +489,20 @@ fn encode_token(kind: ValueKind, version: &str) -> String {
 fn parse_token(token: &str) -> Result<(ValueKind, String), RustyAntError> {
     let (kind_str, version) =
         token.split_once(':').ok_or_else(|| RustyAntError::Parse(format!("malformed CAS token: {token}")))?;
-    let kind = match kind_str {
-        "string" => ValueKind::String,
-        "hash" => ValueKind::Hash,
-        "list" => ValueKind::List,
-        "set" => ValueKind::Set,
-        "zset" => ValueKind::ZSet,
-        "stream" => ValueKind::Stream,
-        other => return Err(RustyAntError::Parse(format!("unknown kind in CAS token: {other}"))),
-    };
+    let kind = parse_kind(kind_str)?;
     Ok((kind, version.to_string()))
 }
 
-/// Cursor format: `<table_idx>` or `<table_idx>:<last_pk>`. `None` means
-/// "start from the first table at the beginning."
-fn parse_cursor(cursor: Option<&str>) -> (usize, Option<String>) {
-    let Some(c) = cursor else {
-        return (0, None);
-    };
-    if let Some((idx_str, pk)) = c.split_once(':') {
-        let idx = idx_str.parse::<usize>().unwrap_or(0);
-        return (idx, Some(pk.to_string()));
+fn parse_kind(s: &str) -> Result<ValueKind, RustyAntError> {
+    match s {
+        "string" => Ok(ValueKind::String),
+        "hash" => Ok(ValueKind::Hash),
+        "list" => Ok(ValueKind::List),
+        "set" => Ok(ValueKind::Set),
+        "zset" => Ok(ValueKind::ZSet),
+        "stream" => Ok(ValueKind::Stream),
+        other => Err(RustyAntError::Parse(format!("unknown kind: {other}"))),
     }
-    (c.parse::<usize>().unwrap_or(0), None)
-}
-
-fn format_cursor(idx: usize, pk: Option<&str>) -> String {
-    pk.map_or_else(|| idx.to_string(), |p| format!("{idx}:{p}"))
 }
 
 // Suppress dead-code warning for `Bytes` import in non-test builds where
@@ -449,8 +520,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_names_with_prefix_yields_one_per_kind() {
+    fn table_names_with_prefix_yields_one_per_kind_plus_index() {
         let tn = TableNames::with_prefix("rustyant-");
+        assert_eq!(tn.index, "rustyant-index");
         assert_eq!(tn.string, "rustyant-string");
         assert_eq!(tn.hash, "rustyant-hash");
         assert_eq!(tn.list, "rustyant-list");
@@ -468,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn table_names_iter_walks_in_value_kind_all_order() {
+    fn table_names_iter_walks_six_kind_tables_in_value_kind_order() {
         let tn = TableNames::with_prefix("p-");
         let kinds: Vec<ValueKind> = tn.iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, ValueKind::ALL.to_vec());
@@ -494,26 +566,10 @@ mod tests {
     }
 
     #[test]
-    fn cursor_round_trip_at_table_start() {
-        let (idx, pk) = parse_cursor(None);
-        assert_eq!(idx, 0);
-        assert!(pk.is_none());
-
-        let s = format_cursor(2, None);
-        assert_eq!(s, "2");
-        let (idx, pk) = parse_cursor(Some("2"));
-        assert_eq!(idx, 2);
-        assert!(pk.is_none());
-    }
-
-    #[test]
-    fn cursor_round_trip_mid_table() {
-        let s = format_cursor(3, Some("foo:bar"));
-        // The `pk` itself may contain colons — only the FIRST colon
-        // separates idx from pk. Parsing must respect that.
-        assert_eq!(s, "3:foo:bar");
-        let (idx, pk) = parse_cursor(Some(&s));
-        assert_eq!(idx, 3);
-        assert_eq!(pk.as_deref(), Some("foo:bar"));
+    fn parse_kind_round_trip_for_all() {
+        for kind in ValueKind::ALL {
+            assert_eq!(parse_kind(kind.as_str()).unwrap(), kind);
+        }
+        assert!(parse_kind("nope").is_err());
     }
 }

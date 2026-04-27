@@ -5,7 +5,10 @@ Description: rustyant — WebSocket transport (API Gateway WS → Lambda → S3 
 # Deploys:
 #   * Storage layer — exactly one of:
 #       - One S3 bucket (when BackendKind=s3)
-#       - Six per-kind DynamoDB tables (when BackendKind=dynamodb)
+#       - Seven DynamoDB tables (when BackendKind=dynamodb): six per-kind
+#         data tables plus one index table that maps Redis key → kind.
+#         The index is the canonical "exists?" lookup; every save/delete
+#         goes through TransactWriteItems so data + index never drift.
 #   * rustyant-ws Lambda (Rust, arm64) built by sam+cargo-lambda
 #   * API Gateway WebSocket API with $connect / $disconnect / $default routes
 #   * IAM policies granting the Lambda backend-appropriate CRUD plus
@@ -90,9 +93,29 @@ Resources:
         RestrictPublicBuckets: true
 
   # --- DynamoDB storage (BackendKind=dynamodb) ---------------------------
-  # Six per-kind tables. All share the same shape: pk (partition key) +
-  # data + version + ttl. Native TTL is enabled so expired rows get GC'd
-  # asynchronously; lazy expiry on read is the authoritative check.
+  # Seven tables — six per-kind data tables plus a canonical index that maps
+  # Redis key → kind. Data tables share the shape pk + data + version + ttl;
+  # the index carries pk + kind + ttl. Native TTL is enabled on every table
+  # so expired rows get GC'd asynchronously; lazy expiry on read is the
+  # authoritative check.
+  TableIndex:
+    Type: AWS::DynamoDB::Table
+    Condition: IsDynamodbBackend
+    Properties:
+      TableName: !Sub '${DynamodbTablePrefix}index'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
   TableString:
     Type: AWS::DynamoDB::Table
     Condition: IsDynamodbBackend
@@ -250,7 +273,9 @@ Resources:
                   - dynamodb:DeleteItem
                   - dynamodb:Scan
                   - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
                 Resource:
+                  - !GetAtt TableIndex.Arn
                   - !GetAtt TableString.Arn
                   - !GetAtt TableHash.Arn
                   - !GetAtt TableList.Arn

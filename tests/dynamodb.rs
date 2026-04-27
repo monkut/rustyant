@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aws_sdk_dynamodb::Client as DynamoClient;
 use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_dynamodb::types::AttributeValue;
 use bytes::Bytes;
-use rustyant::dynamodb::{DynamoDbBackend, TableNames};
+use rustyant::dynamodb::{ATTR_PK, DynamoDbBackend, TableNames};
 use rustyant::storage::{KVStorage, Storage};
 
 const DEFAULT_PREFIX: &str = "rustyant-";
@@ -39,6 +40,15 @@ fn dynamodb_env() -> Option<(String, String)> {
 }
 
 fn make_storage() -> Option<Arc<dyn Storage>> {
+    let (client, tables) = make_client_and_tables()?;
+    let backend = DynamoDbBackend::new(client, tables);
+    Some(Arc::new(KVStorage::new(backend)))
+}
+
+/// Same as [`make_storage`] but also returns a raw `DynamoClient` + table
+/// names for tests that need to peek at row presence in specific tables
+/// (e.g., proving an orphan is gone after a cross-kind transition).
+fn make_client_and_tables() -> Option<(DynamoClient, TableNames)> {
     let (url, prefix) = dynamodb_env()?;
     let creds = Credentials::new("test", "test", None, None, "ddb-test");
     let config = aws_sdk_dynamodb::config::Builder::new()
@@ -49,8 +59,20 @@ fn make_storage() -> Option<Arc<dyn Storage>> {
         .build();
     let client = DynamoClient::from_conf(config);
     let tables = TableNames::with_prefix(&prefix);
-    let backend = DynamoDbBackend::new(client, tables);
-    Some(Arc::new(KVStorage::new(backend)))
+    Some((client, tables))
+}
+
+/// `true` iff a row with the given partition key exists in `table`.
+async fn row_exists(client: &DynamoClient, table: &str, key: &str) -> bool {
+    let resp = client
+        .get_item()
+        .table_name(table)
+        .key(ATTR_PK, AttributeValue::S(key.to_string()))
+        .consistent_read(true)
+        .send()
+        .await
+        .expect("get_item");
+    resp.item.is_some()
 }
 
 /// Produce a unique key suffix per call: `{scope}-{pid}-{seq}-{tail}`.
@@ -226,4 +248,80 @@ async fn ddb_setnx_first_writer_wins() {
     assert_eq!(got.as_deref(), Some(&b"first"[..]));
 
     storage.delete(&key).await.ok();
+}
+
+#[tokio::test]
+async fn ddb_cross_kind_overwrite_leaves_no_orphan() {
+    // SET-after-HSET should leave the strings row alive and the hashes row
+    // gone. The atomic transact-write path is the contract here — without
+    // it the hashes row would still be sitting in `{prefix}hash`.
+    let Some((client, tables)) = make_client_and_tables() else {
+        eprintln!("SKIP: RUSTYANT_DYNAMODB_URL not set");
+        return;
+    };
+    let storage: Arc<dyn Storage> = Arc::new(KVStorage::new(DynamoDbBackend::new(client.clone(), tables.clone())));
+    let key = unique_key("cross-kind", "key");
+
+    storage.hset(&key, vec![("x".to_string(), Bytes::from_static(b"1"))]).await.expect("hset");
+    assert!(row_exists(&client, &tables.hash, &key).await, "hash row should exist after HSET");
+
+    storage.set_string(&key, Bytes::from_static(b"bar"), None).await.expect("set");
+
+    // The string is the only kind that should remain.
+    assert!(row_exists(&client, &tables.string, &key).await, "string row exists after SET");
+    assert!(!row_exists(&client, &tables.hash, &key).await, "hash row was cleaned up");
+    assert!(row_exists(&client, &tables.index, &key).await, "index row exists");
+
+    // GET sees the string; HGET on the same key surfaces WRONGTYPE.
+    let got = storage.get_string(&key).await.expect("get");
+    assert_eq!(got.as_deref(), Some(&b"bar"[..]));
+    assert!(storage.hget(&key, "x").await.is_err(), "HGET against string should be WRONGTYPE");
+
+    storage.delete(&key).await.ok();
+    assert!(!row_exists(&client, &tables.string, &key).await, "string row removed after DEL");
+    assert!(!row_exists(&client, &tables.index, &key).await, "index row removed after DEL");
+}
+
+#[tokio::test]
+async fn ddb_del_uses_index_to_resolve_kind() {
+    // DEL on an HSET-created key should remove BOTH the hash row and the
+    // index row in one transact, without sweeping the other five tables.
+    let Some((client, tables)) = make_client_and_tables() else {
+        eprintln!("SKIP: RUSTYANT_DYNAMODB_URL not set");
+        return;
+    };
+    let storage: Arc<dyn Storage> = Arc::new(KVStorage::new(DynamoDbBackend::new(client.clone(), tables.clone())));
+    let key = unique_key("del-index", "key");
+
+    storage.hset(&key, vec![("a".to_string(), Bytes::from_static(b"1"))]).await.expect("hset");
+    assert!(row_exists(&client, &tables.hash, &key).await);
+    assert!(row_exists(&client, &tables.index, &key).await);
+
+    let deleted = storage.delete(&key).await.expect("del");
+    assert!(deleted, "DEL should report 1 on a present key");
+    assert!(!row_exists(&client, &tables.hash, &key).await);
+    assert!(!row_exists(&client, &tables.index, &key).await);
+}
+
+#[tokio::test]
+async fn ddb_keys_walks_only_the_index_table() {
+    // KEYS / SCAN drive list_page, which now scans only the index. Two
+    // keys of two different kinds should both surface from the same scan.
+    let Some((client, tables)) = make_client_and_tables() else {
+        eprintln!("SKIP: RUSTYANT_DYNAMODB_URL not set");
+        return;
+    };
+    let storage: Arc<dyn Storage> = Arc::new(KVStorage::new(DynamoDbBackend::new(client.clone(), tables.clone())));
+    let str_key = unique_key("keys-index", "str");
+    let hash_key = unique_key("keys-index", "hash");
+
+    storage.set_string(&str_key, Bytes::from_static(b"v"), None).await.expect("set");
+    storage.hset(&hash_key, vec![("f".to_string(), Bytes::from_static(b"v"))]).await.expect("hset");
+
+    let all_keys = storage.keys("*").await.expect("keys");
+    assert!(all_keys.contains(&str_key), "string key surfaced via index scan");
+    assert!(all_keys.contains(&hash_key), "hash key surfaced via index scan");
+
+    storage.delete(&str_key).await.ok();
+    storage.delete(&hash_key).await.ok();
 }
