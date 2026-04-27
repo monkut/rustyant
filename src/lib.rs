@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod dynamodb;
 pub mod error;
 pub mod geo;
 pub mod handler;
