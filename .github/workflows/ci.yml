@@ -86,10 +86,13 @@ jobs:
             s3api create-bucket --bucket "$RUSTYANT_FLOCI_BUCKET"
       - name: Wait for DynamoDB Local
         # The image has no shell tools so we can't use a service-level
-        # healthcheck. Poll from the runner instead.
+        # healthcheck. Poll from the runner via a real API call —
+        # `list-tables` is a no-op probe that succeeds once Java has
+        # finished booting and the service is accepting requests.
         run: |
-          for i in $(seq 1 30); do
-            if curl -sf -o /dev/null "$RUSTYANT_DYNAMODB_URL/"; then
+          for i in $(seq 1 60); do
+            if aws --endpoint-url="$RUSTYANT_DYNAMODB_URL" --region us-east-1 \
+                 dynamodb list-tables >/dev/null 2>&1; then
               echo "DynamoDB Local ready"; exit 0
             fi
             sleep 1
