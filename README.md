@@ -1,8 +1,8 @@
 # rustyant
 
-RustyAnt is a Lambda front end providing a Redis-compatible key-value store backed by S3.
+RustyAnt is a Lambda front end providing a Redis-compatible key-value store backed by S3 or DynamoDB.
 
-Sibling project to [rustyhip](https://github.com/monkut/rustyhip) (SQLite-over-S3). Same architectural wedge — your data is just files in your S3 bucket — applied to Redis semantics.
+Sibling project to [rustyhip](https://github.com/monkut/rustyhip) (SQLite-over-S3). Same architectural wedge — your data lives in AWS-managed storage you already own — applied to Redis semantics.
 
 ## Transports
 
@@ -50,6 +50,39 @@ r.set("k", "v"); r.get("k")  # b"v"
 The `connect_ws` / `connect_http` helpers return a `redis.Redis` instance backed by a `RustyAntWSConnection` / `RustyAntHttpConnection` — so anything that consumes a `redis.Redis` (ORMs, session stores, rate-limiters, third-party libs) works unchanged.
 
 Neither transport supports `MULTI`/`EXEC`, `SUBSCRIBE`/`PUBLISH`, or streams.
+
+## Storage backends
+
+The persistence layer is pluggable. Pick one at deploy-time via the `RUSTYANT_BACKEND` env var (default `s3`):
+
+| Backend | Layout | Conditional writes | Per-value size | Pricing model | When to pick |
+|---|---|---|---|---|---|
+| **S3** (`RUSTYANT_BACKEND=s3`) | One bucket; one object per Redis key under `KEY_PREFIX/{key}` | `If-Match` / `If-None-Match` on real S3 (since Nov 2024); floci emulator ignores them | No practical limit | Per-request (GET / PUT / LIST / DELETE) | Default. Highest per-key payload, simplest IAM (one bucket), survives any blast radius the bucket survives. |
+| **DynamoDB** (`RUSTYANT_BACKEND=dynamodb`) | Seven tables: a `{prefix}index` (key → kind) plus six per-kind data tables `{prefix}string`, `{prefix}hash`, `{prefix}list`, `{prefix}set`, `{prefix}zset`, `{prefix}stream` | Native `ConditionExpression` on every write; works locally too (DynamoDB Local enforces it). Every save/delete is a `TransactWriteItems` so data + index never drift | 400 KB per item — writes that would exceed it error explicitly | On-demand (default) or provisioned, your call | Real conditional writes everywhere, sub-10 ms latency, native TTL. |
+
+The two backends are wire-compatible from the client's perspective — every Redis command behaves the same way over either. Differences live below the trait boundary in [`KVBackend`](src/storage.rs) and its two implementations ([`S3Storage`](src/storage.rs), [`DynamoDbBackend`](src/dynamodb.rs)).
+
+### DynamoDB-specific caveats
+
+- **Index table is the canonical "exists?" source.** A 7th table, `{prefix}index`, maps `pk → kind`. Kind-unaware paths (`DEL`, `EXISTS`, `TYPE`, `KEYS`, `SCAN`) resolve through one `GetItem` (or one `Scan`) on the index — no parallel probe of six tables. Reads do a one-RTT index lookup, then a one-RTT `GetItem` against the correct kind table.
+- **Writes are transactional.** Every `save` and `delete` goes through `TransactWriteItems` — the data row, the index row, and any cross-kind orphan delete all succeed or fail together. After `SET foo "bar"` following `HSET foo x 1`: the hash row is deleted, the string row is created, and the index flips from `kind=hash` to `kind=string`, all in one shot. There are no leaked rows. Cost: transactional writes consume 2× the WCU of a non-transactional `PutItem`, and writes that change kind cost a 3-item transaction (data put, index put, old-kind delete) instead of 2.
+- **CAS version tokens are kind-tagged.** Wire format `"<kind>:<hex>"`. The kind prefix lets a `RESTORE`/`SET`-style overwrite that crosses kinds detect "this CAS token came from a different table" and surface as `Contention` so the outer retry loop re-reads.
+
+### Local development
+
+```sh
+# S3 path
+just floci-up && just floci-seed
+just rustyant-dev
+
+# DynamoDB path
+just dynamodb-up && just dynamodb-seed
+just rustyant-dev-dynamodb
+
+# Run the test suites
+just test            # S3 (floci) — 700+ tests
+just test-dynamodb   # DynamoDB Local — 8 round-trip tests + concurrent CAS
+```
 
 ## Command Surface
 

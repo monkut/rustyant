@@ -113,6 +113,62 @@ rustyant-dev BUCKET="rustyant-dev" KEY_PREFIX="rustyant/":
     export LOG_FORMAT=pretty LOG_LEVEL=info ENVIRONMENT=development
     cargo lambda watch
 
+# ---- DynamoDB Local ----
+# Used by tests/dynamodb.rs and `rustyant-dev-dynamodb` to exercise the
+# DynamoDB backend without standing up real DynamoDB tables.
+
+# Start DynamoDB Local and wait until healthy.
+dynamodb-up:
+    docker compose up -d dynamodb
+    @echo "Waiting for DynamoDB Local..."
+    @timeout 60 sh -c 'until curl -s -o /dev/null http://localhost:8000/ ; do sleep 1; done'
+    @echo "DynamoDB Local ready (http://localhost:8000)."
+
+# Stop the DynamoDB Local container (state is in-memory; recreate after restart).
+dynamodb-down:
+    docker compose stop dynamodb && docker compose rm -f dynamodb
+
+# Create the seven backend tables (index + six per-kind). Idempotent —
+# running twice is a no-op.
+dynamodb-seed PREFIX="rustyant-":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:8000
+    for suffix in index string hash list set zset stream; do
+      table="{{PREFIX}}${suffix}"
+      if aws dynamodb describe-table --table-name "$table" >/dev/null 2>&1; then
+        echo "Table exists: $table"
+      else
+        aws dynamodb create-table \
+          --table-name "$table" \
+          --attribute-definitions AttributeName=pk,AttributeType=S \
+          --key-schema AttributeName=pk,KeyType=HASH \
+          --billing-mode PAY_PER_REQUEST >/dev/null
+        echo "Created table: $table"
+      fi
+    done
+
+# Run rustyant against DynamoDB Local via cargo lambda watch.
+rustyant-dev-dynamodb PREFIX="rustyant-":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+    export AWS_ENDPOINT_URL=http://localhost:8000
+    export RUSTYANT_BACKEND=dynamodb RUSTYANT_DYNAMODB_TABLE_PREFIX={{PREFIX}}
+    export LOG_FORMAT=pretty LOG_LEVEL=info ENVIRONMENT=development
+    cargo lambda watch
+
+# Run the DynamoDB-gated integration suite. Brings up DynamoDB Local + seeds
+# the seven tables (index + six per-kind) before running tests/dynamodb.rs.
+test-dynamodb PREFIX="rustyant-": (dynamodb-up) (dynamodb-seed PREFIX)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1
+    export AWS_ENDPOINT_URL=http://localhost:8000
+    export RUSTYANT_DYNAMODB_URL=http://localhost:8000
+    export RUSTYANT_DYNAMODB_TABLE_PREFIX={{PREFIX}}
+    cargo nextest run --all-features --test dynamodb
+
 # ---- Lambda (cargo-lambda) ----
 # Install once:  cargo binstall cargo-lambda  (or cargo install cargo-lambda)
 
